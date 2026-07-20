@@ -47,7 +47,8 @@ def api_base_url() -> str:
 
 
 def api_model(default: str) -> str:
-    value = (os.environ.get("CODEX_OVERLAY_API_MODEL", "").strip()
+    value = (os.environ.get("DESKORB_AGENT_API_MODEL", "").strip()
+             or os.environ.get("CODEX_OVERLAY_API_MODEL", "").strip()
              or _VALUES.get("model_name", "")
              or _VALUES.get("codex_overlay_api_model", ""))
     # The supplied model_name was an endpoint URL, not a model ID. Do not pass

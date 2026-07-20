@@ -8,7 +8,8 @@ import os
 from provider_env import api_key as _provider_api_key
 
 
-TARGET = "CodexOverlay/OpenAIAPIKey"
+TARGET = "DeskOrbAgent/OpenAIAPIKey"
+LEGACY_TARGET = "CodexOverlay/OpenAIAPIKey"
 
 
 if os.name == "nt":
@@ -41,7 +42,8 @@ def get_api_key() -> str:
         return _provider_api_key()
     pointer = ctypes.POINTER(CREDENTIALW)()
     if not _advapi32.CredReadW(TARGET, 1, 0, ctypes.byref(pointer)):
-        return _provider_api_key()
+        if not _advapi32.CredReadW(LEGACY_TARGET, 1, 0, ctypes.byref(pointer)):
+            return _provider_api_key()
     try:
         cred = pointer.contents
         if not cred.CredentialBlob or not cred.CredentialBlobSize:
@@ -67,7 +69,7 @@ def set_api_key(value: str) -> None:
     cred.CredentialBlobSize = len(raw)
     cred.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_byte))
     cred.Persist = 2                 # CRED_PERSIST_LOCAL_MACHINE
-    cred.UserName = "Codex Overlay"
+    cred.UserName = "DeskOrb Agent"
     if not _advapi32.CredWriteW(ctypes.byref(cred), 0):
         raise ctypes.WinError(ctypes.get_last_error())
 

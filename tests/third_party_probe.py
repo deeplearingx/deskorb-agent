@@ -34,7 +34,7 @@ def main() -> int:
     started = time.perf_counter()
     request = urllib.request.Request(
         base + "/models",
-        headers={"Authorization": "Bearer " + key, "User-Agent": "codex-overlay-probe/1"},
+        headers={"Authorization": "Bearer " + key, "User-Agent": "deskorb-agent-probe/1"},
     )
     try:
         with urllib.request.urlopen(request, timeout=25) as response:

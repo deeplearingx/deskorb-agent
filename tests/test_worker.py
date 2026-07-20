@@ -48,12 +48,40 @@ class CodexWorkerTests(unittest.TestCase):
         self.assertIn(self.worker._session_id, command)
         self.assertEqual(command[-1], "-")
 
-    def test_backend_auto_uses_api_only_with_key(self):
+    def test_backend_auto_uses_agent_with_key(self):
         self.worker._backend = "auto"
         with patch("worker.get_api_key", return_value=""):
             self.assertEqual(self.worker._resolved_backend(), "codex")
         with patch("worker.get_api_key", return_value="secret"):
-            self.assertEqual(self.worker._resolved_backend(), "api")
+            self.assertEqual(self.worker._resolved_backend(), "agent")
+
+    def test_agent_backend_routes_to_independent_runtime(self):
+        self.worker._backend = "agent"
+        with patch.object(self.worker._agent, "run_turn") as run_turn:
+            self.worker._run_turn("inspect", [])
+            run_turn.assert_called_once_with("inspect", [])
+
+    def test_agent_compact_routes_to_independent_runtime(self):
+        self.worker._backend = "agent"
+        with patch.object(self.worker._agent, "compact", return_value=None) as compact:
+            self.worker._compact()
+        compact.assert_called_once_with(force=True)
+
+    def test_agent_startup_diagnostics_report_key_and_powershell(self):
+        self.worker._backend = "agent"
+        with patch("worker.get_api_key", return_value="secret"), \
+             patch.object(self.worker._agent.tools, "_powershell_7_executable", return_value="pwsh"):
+            diagnostics = self.worker._startup_diagnostics()
+        self.assertTrue(any("API key configured" in message for message in diagnostics))
+        self.assertTrue(any("PowerShell 7 available" in message for message in diagnostics))
+
+    def test_agent_startup_diagnostics_explain_missing_requirements(self):
+        self.worker._backend = "agent"
+        with patch("worker.get_api_key", return_value=""), \
+             patch.object(self.worker._agent.tools, "_powershell_7_executable", return_value=None):
+            diagnostics = self.worker._startup_diagnostics()
+        self.assertTrue(any("not configured" in message for message in diagnostics))
+        self.assertTrue(any("was not found" in message for message in diagnostics))
 
     def test_extract_api_text(self):
         response = {"output": [{"content": [
@@ -88,7 +116,9 @@ class CodexWorkerTests(unittest.TestCase):
         with patch("worker.get_api_key", return_value="secret"), \
              patch("worker.urllib.request.urlopen", return_value=FakeResponse()):
             self.worker._run_api_turn("hello", [])
-        self.assertIn(("delta", "fast"), self.drain())
+        events = self.drain()
+        self.assertIn(("delta", "fast"), events)
+        self.assertTrue(any(kind == "ctx" and isinstance(value, float) for kind, value in events))
         self.assertEqual(
             [(item.role, item.text) for item in self.worker._api_context.messages],
             [("user", "hello"), ("assistant", "fast")],

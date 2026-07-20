@@ -82,7 +82,7 @@ def main():
 
     try:
         init_id = send("initialize", {
-            "clientInfo": {"name": "codex-overlay-probe", "version": "0.1"},
+            "clientInfo": {"name": "deskorb-agent-probe", "version": "0.1"},
             "capabilities": {"experimentalApi": True},
         })
         wait_for(lambda m: m.get("id") == init_id, timeout=20)
@@ -132,4 +132,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

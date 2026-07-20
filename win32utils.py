@@ -214,7 +214,7 @@ def _pythonw_exe():
     return exe
 
 
-def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="Claude Overlay"):
+def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="DeskOrb Agent"):
     """Self-heal the Start Menu shortcut Windows needs to pin the overlay to the taskbar
     like a normal app. The overlay is a frameless pythonw window that declares an explicit
     AppUserModelID; Windows will only back a taskbar PIN with a Start Menu .lnk whose
@@ -608,4 +608,3 @@ def compute_onscreen_move(win, monitors, min_vis_w=48, min_vis_h=32):
         if best_d is None or d < best_d:
             best, best_d = rect, d
     return _clamp_into(x, y, w, h, best)
-

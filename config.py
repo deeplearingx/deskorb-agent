@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Configuration constants, theme palette, and the system-prompt append for
-Codex Overlay. Pure data + small env helpers; no project imports (leaf module),
+DeskOrb Agent. Pure data + small env helpers; no project imports (leaf module),
 so anything may import it without a circular-import risk."""
 
 import os
@@ -8,7 +8,7 @@ from pathlib import Path
 
 from provider_env import api_base_url as _provider_api_base_url, api_model as _provider_api_model
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
     try:
@@ -32,7 +32,7 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return v not in ("0", "false", "no", "off")
 
-WORKING_DIR = os.environ.get("CODEX_OVERLAY_WORKING_DIR", str(Path.home()))
+WORKING_DIR = os.environ.get("DESKORB_AGENT_WORKING_DIR", os.environ.get("CODEX_OVERLAY_WORKING_DIR", str(Path.home())))
 # Model IDs are FAMILY ALIASES ("opus"/"sonnet"/"haiku"), not pinned versions, so the
 # overlay always runs the LATEST model of each family — when Anthropic ships a new one
 # (e.g. a future Sonnet 5), it's picked up automatically with NO code change. The CLI
@@ -49,21 +49,21 @@ WORKING_DIR = os.environ.get("CODEX_OVERLAY_WORKING_DIR", str(Path.home()))
 # caches the result, re-probing only when the CLI itself changes). The statusline shows the
 # concrete version each alias resolved to
 # (e.g. "claude-opus-4-8"), so you can always see what you're on.
-MODEL = os.environ.get("CODEX_OVERLAY_MODEL", "gpt-5.6-sol")
+MODEL = os.environ.get("DESKORB_AGENT_MODEL", os.environ.get("CODEX_OVERLAY_MODEL", "gpt-5.6-sol"))
 MODELS = [("GPT-5.6 Sol", "gpt-5.6-sol"),
           ("GPT-5.6 Terra", "gpt-5.6-terra"),
           ("GPT-5.6 Luna", "gpt-5.6-luna")]
-CONNECTION_BACKEND = os.environ.get("CODEX_OVERLAY_BACKEND", "codex").strip().lower()
-if CONNECTION_BACKEND not in ("auto", "codex", "api"):
+CONNECTION_BACKEND = os.environ.get("DESKORB_AGENT_BACKEND", os.environ.get("CODEX_OVERLAY_BACKEND", "agent")).strip().lower()
+if CONNECTION_BACKEND not in ("auto", "codex", "api", "agent"):
     CONNECTION_BACKEND = "auto"
 API_BASE_URL = (os.environ.get("OPENAI_BASE_URL", "").strip() or _provider_api_base_url()
                 or "https://api.openai.com/v1").rstrip("/")
-API_PROXY_URL = os.environ.get("CODEX_OVERLAY_API_PROXY", "").strip()
+API_PROXY_URL = os.environ.get("DESKORB_AGENT_API_PROXY", os.environ.get("CODEX_OVERLAY_API_PROXY", "")).strip()
 API_MODEL = _provider_api_model("gpt-5.6-terra")
-API_TIMEOUT = _env_int("CODEX_OVERLAY_API_TIMEOUT", 180, 15, 900)
-API_CONTEXT_TOKEN_BUDGET = _env_int("CODEX_OVERLAY_CONTEXT_TOKENS", 24_000, 4_000, 200_000)
-API_CONTEXT_RECENT_TURNS = _env_int("CODEX_OVERLAY_RECENT_TURNS", 6, 2, 24)
-API_CONTEXT_SUMMARY_TOKENS = _env_int("CODEX_OVERLAY_SUMMARY_TOKENS", 1_200, 256, 4_096)
+API_TIMEOUT = _env_int("DESKORB_AGENT_API_TIMEOUT", 180, 15, 900)
+API_CONTEXT_TOKEN_BUDGET = _env_int("DESKORB_AGENT_CONTEXT_TOKENS", 24_000, 4_000, 200_000)
+API_CONTEXT_RECENT_TURNS = _env_int("DESKORB_AGENT_RECENT_TURNS", 6, 2, 24)
+API_CONTEXT_SUMMARY_TOKENS = _env_int("DESKORB_AGENT_SUMMARY_TOKENS", 1_200, 256, 4_096)
 PERMISSION_MODE = "workspace-write"
                                  # the STARTUP permission mode; flip it at run time with the
                                  # status-bar "Read-only" toggle (◉ = "plan", a read-only agent
@@ -86,9 +86,9 @@ DISALLOWED_TOOLS = ["AskUserQuestion"]
 # MCP server the user has configured (Atlassian, Figma, M365, ...) injects their tool
 # schemas into the context - easily 50-70K+ tokens, a third of a 200K window, gone
 # before you type. Override per-machine WITHOUT editing source (so a release never has
-# to toggle this constant): set CLAUDE_OVERLAY_STRICT_MCP=0 to inherit your MCP
+# to toggle this constant): set DESKORB_AGENT_STRICT_MCP=0 to inherit your MCP
 # servers/connectors (incl. claude.ai Microsoft 365) for calendar/Outlook etc.
-STRICT_MCP_CONFIG = _env_bool("CLAUDE_OVERLAY_STRICT_MCP", True)
+STRICT_MCP_CONFIG = _env_bool("DESKORB_AGENT_STRICT_MCP", True)
 
 SKILLS = "all"                    # which Agent SDK skills to enable in the overlay. Default None
                                   # means the overlay discovers NO skills (the SDK only wires up
@@ -123,7 +123,7 @@ TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button
                                  # no-taskbar floating overlay (original behaviour).
 APP_ICON = ""  # use the Tk default unless a local icon is supplied
                                  # script (or absolute). "" → no custom icon (Tk default).
-APP_ID = "openai.codex-overlay"  # explicit Windows AppUserModelID. Without it a pythonw
+APP_ID = "deeplearingx.deskorb-agent"  # explicit Windows AppUserModelID. Without it a pythonw
                                  # app shows pythonw's icon in the taskbar and groups with other
                                  # Python apps; setting it makes the taskbar use APP_ICON instead.
 ORB_SIZE = 56                    # diameter (logical px) of the collapsed Codex orb
@@ -146,16 +146,16 @@ ORB_ALPHA_THRESHOLD = 110        # pixels at/above this alpha (0-255) count as "
 FONT_SANS = ["Noto Sans TC", "Inter", "Segoe UI Variable Text", "Segoe UI"]
 FONT_SERIF = ["Noto Serif TC", "Georgia", "Cambria"]   # the "Codex" wordmark
 FONT_MONO = ["Consolas", "Cascadia Mono", "Courier New"]
-SHOT_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "codex_overlay_shots"
+SHOT_DIR = Path(os.environ.get("TEMP", str(Path.home()))) / "deskorb_agent_shots"
 KEEP_SHOTS = 24                  # retain a few captures worth (one file per monitor)
 SHOT_MAX_EDGE = 1568             # downscale captures to this long edge before sending.
-SHOT_FORMAT = os.environ.get("CODEX_OVERLAY_SHOT_FORMAT", "auto").strip().lower()
+SHOT_FORMAT = os.environ.get("DESKORB_AGENT_SHOT_FORMAT", "auto").strip().lower()
                                  # "auto" saves PNG + JPEG and keeps the smaller payload;
                                  # "png" preserves old behavior; "jpeg" favors upload speed.
-SHOT_JPEG_QUALITY = _env_int("CODEX_OVERLAY_SHOT_JPEG_QUALITY", 82, 50, 95)
+SHOT_JPEG_QUALITY = _env_int("DESKORB_AGENT_SHOT_JPEG_QUALITY", 82, 50, 95)
                                  # Codex downsamples larger images internally anyway, so
                                  # bigger files only cost upload time + vision tokens.
-SHOT_SCOPE = os.environ.get("CODEX_OVERLAY_SHOT_SCOPE", "screens").strip().lower()
+SHOT_SCOPE = os.environ.get("DESKORB_AGENT_SHOT_SCOPE", "screens").strip().lower()
                                  # what a screenshot covers — the STARTUP default; flip it live
                                  # via the status-bar "Window-only" toggle. "screens" (default):
                                  # one image per monitor, Codex sees everything you see.
@@ -166,10 +166,10 @@ SHOT_SCOPE = os.environ.get("CODEX_OVERLAY_SHOT_SCOPE", "screens").strip().lower
                                  # when no usable window exists (fresh launch, desktop focused,
                                  # window minimized) it falls back to full-screen capture rather
                                  # than sending nothing. Any other value → "screens".
-SHOT_SCOPE_FORCED = "CODEX_OVERLAY_SHOT_SCOPE" in os.environ
+SHOT_SCOPE_FORCED = "DESKORB_AGENT_SHOT_SCOPE" in os.environ
                                  # an EXPLICIT env var is a per-launch decision, so it beats the
                                  # remembered toggle state below; unset → last toggle choice wins
-STATE_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "codex-overlay" / "state.json"
+STATE_FILE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "deskorb-agent" / "state.json"
                                  # tiny per-machine store for UI-toggle state the user expects to
                                  # survive a relaunch (Window-only and Read-only). Deliberately
                                  # OUTSIDE the app folder: machine state must not dirty the git
@@ -227,7 +227,7 @@ CLI_UPDATE_CHECK = False
                             # and, if so, show a one-click Update notice in the chat (see
                             # cliupdate.py). The overlay and the CLI update independently: keeping
                             # the overlay current never advances the CLI, and an old CLI silently
-                            # runs an older model. Set CLAUDE_OVERLAY_CLI_UPDATE_CHECK=0 to disable
+                            # runs an older model. Set DESKORB_AGENT_CLI_UPDATE_CHECK=0 to disable
                             # (e.g. a locked-down box where global npm installs aren't allowed)
 
 SYSTEM_APPEND = (

@@ -24,13 +24,14 @@ from typing import Any
 from config import (API_BASE_URL, API_CONTEXT_RECENT_TURNS, API_CONTEXT_SUMMARY_TOKENS,
                     API_CONTEXT_TOKEN_BUDGET, API_MODEL, API_PROXY_URL, API_TIMEOUT,
                     CONNECTION_BACKEND, MODEL, PERMISSION_MODE, SYSTEM_APPEND, WORKING_DIR)
+from agent_runtime import AgentRuntime
 from conversation_context import ConversationContext
 from credential_store import get_api_key
 from debuglog import DEBUG_LOG, _UIQueueTap, dbg
 
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-_SERVICE_TIER = os.environ.get("CODEX_OVERLAY_SERVICE_TIER", "fast").strip() or "fast"
+_SERVICE_TIER = os.environ.get("DESKORB_AGENT_SERVICE_TIER", "fast").strip() or "fast"
 
 
 class CodexWorker(threading.Thread):
@@ -39,7 +40,7 @@ class CodexWorker(threading.Thread):
     def __init__(self, ui_queue: "queue.Queue", permission_mode: str | None = None,
                  backend: str | None = None, model: str | None = None,
                  api_base_url: str | None = None, api_proxy_url: str | None = None):
-        super().__init__(daemon=True, name="codex-overlay-worker")
+        super().__init__(daemon=True, name="deskorb-agent-worker")
         self.ui = _UIQueueTap(ui_queue) if DEBUG_LOG else ui_queue
         self.req: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._running = True
@@ -56,6 +57,8 @@ class CodexWorker(threading.Thread):
         self._api_response = None
         self._api_lock = threading.Lock()
         self._permission_mode = permission_mode or PERMISSION_MODE
+        self._agent = AgentRuntime(self.ui, self._model, self._api_base_url, self._api_proxy_url,
+                                   full_access=self._permission_mode != "plan")
         self._proc: subprocess.Popen[str] | None = None
         self._proc_lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -97,6 +100,7 @@ class CodexWorker(threading.Thread):
         self._interrupted = True
         with self._api_lock:
             api_response = self._api_response
+        self._agent.interrupt()
         if api_response is not None:
             try:
                 api_response.close()
@@ -125,6 +129,8 @@ class CodexWorker(threading.Thread):
             self.ui.put(("model", self._model))
             self.ui.put(("backend", self._backend_status()))
             self.ui.put(("permission_mode", self._permission_mode))
+            for message in self._startup_diagnostics():
+                self.ui.put(("diagnostic", message))
 
         while self._running:
             kind, payload = self.req.get()
@@ -136,6 +142,7 @@ class CodexWorker(threading.Thread):
                 elif kind == "reset":
                     self._session_id = None
                     self._api_context.clear()
+                    self._agent.reset()
                     self._tool_items_seen.clear()
                     self.ui.put(("reset_done", None))
                 elif kind == "compact":
@@ -144,6 +151,7 @@ class CodexWorker(threading.Thread):
                     self._model = self._normalize_model(payload)
                     self._session_id = None
                     self._api_context.clear()
+                    self._agent.configure(self._model, self._api_base_url, self._api_proxy_url)
                     self.ui.put(("model", self._model))
                     self.ui.put(("status", "model changed; a new chat will start on the next turn"))
                 elif kind == "configure_connection":
@@ -153,6 +161,7 @@ class CodexWorker(threading.Thread):
                     self._api_proxy_url = self._normalize_proxy(payload.get("api_proxy_url"))
                     self._session_id = None
                     self._api_context.clear()
+                    self._agent.configure(self._model, self._api_base_url, self._api_proxy_url)
                     self.ui.put(("model", self._model))
                     self.ui.put(("backend", self._backend_status()))
                     self.ui.put(("connection_done", {
@@ -162,6 +171,7 @@ class CodexWorker(threading.Thread):
                     }))
                 elif kind == "set_permission_mode":
                     self._permission_mode = str(payload)
+                    self._agent.set_permission_mode(self._permission_mode)
                     self._session_id = None
                     self.ui.put(("permission_mode", self._permission_mode))
                     self.ui.put(("status", "permission mode changed; a new chat will start on the next turn"))
@@ -174,7 +184,7 @@ class CodexWorker(threading.Thread):
     @staticmethod
     def _normalize_backend(value: Any) -> str:
         value = str(value or "auto").strip().lower()
-        return value if value in ("auto", "codex", "api") else "auto"
+        return value if value in ("auto", "codex", "api", "agent") else "auto"
 
     @staticmethod
     def _normalize_model(value: Any) -> str:
@@ -199,12 +209,31 @@ class CodexWorker(threading.Thread):
 
     def _resolved_backend(self) -> str:
         if self._backend == "auto":
-            return "api" if get_api_key() else "codex"
+            return "agent" if get_api_key() else "codex"
         return self._backend
 
     def _backend_status(self) -> str:
         active = self._resolved_backend()
         return f"auto→{active}" if self._backend == "auto" else active
+
+    def _startup_diagnostics(self) -> list[str]:
+        """Return actionable local configuration checks without probing the network."""
+        active = self._resolved_backend()
+        messages: list[str] = []
+        if active in {"api", "agent"}:
+            if get_api_key():
+                messages.append("✓ API key configured. Connection will be checked on the first message.")
+            else:
+                messages.append("⚠ API key is not configured. Open Gear → Connection settings to add one.")
+            messages.append(f"API endpoint: {self._api_base_url}")
+        if active == "agent":
+            pwsh = self._agent.tools._powershell_7_executable()
+            if pwsh:
+                messages.append("✓ PowerShell 7 available for confirmed shell tasks.")
+            else:
+                messages.append("⚠ PowerShell 7 (pwsh) was not found. Shell tasks will be unavailable; set DESKORB_AGENT_PWSH or install PowerShell 7.")
+            messages.append(f"Agent working folder: {self._agent.tools.root}")
+        return messages
 
     @staticmethod
     def _find_codex() -> str | None:
@@ -254,7 +283,7 @@ class CodexWorker(threading.Thread):
                     continue
             self._messages.put(None)
         threading.Thread(target=reader, daemon=True, name="codex-app-server-reader").start()
-        request_id = self._send("initialize", {"clientInfo": {"name": "codex-overlay", "version": "0.1.0"}, "capabilities": {"experimentalApi": True}})
+        request_id = self._send("initialize", {"clientInfo": {"name": "deskorb-agent", "version": "0.2.0"}, "capabilities": {"experimentalApi": True}})
         self._wait_for(lambda m: m.get("id") == request_id, 25)
 
     def _send(self, method: str, params: dict[str, Any]) -> int:
@@ -310,6 +339,16 @@ class CodexWorker(threading.Thread):
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ API 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
+                        self.ui.put(("backend", "auto→codex"))
+                        self._run_codex_turn(text, image_paths)
+                    else:
+                        raise
+            elif active == "agent":
+                try:
+                    self._run_agent_turn(text, image_paths)
+                except BaseException as exc:
+                    if self._backend == "auto" and self._codex:
+                        self.ui.put(("system", f"↪ Agent 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
                         self._run_codex_turn(text, image_paths)
                     else:
@@ -438,7 +477,10 @@ class CodexWorker(threading.Thread):
             raise RuntimeError("API stream ended before response.completed")
         else:
             self._api_context.add_turn(text, "".join(answer_parts))
-            self.ui.put(("context", self._api_context.usage_percent()))
+            self.ui.put(("ctx", self._api_context.usage_percent()))
+
+    def _run_agent_turn(self, text: str, image_paths: list[str]):
+        self._agent.run_turn(text, image_paths)
 
     def _open_api_response(self, payload: dict[str, Any], api_key: str, accept: str):
         endpoint = self._api_base_url
@@ -451,7 +493,7 @@ class CodexWorker(threading.Thread):
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "Accept": accept,
-                "User-Agent": "codex-overlay/0.1.0",
+                "User-Agent": "deskorb-agent/0.1.0",
             },
             method="POST",
         )
@@ -526,7 +568,7 @@ class CodexWorker(threading.Thread):
             with self._api_lock:
                 self._api_response = None
         post_tokens = self._api_context.estimated_tokens()
-        self.ui.put(("context", self._api_context.usage_percent()))
+        self.ui.put(("ctx", self._api_context.usage_percent()))
         return {"pre_tokens": candidate.pre_tokens, "post_tokens": post_tokens}
 
     @staticmethod
@@ -579,6 +621,18 @@ class CodexWorker(threading.Thread):
     def _compact(self):
         self._interrupted = False
         self.ui.put(("compacting", None))
+        if self._resolved_backend() == "agent":
+            try:
+                meta = self._agent.compact(force=True)
+                self.ui.put(("ctx", self._agent.context.usage_percent()))
+                detail = "No older turns need compaction." if meta is None else "Context compacted."
+                self.ui.put(("compact_done", {"status": "ok", "meta": meta, "detail": detail}))
+            except Exception as exc:
+                status = "cancelled" if self._interrupted else "error"
+                self.ui.put(("compact_done", {
+                    "status": status, "meta": None, "detail": self._short_status(str(exc)),
+                }))
+            return
         if self._resolved_backend() == "api":
             try:
                 api_key = get_api_key()

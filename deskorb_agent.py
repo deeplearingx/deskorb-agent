@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Codex Overlay — a frameless, always-on-top floating chat window styled like the
-Codex desktop app. Talks to Codex Code (via the Agent SDK, using your existing
+DeskOrb Agent — a frameless, always-on-top floating chat window styled like the
+DeskOrb Agent desktop app. Supports an independent API-backed agent and an optional
+Codex compatibility backend.
 subscription) and can SEE your screen by attaching screenshots.
 
 Stack: Tkinter (UI) + claude-agent-sdk (drives the npm `claude` CLI) + Pillow
 (screen capture) + keyboard (global hotkey). No API key required — it reuses the
 `claude` login you already have.
 
-Run:   pythonw claude_overlay.py     (no console)
-       python  claude_overlay.py     (console, for debugging)
+Run:   pythonw deskorb_agent.py     (no console)
+       python  deskorb_agent.py     (console, for debugging)
 """
 
 import asyncio
@@ -39,13 +40,22 @@ from win32utils import _user32, _gdi32
 from worker import CodexWorker
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
-PLACEHOLDER = "Reply to Codex…"
+PLACEHOLDER = "Ask DeskOrb Agent…"
 TOOL_ICONS = {
     "Read": "▤", "Write": "✎", "Edit": "✎", "MultiEdit": "✎", "NotebookEdit": "✎",
     "Bash": "❯", "BashOutput": "❯", "KillShell": "❯", "PowerShell": "❯",
     "Glob": "⌕", "Grep": "⌕", "WebSearch": "⌕", "WebFetch": "↗", "ToolSearch": "⌕",
     "TodoWrite": "☑", "Task": "◆",
 }
+_APPROVAL_RE = re.compile(
+    r"^⚠ Confirmation required: (?P<summary>[\s\S]+?)\nReply exactly: 确认 (?P<token>[0-9A-F]{6})\nReply 取消 to stop\.$"
+)
+
+
+def _approval_parts(value):
+    """Extract the runtime's confirmation token without coupling the UI to tool types."""
+    match = _APPROVAL_RE.match(str(value or "").strip())
+    return (match.group("summary"), match.group("token")) if match else None
 
 
 def _ensure_shot_dir():
@@ -61,7 +71,7 @@ def _ensure_shot_dir():
         pass
     import tempfile
     try:
-        SHOT_DIR = Path(tempfile.mkdtemp(prefix="claude_overlay_shots_"))
+        SHOT_DIR = Path(tempfile.mkdtemp(prefix="deskorb_agent_shots_"))
     except Exception:
         SHOT_DIR = Path(tempfile.gettempdir())
 
@@ -127,7 +137,7 @@ class Overlay:
         self.ui_q: "queue.Queue" = queue.Queue()
         saved_state = _load_state()
         self._backend = _state_text(saved_state, "connection_backend", CONNECTION_BACKEND).lower()
-        if self._backend not in ("auto", "codex", "api"):
+        if self._backend not in ("auto", "codex", "api", "agent"):
             self._backend = CONNECTION_BACKEND
         self._api_base_url = _state_text(saved_state, "api_base_url", API_BASE_URL)
         self._api_proxy_url = _state_text(saved_state, "api_proxy_url", API_PROXY_URL)
@@ -205,10 +215,10 @@ class Overlay:
                                           # working in before focusing the overlay; the "window"
                                           # capture scope targets it whenever the overlay has focus
         self._fg_checked = 0.0            # throttle that tracking to ~0.5s in _poll
-        # Per-overlay custom name (session-only, set by clicking the titlebar "Codex"). Shown
+        # Per-overlay custom name (session-only, set by clicking the titlebar). Shown
         # in the titlebar + window title when expanded, and as a small pill UNDER the orb when
         # collapsed — so several overlays open at once (one per task) are tellable apart at a
-        # glance while collapsed. Empty → the default "Codex" everywhere (original behaviour).
+        # glance while collapsed. Empty → the default "DeskOrb Agent" everywhere.
         self.overlay_name = ""
         self._rename_entry = None         # the in-place rename Entry while editing, else None
         self._collapsed_mask = None       # PIL 'L' silhouette (orb ∪ name-pill ∪ done-badge) for the
@@ -235,7 +245,7 @@ class Overlay:
     # ── construction ──
     def _build(self):
         self.root = tk.Tk()
-        self.root.title("Codex Overlay")
+        self.root.title("DeskOrb Agent")
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
         self.root.overrideredirect(True)
         self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
@@ -314,7 +324,7 @@ class Overlay:
         self._start_hang_watchdog()    # diagnostic: dumps all-thread stacks if the UI pump stalls
 
     def _start_hang_watchdog(self):
-        """Diagnostic (active only when CLAUDE_OVERLAY_DEBUG_LOG is set): a daemon thread that,
+        """Diagnostic (active only when DESKORB_AGENT_DEBUG_LOG is set): a daemon thread that,
         if the Tk event pump (_poll) stops heart-beating for >4 s — i.e. the UI is actually
         wedged, which from OUTSIDE looks identical to a healthy idle window (CPU 0, not
         "hung") — dumps every thread's Python stack to the log. That names the exact line /
@@ -635,7 +645,7 @@ class Overlay:
         self._bind_drag(mark)
         # The title doubles as the rename target: click it (without dragging) to edit this
         # overlay's name; dragging it still moves the window (moved-detection, like the orb).
-        self.title_lbl = tk.Label(bar, text=self.overlay_name or "Codex", bg=T["bg"],
+        self.title_lbl = tk.Label(bar, text=self.overlay_name or "DeskOrb Agent", bg=T["bg"],
                                   fg=T["text"], font=self.f_title, cursor="hand2")
         self.title_lbl.pack(side="left")
         self.title_lbl.bind("<ButtonPress-1>", self._title_press)
@@ -666,7 +676,7 @@ class Overlay:
         except Exception:
             pass
 
-    # ── rename this overlay (click the titlebar "Codex") ──
+    # ── rename this overlay (click the titlebar) ──
     def _title_press(self, e):
         self._title_moved = False
         self._drag_start(e)
@@ -731,7 +741,7 @@ class Overlay:
 
     def _apply_name(self, name):
         self.overlay_name = name or ""
-        shown = self.overlay_name or "Codex"
+        shown = self.overlay_name or "DeskOrb Agent"
         try:
             self.title_lbl.configure(text=shown)
         except Exception:
@@ -1991,7 +2001,7 @@ class Overlay:
             # insert) so _prune_chat can tell if a later trim removed the active header.
             self.chat.mark_set("ah_start", "end-1c")
             self.chat.mark_gravity("ah_start", "left")
-            self._ins("\n✦ Codex\n", "ah")
+            self._ins("\n✦ DeskOrb Agent\n", "ah")
             try:
                 self.chat.tag_remove("current_ah", "1.0", "end")
                 self.chat.tag_add("current_ah", "ah_start", "end-1c")
@@ -2387,7 +2397,7 @@ class Overlay:
     def add_tool(self, name, inp):
         # Skip the auto-screenshot Read so the chat isn't cluttered every turn.
         if HIDE_SCREENSHOT_TOOL and name == "Read" and isinstance(inp, dict) \
-                and "claude_overlay_shots" in str(inp.get("file_path", "")):
+                and "deskorb_agent_shots" in str(inp.get("file_path", "")):
             return
         self._md_finalize()              # seal the answer text streamed so far, then the tool chip
         self._ensure_header()
@@ -2546,6 +2556,55 @@ class Overlay:
     def add_sys(self, text):
         self._md_finalize()
         self._ins("\n" + ("" if text is None else str(text)) + "\n", "sys")
+
+    def add_approval(self, text):
+        """Render a one-click confirmation card for a pending local action."""
+        parsed = _approval_parts(text)
+        if not parsed:
+            self.add_sys(text)
+            return
+        summary, token = parsed
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["border"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(9))
+        title = tk.Label(card, text="确认任务", bg=T["field"], fg=T["err"],
+                         font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        detail = tk.Label(card, text=summary, bg=T["field"], fg=T["text"], font=self.f_small,
+                          justify="left", anchor="w", wraplength=self.px(300))
+        detail.pack(fill="x", pady=(self.px(3), self.px(9)))
+        actions = tk.Frame(card, bg=T["field"])
+        actions.pack(fill="x")
+
+        def respond(approved):
+            if getattr(card, "_resolved", False) or self.busy:
+                return
+            card._resolved = True
+            confirm.configure(state="disabled")
+            cancel.configure(state="disabled")
+            self.add_user("✓ 已确认任务" if approved else "✕ 已取消任务")
+            self.worker.ask(f"确认 {token}" if approved else "取消", [])
+            self._set_busy(True)
+
+        confirm = tk.Button(actions, text="确认执行", command=lambda: respond(True),
+                            bg=T["accent"], fg=T["on_accent"], activebackground=T["accent"],
+                            activeforeground=T["on_accent"], relief="flat", bd=0,
+                            font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        confirm.pack(side="left")
+        cancel = tk.Button(actions, text="取消", command=lambda: respond(False),
+                           bg=T["field"], fg=T["muted"], activebackground=T["hover"],
+                           activeforeground=T["text"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        cancel.pack(side="left", padx=(self.px(6), 0))
+        for child in (card, title, detail, actions, confirm, cancel):
+            child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
 
     def add_err(self, text):
         self._md_finalize()
@@ -3047,10 +3106,10 @@ class Overlay:
         if changed:
             _save_state(read_only=ro)   # persist only CONFIRMED switches, never requests
         if changed and ro:
-            self.add_sys("🔒 Read-only: Codex can see your screen, read files, and "
+            self.add_sys("🔒 Read-only: DeskOrb Agent can see your screen, read files, and "
                          "answer — but won't edit anything or run commands.")
         elif changed:
-            self.add_sys(f"⚡ Full access ({mode}): Codex can now edit files and run "
+            self.add_sys(f"⚡ Full access ({mode}): DeskOrb Agent can now edit files and run "
                          "commands without asking. Flip Read-only back on any time.")
 
     def toggle_screen_share(self):
@@ -3222,7 +3281,7 @@ class Overlay:
         ver = f"v{__version__}" + ("  ⬆" if self._update_available else "")
         backend = getattr(self, "_active_backend", self._backend).upper()
         self.statusline.configure(
-            text=f"{backend} · {self._model or 'Codex'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
+            text=f"{backend} · {self._model or 'DeskOrb Agent'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
 
     # ── compaction animation (mirrors the Codex Code CLI's /compact spinner) ──
     def _start_compact_anim(self):
@@ -3372,7 +3431,7 @@ class Overlay:
             self.add_sys("⏳ Finish (or Stop) the current reply before changing connection settings.")
             return
         win = tk.Toplevel(self.root)
-        win.title("Codex Overlay — Connection")
+        win.title("DeskOrb Agent — Connection")
         win.configure(bg=T["bg"])
         win.attributes("-topmost", True)
         win.resizable(False, False)
@@ -3393,7 +3452,7 @@ class Overlay:
             tk.Label(body, text=label, bg=T["bg"], fg=T["muted"],
                      font=self.f_small, anchor="w").grid(row=row, column=0, sticky="w", pady=5)
 
-        backend_menu = tk.OptionMenu(body, backend_var, "auto", "codex", "api")
+        backend_menu = tk.OptionMenu(body, backend_var, "auto", "codex", "api", "agent")
         backend_menu.configure(bg=T["field"], fg=T["text"], activebackground=T["accent"],
                                activeforeground=T["on_accent"], bd=0, highlightthickness=0,
                                width=28)
@@ -3432,8 +3491,8 @@ class Overlay:
             model = model_var.get().strip()
             base = base_var.get().strip().rstrip("/")
             proxy = proxy_var.get().strip().rstrip("/")
-            if backend not in ("auto", "codex", "api"):
-                error_var.set("Connection must be auto, codex, or api.")
+            if backend not in ("auto", "codex", "api", "agent"):
+                error_var.set("Connection must be auto, agent, api, or codex.")
                 return
             if not model:
                 error_var.set("Model ID cannot be empty.")
@@ -3448,8 +3507,8 @@ class Overlay:
             try:
                 if key_var.get().strip():
                     set_api_key(key_var.get())
-                if backend == "api" and not has_api_key():
-                    error_var.set("API mode requires an API Key.")
+                if backend in ("api", "agent") and not has_api_key():
+                    error_var.set("API and Agent modes require an API Key.")
                     return
                 self._backend = backend
                 self._model = model
@@ -3680,6 +3739,10 @@ class Overlay:
             self._apply_permission_mode(str(payload))
         elif kind == "system":
             self.add_sys(str(payload))
+        elif kind == "diagnostic":
+            self.add_sys(str(payload))
+        elif kind == "approval":
+            self.add_approval(str(payload))
         elif kind == "update":
             self._update_available = str(payload)
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
@@ -3691,7 +3754,7 @@ class Overlay:
             self._show_cli_update_result(payload)
 
     def _intro(self):
-        self._ins("\n✦ Codex\n", "ah")
+        self._ins("\n✦ DeskOrb Agent\n", "ah")
         self._ins("Hi — I float on top of everything. Ask me anything and I'll look at "
                   "your screen to help.\n"
                   "Enter to send · Shift+Enter for a new line · Ctrl +/− to zoom text · "

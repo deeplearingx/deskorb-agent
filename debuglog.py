@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Opt-in activity logging for the worker, and the queue tap that mirrors every
-worker->UI event into the log. Enabled by the CLAUDE_OVERLAY_DEBUG_LOG env var;
+worker->UI event into the log. Enabled by the DESKORB_AGENT_DEBUG_LOG env var;
 inert (no writes) when unset. Leaf module - imports only the stdlib."""
 
 import os
@@ -9,7 +9,7 @@ import threading
 
 # ── debug / activity log (monitoring) ──────────────────────────────────────
 # Under pythonw the overlay has no console and exposes no IPC, so its work can't be
-# watched from outside. Opt in by setting the CLAUDE_OVERLAY_DEBUG_LOG environment
+# watched from outside. Opt in by setting the DESKORB_AGENT_DEBUG_LOG environment
 # variable to a file path: you then get a timestamped, one-line-per-event trace of the
 # worker (turn start, tool calls, results, errors, reconnects, a throttled streaming
 # heartbeat) — enough to see what it's doing and whether a turn is stuck. Default is OFF
@@ -17,7 +17,7 @@ import threading
 # logged (deltas/thinking are logged only as a ~2s heartbeat + char count), but a
 # turn-start prompt preview (≤120 chars) IS written — so only enable it on a trusted
 # machine. Each PID tags its own lines so several overlays don't get confused.
-DEBUG_LOG = os.environ.get("CLAUDE_OVERLAY_DEBUG_LOG", "")
+DEBUG_LOG = os.environ.get("DESKORB_AGENT_DEBUG_LOG", "")
 DEBUG_LOG_MAX_BYTES = 2_000_000     # truncate (best-effort) once the log grows past this
 _dbg_lock = threading.Lock()
 _dbg_stream_last = [0.0]             # throttle high-frequency streaming deltas to a heartbeat
@@ -82,4 +82,3 @@ class _UIQueueTap:
 
     def __getattr__(self, name):
         return getattr(self._q, name)
-
