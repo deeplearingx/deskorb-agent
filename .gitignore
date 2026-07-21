@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+
+# Machine-specific launchers / shortcuts (recreate locally)
+*.lnk
+
+# Logs & scratch
+*.log
+_*.log
+_*.py
+_*.png
+app-server-schema/
+
+# Runtime screenshots (the app writes these to %TEMP%, but ignore here too)
+claude_overlay_shots/
+
+# Local launch / marketing / progress notes (keep out of the public repo)
+LAUNCH_KIT.md
+PROGRESS.md
+CODEX_CRASH_AUDIT.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Inbound contribution archives (kept locally as provenance only - may carry a
+# contributor's private email / unsanitized patch; never commit to the public repo)
+*-submission.zip
