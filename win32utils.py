@@ -357,6 +357,16 @@ _user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
 _user32.GetWindowThreadProcessId.restype = wt.DWORD
 _user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
 _user32.AttachThreadInput.restype = wt.BOOL
+_kernel32 = ctypes.windll.kernel32
+_kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+_kernel32.OpenProcess.restype = wt.HANDLE
+_kernel32.CloseHandle.argtypes = [wt.HANDLE]
+_kernel32.CloseHandle.restype = wt.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_wchar_p,
+                                                   ctypes.POINTER(wt.DWORD)]
+_kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+GA_ROOT = 2
 _user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
 _user32.IsClipboardFormatAvailable.restype = ctypes.c_int
 # Virtual-desktop bounding box — used as a cheap display-topology change signature (the box
@@ -469,6 +479,40 @@ def window_is_own(hwnd):
         return pid.value == _kernel32.GetCurrentProcessId()
     except Exception:
         return True     # can't tell → treat as our own so it's never captured by mistake
+
+
+def root_window(hwnd):
+    """Return hwnd's top-level ancestor, preserving a usable handle on lookup failure."""
+    try:
+        value = _user32.GetAncestor(wt.HWND(hwnd), GA_ROOT)
+        return int(value or hwnd)
+    except Exception:
+        return int(hwnd or 0)
+
+
+def window_process_name(hwnd):
+    """Return the executable basename for hwnd, or an empty string when unavailable."""
+    handle = None
+    try:
+        pid = wt.DWORD(0)
+        if not hwnd or not _user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid)):
+            return ""
+        handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return ""
+        size = wt.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not _kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buffer.value)
+    except Exception:
+        return ""
+    finally:
+        if handle:
+            try:
+                _kernel32.CloseHandle(handle)
+            except Exception:
+                pass
 
 
 def window_capturable(hwnd):
