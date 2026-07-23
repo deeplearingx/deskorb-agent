@@ -104,12 +104,10 @@ AUTO_SCREENSHOT_DEFAULT = True
 # It is intentionally opt-out (set CODEX_OVERLAY_COMPUTER_USE=0 to disable): the
 # model is still instructed to use it only after a direct user request.
 COMPUTER_USE_ENABLED = _env_bool("CODEX_OVERLAY_COMPUTER_USE", True)
-SHOW_IN_SCREEN_SHARE_DEFAULT = False  # False (default) = the overlay is excluded from screen
-                                  # captures at the OS/DWM level (WDA_EXCLUDEFROMCAPTURE): it
-                                  # stays visible to YOU but is omitted from Teams/Zoom/Meet/OBS
-                                  # screen shares, PrintScreen, and our own screenshots — private.
-                                  # True = the overlay shows up in screen shares. Flip it live via
-                                  # the status-bar "shareable" toggle; no restart needed.
+SHOW_IN_SCREEN_SHARE_DEFAULT = _env_bool("DESKORB_AGENT_SHOW_IN_SCREEN_SHARE", True)
+# The default avoids WDA_EXCLUDEFROMCAPTURE, which prevents this Tk window from
+# rendering in some remote or overlay desktop environments. Set the environment
+# variable to 0 only after confirming the private screen-share mode remains visible.
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
 THEME = "light"                  # "light" (Codex paper) or "dark" (warm dark)

@@ -30,6 +30,9 @@ Configuration overrides:
 - `OPENAI_BASE_URL`: Responses-compatible API base URL (defaults to OpenAI `/v1`)
 - `DESKORB_AGENT_API_PROXY`: optional HTTP/HTTPS proxy URL
 - `DESKORB_AGENT_CONTEXT_TOKENS`: API context budget (defaults to `24000`)
+- `DESKORB_AGENT_SHOW_IN_SCREEN_SHARE`: whether the overlay appears in screen shares
+  (defaults to `1`). Set to `0` to request private mode only after verifying the
+  window remains visible on the current desktop environment.
 - `DESKORB_AGENT_FRAMELESS_WINDOW`: set to `1` to opt into the legacy frameless window
   style. It is off by default for Windows/Tk compatibility.
 - `DESKORB_AGENT_CUSTOM_WINDOW_REGION`: set to `1` to apply the legacy rounded Win32
