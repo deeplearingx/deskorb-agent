@@ -61,6 +61,19 @@ class CodexWorkerTests(unittest.TestCase):
             self.worker._run_turn("inspect", [])
             run_turn.assert_called_once_with("inspect", [])
 
+    def test_ephemeral_agent_turn_routes_to_isolated_runtime(self):
+        self.worker._backend = "agent"
+        with patch.object(self.worker._agent, "run_ephemeral_turn") as run_turn:
+            self.worker._run_turn("private Word contents", [], ephemeral=True)
+        run_turn.assert_called_once_with("private Word contents", [])
+
+    def test_ask_ephemeral_queues_a_distinct_request_kind(self):
+        self.worker.ask_ephemeral("private Word contents", [])
+        self.assertEqual(
+            self.worker.req.get_nowait(),
+            ("ask_ephemeral", ("private Word contents", [])),
+        )
+
     def test_agent_compact_routes_to_independent_runtime(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "compact", return_value=None) as compact:

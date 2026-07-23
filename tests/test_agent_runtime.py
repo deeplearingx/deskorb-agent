@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from queue import Queue
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_policy import Risk
 from agent_runtime import AgentRuntime, ControlledTools, ReadOnlyTools
@@ -167,6 +167,21 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertIsNotNone(meta)
         self.assertEqual(runtime.context.summary, "Remembered early turns.")
         self.assertEqual(len(runtime.context.messages), 4)
+
+    def test_ephemeral_turn_does_not_mutate_context(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.context.add_turn("remember ordinary turn", "Ordinary answer")
+        before = runtime.context.build_input("next question")
+        request = Mock(return_value={"output_text": "Private answer", "output": []})
+        runtime._request = request
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_ephemeral_turn("private Word contents", [])
+
+        self.assertEqual(runtime.context.build_input("next question"), before)
+        payload = request.call_args.args[0]
+        self.assertEqual(payload["input"][0]["content"][0]["text"], "private Word contents")
+
 
 
 if __name__ == "__main__":
