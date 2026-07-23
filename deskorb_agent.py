@@ -38,6 +38,7 @@ from debuglog import dbg, DEBUG_LOG
 from win32utils import *
 from win32utils import _user32, _gdi32
 from worker import CodexWorker
+from word_sources import WordMaterial, is_word_window, read_active_word_document
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Ask DeskOrb Agent…"
@@ -234,6 +235,10 @@ class Overlay:
         self._compact_anim_after = None   # pending animation timer id
         self._compact_t0 = 0.0            # monotonic start (for the elapsed-seconds counter)
         self._compact_frame = 0
+        self.chat_word_attachment: WordMaterial | None = None
+        self._chat_word_read_request = None
+        self._chat_word_read_sequence = 0
+        self._chat_word_read_timeout_after = None
 
         self._build()
         self._register_hotkey()
@@ -299,6 +304,7 @@ class Overlay:
         self._build_statusline()   # very bottom: model + context %
         self._build_statusbar()    # controls row (above statusline)
         self._build_input()        # side=bottom (above controls)
+        self._build_chat_word_attachment()
         self._build_chat()         # side=top, fills the middle
         self._build_orb()          # collapsed bubble (hidden until "—")
         self._build_edges()        # invisible drag strips on every edge/corner → resize
@@ -911,6 +917,127 @@ class Overlay:
         self._ph_active = False
         self._ph_in()
         self.canvas.bind("<Configure>", self._layout_input)
+
+    def _build_chat_word_attachment(self):
+        """Render the explicit one-turn Word attachment control for Chat."""
+        wrap = tk.Frame(self.root, bg=T["bg"])
+        wrap.pack(fill="x", side="bottom", padx=self.px(12), pady=(0, self.px(3)))
+        self.chat_word_frame = wrap
+        self.chat_word_button = tk.Button(
+            wrap, text="Read current Word", command=self._add_chat_word,
+            bg=T["field"], fg=T["text"], activebackground=T["accent"],
+            activeforeground=T["on_accent"], disabledforeground=T["faint"],
+            font=self.f_small, relief="flat", bd=0, padx=self.px(7), pady=self.px(2),
+            cursor="hand2", takefocus=0,
+        )
+        self.chat_word_button.pack(side="left", padx=(0, self.px(6)))
+        self.chat_word_label = tk.Label(wrap, text="", bg=T["bg"], fg=T["muted"],
+                                        font=self.f_small, anchor="w")
+        self.chat_word_label.pack(side="left", fill="x", expand=True)
+        self.chat_word_clear_button = tk.Button(
+            wrap, text="Clear", command=self._clear_chat_word_attachment,
+            bg=T["bg"], fg=T["muted"], activebackground=T["field"],
+            activeforeground=T["text"], font=self.f_small, relief="flat", bd=0,
+            padx=self.px(4), pady=0, cursor="hand2", takefocus=0,
+        )
+        self.chat_word_clear_button.pack(side="right")
+        self._refresh_chat_word_attachment()
+
+    def _refresh_chat_word_attachment(self):
+        material = getattr(self, "chat_word_attachment", None)
+        reading = getattr(self, "_chat_word_read_request", None) is not None
+        try:
+            self.chat_word_button.configure(state="disabled" if self.busy or reading else "normal")
+            self.chat_word_clear_button.configure(state="normal" if material and not reading else "disabled")
+            if reading:
+                self.chat_word_label.configure(text="Reading current Word…")
+            elif material:
+                saved = "unsaved changes" if material.has_unsaved_changes else "saved"
+                self.chat_word_label.configure(
+                    text=f"Attached: {material.name} · {material.character_count:,} chars · {saved}"
+                )
+            else:
+                self.chat_word_label.configure(text="")
+        except Exception:
+            pass
+
+    def _add_chat_word(self):
+        if self.busy or getattr(self, "_chat_word_read_request", None) is not None:
+            self.add_sys("Finish the current reply or Word read before reading another Word document.")
+            return
+        hwnd = self._capture_target_hwnd()
+        if not hwnd or not is_word_window(hwnd):
+            self.add_err("Focus a Microsoft Word document before opening DeskOrb Agent, then try again.")
+            return
+        self._clear_chat_word_attachment()
+        self._chat_word_read_sequence = getattr(self, "_chat_word_read_sequence", 0) + 1
+        request_id = self._chat_word_read_sequence
+        self._chat_word_read_request = request_id
+        self._refresh_chat_word_attachment()
+        try:
+            self._chat_word_read_timeout_after = self.root.after(
+                15_000, lambda: self._expire_chat_word_read(request_id)
+            )
+        except Exception:
+            self._chat_word_read_timeout_after = None
+        threading.Thread(
+            target=self._read_chat_word_bg, args=(request_id, hwnd),
+            name="chat-word-read", daemon=True,
+        ).start()
+
+    def _read_chat_word_bg(self, request_id, hwnd):
+        try:
+            self.ui_q.put(("chat_word_read", (request_id, read_active_word_document(hwnd), None)))
+        except Exception as exc:
+            self.ui_q.put(("chat_word_read", (request_id, None, exc)))
+
+    def _expire_chat_word_read(self, request_id):
+        if getattr(self, "_chat_word_read_request", None) != request_id:
+            return
+        self._chat_word_read_request = None
+        self._chat_word_read_timeout_after = None
+        self._clear_chat_word_attachment()
+        self.add_err("Reading Word took longer than 15 seconds. Close any Word dialog and try again.")
+
+    def _finish_chat_word_read(self, request_id, material: WordMaterial | None = None, error=None):
+        if getattr(self, "_chat_word_read_request", None) != request_id:
+            return
+        self._chat_word_read_request = None
+        timeout_after = getattr(self, "_chat_word_read_timeout_after", None)
+        self._chat_word_read_timeout_after = None
+        if timeout_after is not None:
+            try:
+                self.root.after_cancel(timeout_after)
+            except Exception:
+                pass
+        if error is not None:
+            self.add_err(str(error))
+            self._clear_chat_word_attachment()
+            return
+        if material is None:
+            self.add_err("Word didn't return a readable document. Try again.")
+            self._clear_chat_word_attachment()
+            return
+        self.chat_word_attachment = material
+        self.add_sys(
+            f"Word attached: {material.name} ({material.character_count:,} chars, "
+            f"{'unsaved changes' if material.has_unsaved_changes else 'saved'})."
+        )
+        self._refresh_chat_word_attachment()
+
+    def _clear_chat_word_attachment(self, cancel_read=False):
+        if cancel_read:
+            self._chat_word_read_sequence = getattr(self, "_chat_word_read_sequence", 0) + 1
+            self._chat_word_read_request = None
+            timeout_after = getattr(self, "_chat_word_read_timeout_after", None)
+            self._chat_word_read_timeout_after = None
+            if timeout_after is not None:
+                try:
+                    self.root.after_cancel(timeout_after)
+                except Exception:
+                    pass
+        self.chat_word_attachment = None
+        self._refresh_chat_word_attachment()
 
     def _build_statusbar(self):
         st = tk.Frame(self.root, bg=T["bg"])
@@ -2788,6 +2915,15 @@ class Overlay:
             self._set_status("stopping…")
             return
         text = self._entry_text()
+        if self.chat_word_attachment is not None:
+            if not text:
+                self.add_err("Enter a question to send with the current Word document.")
+                return
+            self._precaptured = None
+            self._send_chat_word_attachment(text)
+            self.entry.delete("1.0", "end")
+            self._ph_active = False
+            return
         shots = None
         if self.auto_shot:
             pc = self._precaptured
@@ -2812,10 +2948,34 @@ class Overlay:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
         self.add_user(label)
         if IMAGE_INPUT == "inline":
-            paths = [s["path"] for s in (shots or [])] + list(images)
-            self.worker.ask(self._inline_text(text, shots, images), paths)
+            self._dispatch_turn(self._inline_text(text, shots, images), shots, images)
         else:
-            self.worker.ask(self._build_prompt(text, shots, images), [])
+            self._dispatch_turn(self._build_prompt(text, shots, images), [], [])
+        self._set_busy(True)
+
+    def _dispatch_turn(self, prompt, shots, images, ephemeral=False):
+        paths = [] if ephemeral else [s["path"] for s in (shots or [])] + list(images or [])
+        if ephemeral:
+            self.worker.ask_ephemeral(prompt, paths)
+        else:
+            self.worker.ask(prompt, paths)
+
+    def _send_chat_word_attachment(self, question):
+        """Submit the visible Word attachment once without leaking its text into Chat."""
+        material = self.chat_word_attachment
+        if material is None:
+            return
+        prompt = (
+            "[TEMPORARY WORD DOCUMENT — use only for this one response]\n"
+            f"Document name: {material.name}\n"
+            "[BEGIN WORD DOCUMENT]\n"
+            f"{material.text}\n"
+            "[END WORD DOCUMENT]\n\n"
+            f"User question:\n{question}"
+        )
+        self.add_user(f"{question} [Word attachment: {material.name} · {material.character_count:,} chars]")
+        self._clear_chat_word_attachment()
+        self._dispatch_turn(prompt, [], [], ephemeral=True)
         self._set_busy(True)
 
     def _inline_text(self, text, shots, images):
@@ -3129,6 +3289,7 @@ class Overlay:
         # receive_response() and the reset just queues behind it — meanwhile the tail
         # of the old reply keeps streaming deltas into the chat we just cleared.
         self.worker.interrupt()
+        self._clear_chat_word_attachment(cancel_read=True)
         self.chat.delete("1.0", "end")
         self._md_reset()                 # chat wiped → drop md tail/table/fence state + marks
         self._zoomables = []             # all embedded canvases were just destroyed with the text
@@ -3273,6 +3434,7 @@ class Overlay:
     def _set_busy(self, busy):
         self.busy = busy
         self._refresh_send()
+        self._refresh_chat_word_attachment()
         self.busy_lbl.configure(text="thinking…" if busy else "")
 
     def _refresh_statusline(self):
@@ -3729,6 +3891,8 @@ class Overlay:
                 self._refresh_attach()
             if failed:
                 self.add_err(f"{failed} pasted image(s) couldn't be attached.")
+        elif kind == "chat_word_read":
+            self._finish_chat_word_read(*payload)
         elif kind == "precapture_done":
             self._capture_busy = False
             if payload:
