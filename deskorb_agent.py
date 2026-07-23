@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DeskOrb Agent — a frameless, always-on-top floating chat window styled like the
+DeskOrb Agent — an always-on-top floating chat window styled like the
 DeskOrb Agent desktop app. Supports an independent API-backed agent and an optional
 Codex compatibility backend.
 subscription) and can SEE your screen by attaching screenshots.
@@ -248,11 +248,15 @@ class Overlay:
         return int(round(v * self.s))
 
     # ── construction ──
+    def _apply_window_style(self):
+        """Apply native decorations unless optional frameless mode is explicitly enabled."""
+        self.root.overrideredirect(FRAMELESS_WINDOW)
+
     def _build(self):
         self.root = tk.Tk()
         self.root.title("DeskOrb Agent")
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
-        self.root.overrideredirect(True)
+        self._apply_window_style()
         self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
         self.root.configure(bg=T["bg"])
         self.root.attributes("-topmost", True)
@@ -320,7 +324,7 @@ class Overlay:
 
         self.root.after(130, lambda: (self.root.focus_force(), self.entry.focus_set()))
         self.root.bind("<Configure>", self._on_configure)
-        self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-asserts the frameless look
+        self.root.bind("<Map>", self._on_map, add="+")   # restore (incl. from taskbar) re-applies the window style
         self.root.bind("<FocusIn>", self._on_focus_in, add="+")  # taskbar-click / alt-tab activation → raise above topmost peers
         self.root.after(170, self._apply_region)
         self.root.after(180, self._apply_share_visibility)
@@ -504,7 +508,7 @@ class Overlay:
     def _after_taskbar_show(self, geo=None):
         try:
             self.root.deiconify()
-            self.root.overrideredirect(True)        # deiconify can re-add decorations → strip them
+            self._apply_window_style()
             if geo:
                 self.root.geometry(geo)
             self.root.attributes("-topmost", True)
@@ -523,7 +527,7 @@ class Overlay:
             return
         self._mapping = True
         try:
-            self.root.overrideredirect(True)
+            self._apply_window_style()
             self.root.attributes("-topmost", True)
             self._set_taskbar_button()
             self.root.after(20, self._apply_region)
@@ -1879,6 +1883,8 @@ class Overlay:
         self._round_after = self.root.after(50, self._apply_region)
 
     def _apply_region(self):
+        if not CUSTOM_WINDOW_REGION:
+            return
         try:
             self.root.update_idletasks()
             w, h = self.root.winfo_width(), self.root.winfo_height()
@@ -3191,7 +3197,7 @@ class Overlay:
         finally:
             if do_hide:
                 self.root.deiconify()
-                self.root.overrideredirect(True)
+                self._apply_window_style()
                 self.root.geometry(geo)
                 self.root.attributes("-topmost", True)
                 self._set_taskbar_button()   # withdraw→deiconify dropped the button; bring it back
@@ -3400,7 +3406,7 @@ class Overlay:
 
     def _show_window(self):
         self.root.deiconify()
-        self.root.overrideredirect(True)
+        self._apply_window_style()
         self.root.attributes("-topmost", True)
         self._set_taskbar_button()   # re-assert the taskbar button after a hotkey-hide → show
         self._force_foreground()     # hotkey path: WE initiate activation, push past the fg lock

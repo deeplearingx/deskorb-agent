@@ -121,6 +121,10 @@ TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button
                                  # (overrideredirect) window gets NO taskbar button by default;
                                  # this forces one via WS_EX_APPWINDOW. False → the pure
                                  # no-taskbar floating overlay (original behaviour).
+FRAMELESS_WINDOW = _env_bool("DESKORB_AGENT_FRAMELESS_WINDOW", False)
+# Standard decorations avoid an invisible Tk window on some desktops. The matching
+# custom Win32 window region is also opt-in, because it clips native title bars.
+CUSTOM_WINDOW_REGION = _env_bool("DESKORB_AGENT_CUSTOM_WINDOW_REGION", FRAMELESS_WINDOW)
 APP_ICON = ""  # use the Tk default unless a local icon is supplied
                                  # script (or absolute). "" → no custom icon (Tk default).
 APP_ID = "deeplearingx.deskorb-agent"  # explicit Windows AppUserModelID. Without it a pythonw

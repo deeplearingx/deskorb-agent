@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from deskorb_agent import Overlay
 from word_sources import WordMaterial
@@ -81,6 +81,24 @@ class ChatWordAttachmentTests(unittest.TestCase):
 
         overlay.capture.assert_not_called()
         overlay._send_chat_word_attachment.assert_called_once_with("What are the risks?")
+
+    def test_window_style_uses_standard_decorations_by_default(self):
+        overlay = Overlay.__new__(Overlay)
+        overlay.root = Mock()
+
+        with patch("deskorb_agent.FRAMELESS_WINDOW", False):
+            overlay._apply_window_style()
+
+        overlay.root.overrideredirect.assert_called_once_with(False)
+
+    def test_standard_window_style_does_not_apply_custom_region(self):
+        overlay = Overlay.__new__(Overlay)
+        overlay.root = Mock()
+
+        with patch("deskorb_agent.CUSTOM_WINDOW_REGION", False):
+            overlay._apply_region()
+
+        overlay.root.update_idletasks.assert_not_called()
 
 
 if __name__ == "__main__":

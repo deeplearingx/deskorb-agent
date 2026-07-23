@@ -30,6 +30,10 @@ Configuration overrides:
 - `OPENAI_BASE_URL`: Responses-compatible API base URL (defaults to OpenAI `/v1`)
 - `DESKORB_AGENT_API_PROXY`: optional HTTP/HTTPS proxy URL
 - `DESKORB_AGENT_CONTEXT_TOKENS`: API context budget (defaults to `24000`)
+- `DESKORB_AGENT_FRAMELESS_WINDOW`: set to `1` to opt into the legacy frameless window
+  style. It is off by default for Windows/Tk compatibility.
+- `DESKORB_AGENT_CUSTOM_WINDOW_REGION`: set to `1` to apply the legacy rounded Win32
+  window region; it defaults to the frameless-window setting.
 - `DESKORB_AGENT_RECENT_TURNS`: verbatim API recency window (defaults to `6`)
 - `DESKORB_AGENT_SUMMARY_TOKENS`: rolling-summary output cap (defaults to `1200`)
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
