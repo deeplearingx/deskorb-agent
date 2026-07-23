@@ -322,4 +322,3 @@ Expected: no whitespace errors and a clean worktree before committing README cha
 git add README.md tests/test_chat_word_attachment.py
 git commit -m "docs: explain Word chat attachments"
 ```
-
