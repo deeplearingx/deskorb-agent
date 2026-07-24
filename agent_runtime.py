@@ -381,7 +381,15 @@ class AgentRuntime:
             self._task_authorized_until = 0.0
             raise
 
-    def _run_turn(self, text: str, image_paths: list[str]):
+    def run_ephemeral_turn(self, text: str, image_paths: list[str]):
+        """Run one request without reading or updating normal conversation context."""
+        try:
+            return self._run_turn(text, image_paths, ephemeral=True)
+        except BaseException:
+            self._task_authorized_until = 0.0
+            raise
+
+    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
         api_key = get_api_key()
         if not api_key:
             raise RuntimeError("API Key is not configured")
@@ -395,16 +403,19 @@ class AgentRuntime:
         if approval_status == "pending":
             self.ui.put(("system", f"A confirmation is still pending. Reply exactly: 确认 {approval.token}, or reply 取消."))
             return
-        self._maybe_compact_context(api_key)
+        if not ephemeral:
+            self._maybe_compact_context(api_key)
         self.ui.put(("status", "agent inspecting…"))
-        content: list[dict[str, Any]] = [{"type": "input_text", "text": self.context.build_input(text)}]
+        content: list[dict[str, Any]] = [{
+            "type": "input_text", "text": text if ephemeral else self.context.build_input(text),
+        }]
         for raw_path in image_paths:
             path = Path(raw_path).expanduser()
             if path.is_file():
                 mime = mimetypes.guess_type(str(path))[0] or "image/png"
                 content.append({"type": "input_image", "image_url": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"})
         transcript: list[dict[str, Any]] = [{"role": "user", "content": content}]
-        original_text = self._clean_task_text(text)
+        original_text = "Answer the attached Word question" if ephemeral else self._clean_task_text(text)
         if approval_status == "approved" and self._pending_execution:
             call, transcript, original_text = self._pending_execution
             self._pending_execution = None
@@ -438,10 +449,12 @@ class AgentRuntime:
                 answer = self._extract_text(response)
                 if not answer:
                     raise RuntimeError("Agent response contained neither text nor a function call")
-                self.context.add_turn(original_text, answer)
+                if not ephemeral:
+                    self.context.add_turn(original_text, answer)
                 self._task_authorized_until = 0.0
                 self.ui.put(("delta", answer))
-                self.ui.put(("ctx", self.context.usage_percent()))
+                if not ephemeral:
+                    self.ui.put(("ctx", self.context.usage_percent()))
                 return
             outputs = []
             for call in calls:
@@ -656,3 +669,4 @@ class AgentRuntime:
         if name == "window_focus":
             return "Focus window: " + str(arguments.get("title", ""))[:120]
         return name + " requested"
+

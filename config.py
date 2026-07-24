@@ -104,12 +104,10 @@ AUTO_SCREENSHOT_DEFAULT = True
 # It is intentionally opt-out (set CODEX_OVERLAY_COMPUTER_USE=0 to disable): the
 # model is still instructed to use it only after a direct user request.
 COMPUTER_USE_ENABLED = _env_bool("CODEX_OVERLAY_COMPUTER_USE", True)
-SHOW_IN_SCREEN_SHARE_DEFAULT = False  # False (default) = the overlay is excluded from screen
-                                  # captures at the OS/DWM level (WDA_EXCLUDEFROMCAPTURE): it
-                                  # stays visible to YOU but is omitted from Teams/Zoom/Meet/OBS
-                                  # screen shares, PrintScreen, and our own screenshots — private.
-                                  # True = the overlay shows up in screen shares. Flip it live via
-                                  # the status-bar "shareable" toggle; no restart needed.
+SHOW_IN_SCREEN_SHARE_DEFAULT = _env_bool("DESKORB_AGENT_SHOW_IN_SCREEN_SHARE", True)
+# The default avoids WDA_EXCLUDEFROMCAPTURE, which prevents this Tk window from
+# rendering in some remote or overlay desktop environments. Set the environment
+# variable to 0 only after confirming the private screen-share mode remains visible.
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
 THEME = "light"                  # "light" (Codex paper) or "dark" (warm dark)
@@ -121,6 +119,10 @@ TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button
                                  # (overrideredirect) window gets NO taskbar button by default;
                                  # this forces one via WS_EX_APPWINDOW. False → the pure
                                  # no-taskbar floating overlay (original behaviour).
+FRAMELESS_WINDOW = _env_bool("DESKORB_AGENT_FRAMELESS_WINDOW", False)
+# Standard decorations avoid an invisible Tk window on some desktops. The matching
+# custom Win32 window region is also opt-in, because it clips native title bars.
+CUSTOM_WINDOW_REGION = _env_bool("DESKORB_AGENT_CUSTOM_WINDOW_REGION", FRAMELESS_WINDOW)
 APP_ICON = ""  # use the Tk default unless a local icon is supplied
                                  # script (or absolute). "" → no custom icon (Tk default).
 APP_ID = "deeplearingx.deskorb-agent"  # explicit Windows AppUserModelID. Without it a pythonw
@@ -281,3 +283,4 @@ THEMES = {
     },
 }
 T = THEMES.get(THEME, THEMES["light"])
+

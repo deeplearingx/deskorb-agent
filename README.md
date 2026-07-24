@@ -30,6 +30,13 @@ Configuration overrides:
 - `OPENAI_BASE_URL`: Responses-compatible API base URL (defaults to OpenAI `/v1`)
 - `DESKORB_AGENT_API_PROXY`: optional HTTP/HTTPS proxy URL
 - `DESKORB_AGENT_CONTEXT_TOKENS`: API context budget (defaults to `24000`)
+- `DESKORB_AGENT_SHOW_IN_SCREEN_SHARE`: whether the overlay appears in screen shares
+  (defaults to `1`). Set to `0` to request private mode only after verifying the
+  window remains visible on the current desktop environment.
+- `DESKORB_AGENT_FRAMELESS_WINDOW`: set to `1` to opt into the legacy frameless window
+  style. It is off by default for Windows/Tk compatibility.
+- `DESKORB_AGENT_CUSTOM_WINDOW_REGION`: set to `1` to apply the legacy rounded Win32
+  window region; it defaults to the frameless-window setting.
 - `DESKORB_AGENT_RECENT_TURNS`: verbatim API recency window (defaults to `6`)
 - `DESKORB_AGENT_SUMMARY_TOKENS`: rolling-summary output cap (defaults to `1200`)
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
@@ -75,6 +82,20 @@ settings window take precedence over this file.
 API mode provides chat and image/screenshot understanding. Use **agent** mode for
 local shell/file tools and Windows mouse/keyboard control; Codex mode is optional.
 
+### One-time Word attachment in Chat
+
+Focus an editable Microsoft Word document, open DeskOrb Agent, select **Read current
+Word**, enter a question, and send it. DeskOrb reads the document text (including
+table text and unsaved edits) only after that explicit action and sends it with that
+single reply. If Word opens a dialog or the focused document changes while it is
+being read, focus the intended document and try again.
+
+The attachment turn sends no screenshot or pasted image. The Chat transcript shows
+only the document name and character count, and DeskOrb clears the extracted text
+from local memory after sending, cancellation, timeout, or failure. Normal local
+Chat context and later turns cannot retrieve the Word text; any provider-side
+retention remains governed by the selected Codex or API provider's policy.
+
 ### Startup diagnostics
 
 When Agent mode starts, the chat reports whether an API key is configured, the
@@ -116,3 +137,4 @@ confirmation at the point of risk.
 Copyright (c) 2025 Shengyan Lin. Original project and UI licensed under the MIT
 license in `LICENSE`. Codex-specific adapter changes are provided under the
 same license.
+

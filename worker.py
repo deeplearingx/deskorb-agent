@@ -46,6 +46,7 @@ class CodexWorker(threading.Thread):
         self._running = True
         self._session_id: str | None = None
         self._turn_id: str | None = None
+        self._turn_thread_id: str | None = None
         self._model = self._normalize_model(model)
         self._backend = self._normalize_backend(backend or CONNECTION_BACKEND)
         self._api_base_url = self._normalize_api_base(api_base_url or API_BASE_URL)
@@ -71,6 +72,10 @@ class CodexWorker(threading.Thread):
     # -- UI-facing API -------------------------------------------------
     def ask(self, text: str, image_paths=None):
         self.req.put(("ask", (text, list(image_paths or []))))
+
+    def ask_ephemeral(self, text: str, image_paths=None):
+        """Run one turn without adding its input to normal conversation memory."""
+        self.req.put(("ask_ephemeral", (text, list(image_paths or []))))
 
     def reset(self):
         self.req.put(("reset", None))
@@ -110,7 +115,9 @@ class CodexWorker(threading.Thread):
         turn_id = self._turn_id
         if turn_id:
             try:
-                self._send("turn/interrupt", {"threadId": self._session_id, "turnId": turn_id})
+                self._send("turn/interrupt", {
+                    "threadId": self._turn_thread_id or self._session_id, "turnId": turn_id,
+                })
                 return
             except Exception:
                 pass
@@ -139,6 +146,8 @@ class CodexWorker(threading.Thread):
             try:
                 if kind == "ask":
                     self._run_turn(*payload)
+                elif kind == "ask_ephemeral":
+                    self._run_turn(*payload, ephemeral=True)
                 elif kind == "reset":
                     self._session_id = None
                     self._api_context.clear()
@@ -327,7 +336,7 @@ class CodexWorker(threading.Thread):
         self._session_id = str(response["result"]["thread"]["id"])
 
     # -- turn execution ------------------------------------------------
-    def _run_turn(self, text: str, image_paths: list[str]):
+    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
         self._interrupted = False
         self._tool_items_seen.clear()
         active = self._resolved_backend()
@@ -335,26 +344,26 @@ class CodexWorker(threading.Thread):
         try:
             if active == "api":
                 try:
-                    self._run_api_turn(text, image_paths)
+                    self._run_api_turn(text, image_paths, ephemeral=ephemeral)
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ API 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
-                        self._run_codex_turn(text, image_paths)
+                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral)
                     else:
                         raise
             elif active == "agent":
                 try:
-                    self._run_agent_turn(text, image_paths)
+                    self._run_agent_turn(text, image_paths, ephemeral=ephemeral)
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ Agent 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
-                        self._run_codex_turn(text, image_paths)
+                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral)
                     else:
                         raise
             else:
-                self._run_codex_turn(text, image_paths)
+                self._run_codex_turn(text, image_paths, ephemeral=ephemeral)
         except BaseException as exc:
             if self._interrupted:
                 self.ui.put(("system", "⏹ stopped."))
@@ -362,15 +371,31 @@ class CodexWorker(threading.Thread):
                 self.ui.put(("error", f"Could not run {active.upper()}: {type(exc).__name__}: {exc}"))
         finally:
             self._turn_id = None
+            self._turn_thread_id = None
             with self._api_lock:
                 self._api_response = None
             self.ui.put(("status", ""))
             self.ui.put(("turn_done", None))
 
-    def _run_codex_turn(self, text: str, image_paths: list[str]):
+    def _run_codex_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
         if not self._codex:
             raise RuntimeError("Codex CLI is not installed or is not on PATH")
-        first_turn = self._session_id is None
+        if ephemeral:
+            self._start_server()
+            cwd = str(Path(WORKING_DIR).expanduser())
+            if not os.path.isdir(cwd):
+                cwd = str(Path.home())
+            request_id = self._send("thread/start", {
+                "cwd": cwd, "model": self._model, "sandbox": self._sandbox(),
+                "approvalPolicy": "never", "serviceTier": _SERVICE_TIER,
+            })
+            response = self._wait_for(lambda m: m.get("id") == request_id, 30)
+            thread_id = str(response["result"]["thread"]["id"])
+            first_turn = True
+        else:
+            first_turn = self._session_id is None
+            self._ensure_thread()
+            thread_id = self._session_id
         prompt = text
         if first_turn and SYSTEM_APPEND:
             prompt = "[OVERLAY CONTEXT]\n" + SYSTEM_APPEND.strip() + "\n[/OVERLAY CONTEXT]\n\n" + text
@@ -381,13 +406,13 @@ class CodexWorker(threading.Thread):
                 "⏳ 正在建立 Codex 连接。当前网络会先回退到 HTTPS，首次回复可能需要约 2 分钟；后续提问会复用连接并明显加快。",
             ))
         try:
-            self._ensure_thread()
+            self._turn_thread_id = thread_id
             input_items: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
             input_items += [{"type": "localImage", "path": str(Path(p).expanduser()), "detail": "auto"} for p in image_paths if os.path.isfile(str(Path(p).expanduser()))]
-            request_id = self._send("turn/start", {"threadId": self._session_id, "input": input_items, "approvalPolicy": "never", "serviceTier": _SERVICE_TIER})
+            request_id = self._send("turn/start", {"threadId": thread_id, "input": input_items, "approvalPolicy": "never", "serviceTier": _SERVICE_TIER})
             response = self._wait_for(lambda m: m.get("id") == request_id, 30)
             self._turn_id = str(response.get("result", {}).get("turn", {}).get("id") or "") or None
-            self._wait_for(lambda m: m.get("method") == "turn/completed" and m.get("params", {}).get("threadId") == self._session_id, 360)
+            self._wait_for(lambda m: m.get("method") == "turn/completed" and m.get("params", {}).get("threadId") == thread_id, 360)
             if self._interrupted:
                 self.ui.put(("system", "⏹ stopped."))
         except BaseException as exc:
@@ -395,17 +420,19 @@ class CodexWorker(threading.Thread):
                 raise
             else:
                 self._stop_server()
-                self._session_id = None
+                if not ephemeral:
+                    self._session_id = None
                 raise
 
-    def _run_api_turn(self, text: str, image_paths: list[str]):
+    def _run_api_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
         api_key = get_api_key()
         if not api_key:
             raise RuntimeError("API Key 未配置；点击底部状态栏打开 Connection settings")
         self.ui.put(("status", "API connecting…"))
-        self._maybe_compact_api_context(api_key)
+        if not ephemeral:
+            self._maybe_compact_api_context(api_key)
         content: list[dict[str, Any]] = [{
-            "type": "input_text", "text": self._api_context.build_input(text),
+            "type": "input_text", "text": text if ephemeral else self._api_context.build_input(text),
         }]
         for raw_path in image_paths:
             path = Path(raw_path).expanduser()
@@ -476,11 +503,15 @@ class CodexWorker(threading.Thread):
         elif not completed:
             raise RuntimeError("API stream ended before response.completed")
         else:
-            self._api_context.add_turn(text, "".join(answer_parts))
-            self.ui.put(("ctx", self._api_context.usage_percent()))
+            if not ephemeral:
+                self._api_context.add_turn(text, "".join(answer_parts))
+                self.ui.put(("ctx", self._api_context.usage_percent()))
 
-    def _run_agent_turn(self, text: str, image_paths: list[str]):
-        self._agent.run_turn(text, image_paths)
+    def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+        if ephemeral:
+            self._agent.run_ephemeral_turn(text, image_paths)
+        else:
+            self._agent.run_turn(text, image_paths)
 
     def _open_api_response(self, payload: dict[str, Any], api_key: str, accept: str):
         endpoint = self._api_base_url
@@ -720,3 +751,4 @@ class CodexWorker(threading.Thread):
         except Exception:
             try: proc.kill()
             except Exception: pass
+
