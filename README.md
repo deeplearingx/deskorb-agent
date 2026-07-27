@@ -82,6 +82,72 @@ settings window take precedence over this file.
 API mode provides chat and image/screenshot understanding. Use **agent** mode for
 local shell/file tools and Windows mouse/keyboard control; Codex mode is optional.
 
+### Local MCP: browser and PowerToys
+
+Agent mode includes two local MCP servers on demand: Microsoft's Playwright MCP for
+browser/web/search tasks, and DeskOrb's `powertoys_mcp.py` for supported PowerToys
+configuration tasks. The task router starts only the relevant server: a web task does
+not boot PowerToys, a PowerToys task does not boot Playwright, and an ordinary desktop
+task starts neither. Custom servers can declare lightweight intent metadata; DeskOrb
+then routes matching requests automatically. When a request is ambiguous, the model sees
+only the small configured capability catalog, selects one integration, and then loads
+only that server's real tools. Browser snapshots are read-only,
+while navigation, clicking, typing and scrolling use the same task-level confirmation
+policy as desktop input. Submitting, purchasing, sending, uploading private data,
+deleting, or changing permissions still requires a fresh confirmation.
+
+The PowerToys MCP uses the locally installed `PowerToys.DSC.exe`, never a shell.
+It can inspect installed modules, settings, schemas, and backups; it can dry-run setting
+changes. It can also apply a small multi-module productivity profile (up to eight changes)
+after preflighting every entry; if a later entry fails, already-applied entries are rolled
+back automatically. Writes are deliberately limited to reversible productivity modules:
+**Advanced Paste, Always on Top, Awake, Color Picker, Crop and Lock, FancyZones, Image
+Resizer, mouse utilities, Peek, PowerRename, Shortcut Guide, Workspaces, and ZoomIt**.
+Every write is a fresh high-risk confirmation. The service preflights the proposed partial
+change, takes an in-memory backup, applies it, and rereads it to verify. A returned backup
+ID can be used by the separately confirmed restore action while the MCP session remains
+open. Keyboard Manager, Hosts, Environment Variables, Registry Preview, and global App
+settings remain read-only until explicitly reviewed and added to the allowlist.
+
+To use another trusted local MCP server, copy
+[`mcp.servers.example.json`](mcp.servers.example.json), edit it, and set:
+
+```text
+DESKORB_AGENT_MCP_CONFIG=C:\path\to\mcp.servers.json
+```
+
+The file uses the standard `mcpServers` JSON shape (`command`, `args`, optional
+`env`, `cwd`, and `enabled`). A custom file replaces the defaults, so keep the
+`powertoys` entry if you want that integration. Set `DESKORB_AGENT_PLAYWRIGHT_MCP=0`
+to disable the default Playwright server. Chrome DevTools MCP can be configured this
+way when you explicitly want to attach to a Chrome instance started with remote
+debugging; Playwright MCP is the default because it runs in a separate local browser
+profile.
+
+For automatic routing of a custom integration, add the optional DeskOrb-only metadata
+(other MCP clients safely ignore it):
+
+```json
+"deskorb": {
+  "description": "Search the company knowledge base",
+  "keywords": ["knowledge base", "wiki", "内部文档", "知识库"]
+}
+```
+
+### Practical Windows desktop control
+
+In Agent mode, DeskOrb can launch supported applications and use verified mouse,
+keyboard, hotkey, and scrolling input. For reliable window operations it now lists
+visible top-level windows first and returns a short-lived `window_id`; the agent then
+uses that exact ID to focus, minimize, maximize, restore, snap left/right, move/resize,
+or toggle topmost. This avoids guessing window titles or stale screen coordinates.
+
+One task confirmation covers ordinary navigation and window layout steps. Closing a
+window always needs a fresh confirmation. Reading clipboard text also needs a fresh
+confirmation because clipboard contents can contain passwords, private text, or tokens.
+After coordinate/keyboard/window actions, DeskOrb captures a fresh desktop observation
+before continuing.
+
 ### One-time Word attachment in Chat
 
 Focus an editable Microsoft Word document, open DeskOrb Agent, select **Read current
@@ -137,4 +203,3 @@ confirmation at the point of risk.
 Copyright (c) 2025 Shengyan Lin. Original project and UI licensed under the MIT
 license in `LICENSE`. Codex-specific adapter changes are provided under the
 same license.
-

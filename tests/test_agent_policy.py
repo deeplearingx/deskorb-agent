@@ -12,6 +12,10 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
         self.assertEqual(decision.risk, Risk.OBSERVE)
 
+    def test_window_listing_is_allowed_in_read_only_mode(self):
+        decision = self.policy.decide("desktop_list_windows", execution_requested=False, full_access=False)
+        self.assertEqual(decision.kind, DecisionKind.ALLOW)
+
     def test_write_requires_explicit_execution_intent(self):
         decision = self.policy.decide("filesystem_write", execution_requested=False, full_access=True)
         self.assertEqual(decision.kind, DecisionKind.DENY)
@@ -33,7 +37,7 @@ class ToolPolicyTests(unittest.TestCase):
                 self.assertEqual(decision.kind, DecisionKind.CONFIRM)
 
     def test_scroll_and_focus_require_confirmation(self):
-        for tool in ("desktop_scroll", "window_focus"):
+        for tool in ("desktop_scroll", "window_focus", "window_control", "desktop_clipboard_read_text"):
             with self.subTest(tool=tool):
                 decision = self.policy.decide(tool, execution_requested=True, full_access=True)
             self.assertEqual(decision.kind, DecisionKind.CONFIRM)
@@ -43,7 +47,7 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(decision.kind, DecisionKind.CONFIRM)
 
     def test_task_authorization_allows_normal_desktop_steps(self):
-        for tool in ("application_launch", "desktop_click", "desktop_type", "desktop_hotkey"):
+        for tool in ("application_launch", "desktop_click", "desktop_type", "desktop_hotkey", "window_control"):
             with self.subTest(tool=tool):
                 decision = self.policy.decide(tool, execution_requested=True, full_access=True,
                                               task_authorized=True)

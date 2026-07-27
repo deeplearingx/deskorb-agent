@@ -61,9 +61,16 @@ API_BASE_URL = (os.environ.get("OPENAI_BASE_URL", "").strip() or _provider_api_b
 API_PROXY_URL = os.environ.get("DESKORB_AGENT_API_PROXY", os.environ.get("CODEX_OVERLAY_API_PROXY", "")).strip()
 API_MODEL = _provider_api_model("gpt-5.6-terra")
 API_TIMEOUT = _env_int("DESKORB_AGENT_API_TIMEOUT", 180, 15, 900)
+API_REQUEST_RETRIES = _env_int("DESKORB_AGENT_API_REQUEST_RETRIES", 2, 0, 4)
 API_CONTEXT_TOKEN_BUDGET = _env_int("DESKORB_AGENT_CONTEXT_TOKENS", 24_000, 4_000, 200_000)
 API_CONTEXT_RECENT_TURNS = _env_int("DESKORB_AGENT_RECENT_TURNS", 6, 2, 24)
 API_CONTEXT_SUMMARY_TOKENS = _env_int("DESKORB_AGENT_SUMMARY_TOKENS", 1_200, 256, 4_096)
+# Local MCP bridge. With no config file DeskOrb starts Microsoft's Playwright MCP server
+# through npx on demand. Set DESKORB_AGENT_MCP_CONFIG to a standard mcpServers JSON file
+# to replace or add trusted local servers; set PLAYWRIGHT_MCP=0 to disable the default.
+MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
+PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
+MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
 PERMISSION_MODE = "workspace-write"
                                  # the STARTUP permission mode; flip it at run time with the
                                  # status-bar "Read-only" toggle (◉ = "plan", a read-only agent
@@ -283,4 +290,3 @@ THEMES = {
     },
 }
 T = THEMES.get(THEME, THEMES["light"])
-

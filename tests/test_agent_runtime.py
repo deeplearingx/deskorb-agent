@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import io
+import urllib.error
 from pathlib import Path
 from queue import Queue
 from unittest.mock import Mock, patch
@@ -66,6 +68,34 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertTrue(AgentRuntime._execution_requested("打开 Google Chrome"))
         self.assertTrue(AgentRuntime._execution_requested("launch Edge"))
 
+    def test_mcp_router_activates_only_relevant_default_server(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+
+        self.assertEqual(runtime._mcp_servers_for_task("打开浏览器搜索淘宝 T 恤"), ("playwright",))
+        self.assertEqual(runtime._mcp_servers_for_task("启用 PowerToys 保持唤醒"), ("powertoys",))
+        self.assertEqual(runtime._mcp_servers_for_task("打开记事本并输入 hello"), ())
+
+    def test_mcp_router_uses_custom_intent_keywords_and_discovery_tool(self):
+        class FakeMcp:
+            available_servers = ("knowledge",)
+
+            def server_catalog(self):
+                return [{"name": "knowledge", "description": "Search internal documentation",
+                         "keywords": ["wiki", "知识库"]}]
+
+            def schemas(self, servers):
+                return [{"type": "function", "name": "mcp_knowledge_search", "parameters": {}}]
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakeMcp()
+        self.assertEqual(runtime._mcp_servers_for_task("查一下公司知识库"), ("knowledge",))
+        chooser = next(item for item in runtime._available_schemas("帮我找内部文档")
+                       if item["name"] == "mcp_enable_server")
+        self.assertIn("knowledge", chooser["description"])
+        result = runtime._run_local_tool("mcp_enable_server", {"server_name": "knowledge"})
+        self.assertTrue(result["ok"])
+        self.assertIn("mcp_knowledge_search", [item["name"] for item in runtime._available_schemas("帮我找内部文档")])
+
     def test_attachment_note_is_removed_from_task_summary(self):
         text = "[Attached: a live screenshot of my screen — monitor 1 (primary).]\n\n打开QQ，发送消息"
         self.assertEqual(AgentRuntime._clean_task_text(text), "打开QQ，发送消息")
@@ -110,10 +140,17 @@ class ReadOnlyToolsTests(unittest.TestCase):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
         self.assertFalse(runtime._high_risk_call("desktop_type", {"risk_level": "normal"}))
         self.assertTrue(runtime._high_risk_call("desktop_type", {"risk_level": "high"}))
+        self.assertTrue(runtime._high_risk_call("desktop_clipboard_read_text", {}))
+        self.assertTrue(runtime._high_risk_call("window_control", {"action": "close"}))
         runtime._task_authorized_until = __import__("time").monotonic() + 10
         self.assertTrue(runtime._task_authorized())
         runtime.set_permission_mode("plan")
         self.assertFalse(runtime._task_authorized())
+
+    def test_window_control_schema_is_non_strict_for_optional_bounds(self):
+        schema = next(item for item in ControlledTools.schemas() if item["name"] == "window_control")
+        self.assertFalse(schema["strict"])
+        self.assertEqual(schema["parameters"]["required"], ["window_id", "action"])
 
     def test_desktop_observation_is_appended_after_action(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
@@ -182,8 +219,68 @@ class ReadOnlyToolsTests(unittest.TestCase):
         payload = request.call_args.args[0]
         self.assertEqual(payload["input"][0]["content"][0]["text"], "private Word contents")
 
+    def test_captcha_handoff_pauses_and_resumes_the_same_browser_task(self):
+        class FakeMcp:
+            def owns(self, name):
+                return name == "mcp_playwright_browser_snapshot"
+
+            def is_high_risk(self, name):
+                return False
+
+            def is_action(self, name):
+                return False
+
+            def schemas(self):
+                return []
+
+            def call(self, name, arguments):
+                return {"ok": True, "content": [{"type": "text", "text": "快速验证身份：我是人类"}]}
+
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakeMcp()
+        responses = iter([
+            {"output": [{"type": "function_call", "call_id": "call-captcha",
+                         "name": "mcp_playwright_browser_snapshot", "arguments": "{}"}]},
+            {"output_text": "Found a T-shirt priced ¥129.", "output": []},
+        ])
+        runtime._request = lambda payload, key: next(responses)
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_turn("打开淘宝并搜索 100 到 150 元的 T 恤", [])
+            paused = []
+            while not events.empty():
+                paused.append(events.get_nowait())
+            runtime.run_turn(runtime.HUMAN_VERIFICATION_CONTINUE, [])
+        resumed = paused
+        while not events.empty():
+            resumed.append(events.get_nowait())
+
+        handoff = next(payload for kind, payload in paused if kind == "human_verification")
+        self.assertEqual(handoff["marker"], "快速验证身份")
+        self.assertTrue(any(kind == "delta" and "¥129" in payload for kind, payload in resumed))
+        self.assertIsNone(runtime._pending_human_verification)
+        self.assertFalse(runtime._task_authorized())
+
+    def test_request_retries_transient_http_502_then_succeeds(self):
+        class Response:
+            def read(self, _limit):
+                return b'{"output_text":"RECOVERED"}'
+
+            def close(self):
+                return None
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        transient = urllib.error.HTTPError("https://example.test/v1/responses", 502, "Bad Gateway", {},
+                                            io.BytesIO(b'{"error":"temporary"}'))
+        with patch("agent_runtime.urllib.request.urlopen", side_effect=[transient, Response()]) as open_call, \
+             patch("agent_runtime.time.sleep") as sleep:
+            response = runtime._request({"model": "test"}, "key")
+        self.assertEqual(response["output_text"], "RECOVERED")
+        self.assertEqual(open_call.call_count, 2)
+        sleep.assert_called_once()
+
 
 
 if __name__ == "__main__":
     unittest.main()
-

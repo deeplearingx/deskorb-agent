@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "powertoys": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["powertoys_mcp.py"],
+      "cwd": "."
+    }
+  }
+}

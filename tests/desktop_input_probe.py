@@ -31,7 +31,10 @@ def main() -> int:
         y = entry.winfo_rooty() + entry.winfo_height() // 2
         clicked = tools.click(state["snapshot_id"], x, y, "left")
         tools.user32.SetForegroundWindow(root.winfo_id()); root.update(); entry.focus_force(); root.update(); time.sleep(0.15); root.update()
-        typed = tools.type_text(state["snapshot_id"], expected)
+        typing_state = tools.capture_state()
+        if not typing_state.get("ok"):
+            raise RuntimeError(typing_state.get("error", "could not refresh state before typing"))
+        typed = tools.type_text(typing_state["snapshot_id"], expected)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             root.update()
@@ -39,7 +42,8 @@ def main() -> int:
                 break
             time.sleep(0.03)
         print(json.dumps({"ok": clicked.get("ok") and typed.get("ok") and entry.get() == expected,
-                          "click_ok": clicked.get("ok"), "type_ok": typed.get("ok"),
+                          "click_ok": clicked.get("ok"), "click_error": clicked.get("error"),
+                          "type_ok": typed.get("ok"), "type_error": typed.get("error"),
                           "value_exact": entry.get() == expected}, ensure_ascii=False))
         return 0 if entry.get() == expected else 2
     except Exception as exc:

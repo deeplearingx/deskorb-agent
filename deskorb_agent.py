@@ -2739,6 +2739,62 @@ class Overlay:
             self.chat.see("end")
         self._prune_chat()
 
+    def add_human_verification(self, payload):
+        """Render a manual CAPTCHA handoff without exposing a CAPTCHA solution to the agent."""
+        info = payload if isinstance(payload, dict) else {}
+        marker = str(info.get("marker") or "验证码")
+        page = str(info.get("page") or "当前浏览器页面")
+        timeout = max(1, int(info.get("timeout_seconds") or 900)) // 60
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["accent"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(9))
+        title = tk.Label(card, text="需要你完成浏览器验证", bg=T["field"], fg=T["accent"],
+                         font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        detail = tk.Label(
+            card,
+            text=(f"检测到“{marker}”。请切换到受控浏览器，在那里自行完成验证。"
+                  f"\n完成后点击下方继续；Agent 会先重新读取页面再继续任务。"
+                  f"\n页面：{page}\n此接管将在约 {timeout} 分钟后过期。"),
+            bg=T["field"], fg=T["text"], font=self.f_small, justify="left", anchor="w",
+            wraplength=self.px(300),
+        )
+        detail.pack(fill="x", pady=(self.px(3), self.px(9)))
+        actions = tk.Frame(card, bg=T["field"])
+        actions.pack(fill="x")
+
+        def respond(continue_task):
+            if getattr(card, "_resolved", False) or self.busy:
+                return
+            card._resolved = True
+            resume.configure(state="disabled")
+            cancel.configure(state="disabled")
+            self.add_user("✓ 我已完成验证，继续任务" if continue_task else "✕ 已取消验证码接管")
+            command = ("__deskorb_human_verification_complete__" if continue_task
+                       else "__deskorb_human_verification_cancel__")
+            self.worker.ask(command, [])
+            self._set_busy(True)
+
+        resume = tk.Button(actions, text="我已完成验证，继续", command=lambda: respond(True),
+                           bg=T["accent"], fg=T["on_accent"], activebackground=T["accent"],
+                           activeforeground=T["on_accent"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        resume.pack(side="left")
+        cancel = tk.Button(actions, text="取消任务", command=lambda: respond(False),
+                           bg=T["field"], fg=T["muted"], activebackground=T["hover"],
+                           activeforeground=T["text"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        cancel.pack(side="left", padx=(self.px(6), 0))
+        for child in (card, title, detail, actions, resume, cancel):
+            child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
     def add_err(self, text):
         self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
@@ -3913,6 +3969,8 @@ class Overlay:
             self.add_sys(str(payload))
         elif kind == "approval":
             self.add_approval(str(payload))
+        elif kind == "human_verification":
+            self.add_human_verification(payload)
         elif kind == "update":
             self._update_available = str(payload)
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
@@ -3997,4 +4055,3 @@ if __name__ == "__main__":
         Overlay().run()
     except KeyboardInterrupt:
         sys.exit(0)
-
