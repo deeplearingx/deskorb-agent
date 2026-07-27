@@ -118,4 +118,3 @@ def _word_error_message(exc: Exception) -> str:
     if message:
         return f"Word couldn't read the current document: {message}"
     return "Word couldn't read the current document. Close any Word dialog and try again."
-

@@ -104,4 +104,3 @@ Add focused `unittest` coverage with mocked COM, worker, and UI boundaries:
 - The UI never displays the full Word text and does not send a screenshot with
   the attachment.
 - The maintained unit-test suite passes.
-
