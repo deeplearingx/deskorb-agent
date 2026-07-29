@@ -426,11 +426,22 @@ class AgentRuntime:
             self._task_authorized_until = 0.0
             raise
 
-    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def run_office_plan_turn(self, text: str):
+        """Generate an ephemeral Office plan with no local or MCP tool access."""
+        try:
+            return self._run_turn(text, [], ephemeral=True, allow_tools=False)
+        except BaseException:
+            self._task_authorized_until = 0.0
+            raise
+
+    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
+                  allow_tools: bool = True):
         api_key = get_api_key()
         if not api_key:
             raise RuntimeError("API Key is not configured")
         self._cancelled.clear()
+        if not allow_tools:
+            return self._run_no_tools_ephemeral_turn(api_key, text)
         verification_status, continuation = self._resolve_human_verification(text)
         if verification_status == "cancelled":
             self._task_authorized_until = 0.0
@@ -496,6 +507,23 @@ class AgentRuntime:
             transcript.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
             transcript = self._append_desktop_observation(transcript, call.name)
         return self._run_task_loop(api_key, transcript, original_text, ephemeral)
+
+    def _run_no_tools_ephemeral_turn(self, api_key: str, text: str) -> None:
+        """One isolated text response; function calls are an error, never dispatched."""
+        payload = {
+            "model": self.model,
+            "instructions": SYSTEM_APPEND,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+            "tools": [],
+            "stream": False,
+        }
+        response = self._request(payload, api_key)
+        if function_calls(response):
+            raise RuntimeError("Office planning responses must not contain tool calls")
+        answer = self._extract_text(response)
+        if not answer:
+            raise RuntimeError("Office planning response contained no text")
+        self.ui.put(("delta", answer))
 
     def _run_task_loop(self, api_key: str, transcript: list[dict[str, Any]], original_text: str,
                        ephemeral: bool) -> None:

@@ -77,6 +77,10 @@ class CodexWorker(threading.Thread):
         """Run one turn without adding its input to normal conversation memory."""
         self.req.put(("ask_ephemeral", (text, list(image_paths or []))))
 
+    def ask_office_plan(self, text: str):
+        """Run an isolated, no-tools Office planning turn."""
+        self.req.put(("ask_office_plan", str(text)))
+
     def reset(self):
         self.req.put(("reset", None))
 
@@ -148,6 +152,8 @@ class CodexWorker(threading.Thread):
                     self._run_turn(*payload)
                 elif kind == "ask_ephemeral":
                     self._run_turn(*payload, ephemeral=True)
+                elif kind == "ask_office_plan":
+                    self._run_turn(payload, [], ephemeral=True, office_plan=True)
                 elif kind == "reset":
                     self._session_id = None
                     self._api_context.clear()
@@ -336,7 +342,8 @@ class CodexWorker(threading.Thread):
         self._session_id = str(response["result"]["thread"]["id"])
 
     # -- turn execution ------------------------------------------------
-    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
+                  office_plan: bool = False):
         self._interrupted = False
         self._tool_items_seen.clear()
         active = self._resolved_backend()
@@ -344,26 +351,26 @@ class CodexWorker(threading.Thread):
         try:
             if active == "api":
                 try:
-                    self._run_api_turn(text, image_paths, ephemeral=ephemeral)
+                    self._run_api_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ API 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
-                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral)
+                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
                     else:
                         raise
             elif active == "agent":
                 try:
-                    self._run_agent_turn(text, image_paths, ephemeral=ephemeral)
+                    self._run_agent_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ Agent 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
-                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral)
+                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
                     else:
                         raise
             else:
-                self._run_codex_turn(text, image_paths, ephemeral=ephemeral)
+                self._run_codex_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
         except BaseException as exc:
             if self._interrupted:
                 self.ui.put(("system", "⏹ stopped."))
@@ -375,9 +382,10 @@ class CodexWorker(threading.Thread):
             with self._api_lock:
                 self._api_response = None
             self.ui.put(("status", ""))
-            self.ui.put(("turn_done", None))
+            self.ui.put(("office_plan_done" if office_plan else "turn_done", None))
 
-    def _run_codex_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def _run_codex_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
+                         office_plan: bool = False):
         if not self._codex:
             raise RuntimeError("Codex CLI is not installed or is not on PATH")
         if ephemeral:
@@ -386,7 +394,8 @@ class CodexWorker(threading.Thread):
             if not os.path.isdir(cwd):
                 cwd = str(Path.home())
             request_id = self._send("thread/start", {
-                "cwd": cwd, "model": self._model, "sandbox": self._sandbox(),
+                "cwd": cwd, "model": self._model,
+                "sandbox": "read-only" if office_plan else self._sandbox(),
                 "approvalPolicy": "never", "serviceTier": _SERVICE_TIER,
             })
             response = self._wait_for(lambda m: m.get("id") == request_id, 30)
@@ -424,7 +433,8 @@ class CodexWorker(threading.Thread):
                     self._session_id = None
                 raise
 
-    def _run_api_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def _run_api_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
+                      office_plan: bool = False):
         api_key = get_api_key()
         if not api_key:
             raise RuntimeError("API Key 未配置；点击底部状态栏打开 Connection settings")
@@ -447,6 +457,8 @@ class CodexWorker(threading.Thread):
             "input": [{"role": "user", "content": content}],
             "stream": True,
         }
+        if office_plan:
+            payload["tools"] = []
         response = self._open_api_response(payload, api_key, "text/event-stream")
         with self._api_lock:
             self._api_response = response
@@ -507,7 +519,11 @@ class CodexWorker(threading.Thread):
                 self._api_context.add_turn(text, "".join(answer_parts))
                 self.ui.put(("ctx", self._api_context.usage_percent()))
 
-    def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
+                        office_plan: bool = False):
+        if office_plan:
+            self._agent.run_office_plan_turn(text)
+            return
         if ephemeral:
             self._agent.run_ephemeral_turn(text, image_paths)
         else:

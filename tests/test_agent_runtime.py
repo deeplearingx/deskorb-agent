@@ -219,6 +219,21 @@ class ReadOnlyToolsTests(unittest.TestCase):
         payload = request.call_args.args[0]
         self.assertEqual(payload["input"][0]["content"][0]["text"], "private Word contents")
 
+    def test_office_plan_turn_is_ephemeral_and_has_no_tools(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.context.add_turn("ordinary", "answer")
+        before = runtime.context.build_input("next")
+        request = Mock(return_value={"output_text": "{\"answer\":\"x\",\"plan\":null}", "output": []})
+        runtime._request = request
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_office_plan_turn("private Office snapshot")
+
+        payload = request.call_args.args[0]
+        self.assertEqual(payload["tools"], [])
+        self.assertEqual(payload["input"][0]["content"][0]["text"], "private Office snapshot")
+        self.assertEqual(runtime.context.build_input("next"), before)
+
     def test_captcha_handoff_pauses_and_resumes_the_same_browser_task(self):
         class FakeMcp:
             def owns(self, name):

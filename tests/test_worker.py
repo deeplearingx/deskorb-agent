@@ -74,6 +74,40 @@ class CodexWorkerTests(unittest.TestCase):
             ("ask_ephemeral", ("private Word contents", [])),
         )
 
+    def test_ask_office_plan_queues_a_dedicated_request_kind(self):
+        self.worker.ask_office_plan("private Office snapshot")
+        self.assertEqual(self.worker.req.get_nowait(), ("ask_office_plan", "private Office snapshot"))
+
+    def test_office_plan_agent_turn_uses_no_tools_runtime_and_terminal_event(self):
+        self.worker._backend = "agent"
+        with patch.object(self.worker._agent, "run_office_plan_turn") as run_turn:
+            self.worker._run_turn("private Office snapshot", [], ephemeral=True, office_plan=True)
+        run_turn.assert_called_once_with("private Office snapshot")
+        self.assertIn(("office_plan_done", None), self.drain())
+
+    def test_office_plan_codex_turn_uses_temporary_read_only_thread(self):
+        self.worker._codex = "codex"
+        self.worker._session_id = "normal-thread"
+        sent = []
+
+        def send(method, payload):
+            sent.append((method, payload))
+            return len(sent)
+
+        responses = iter([
+            {"result": {"thread": {"id": "temporary-thread"}}},
+            {"result": {"turn": {"id": "temporary-turn"}}},
+            {"method": "turn/completed", "params": {"threadId": "temporary-thread"}},
+        ])
+        with patch.object(self.worker, "_start_server"), \
+                patch.object(self.worker, "_send", side_effect=send), \
+                patch.object(self.worker, "_wait_for", side_effect=lambda predicate, timeout: next(responses)):
+            self.worker._run_codex_turn("private Office snapshot", [], ephemeral=True, office_plan=True)
+
+        self.assertEqual(self.worker._session_id, "normal-thread")
+        self.assertEqual(sent[0][0], "thread/start")
+        self.assertEqual(sent[0][1]["sandbox"], "read-only")
+
     def test_agent_compact_routes_to_independent_runtime(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "compact", return_value=None) as compact:
