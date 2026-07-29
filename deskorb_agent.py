@@ -1080,6 +1080,12 @@ class Overlay:
         request_id = self._chat_word_read_sequence
         self._chat_word_read_request = request_id
         self._refresh_chat_word_attachment()
+        try:
+            self._chat_word_read_timeout_after = self.root.after(
+                15_000, lambda: self._expire_chat_word_read(request_id)
+            )
+        except Exception:
+            self._chat_word_read_timeout_after = None
         threading.Thread(target=self._read_chat_excel_bg, args=(request_id, hwnd),
                          name="chat-excel-read", daemon=True).start()
 
@@ -1093,6 +1099,13 @@ class Overlay:
         if getattr(self, "_chat_word_read_request", None) != request_id:
             return
         self._chat_word_read_request = None
+        timeout_after = getattr(self, "_chat_word_read_timeout_after", None)
+        self._chat_word_read_timeout_after = None
+        if timeout_after is not None:
+            try:
+                self.root.after_cancel(timeout_after)
+            except Exception:
+                pass
         if error is not None or snapshot is None:
             self.add_err(str(error or "Excel didn't return a readable workbook. Try again."))
             self._clear_chat_word_attachment()
