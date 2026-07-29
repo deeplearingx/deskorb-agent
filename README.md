@@ -39,6 +39,8 @@ Configuration overrides:
   window region; it defaults to the frameless-window setting.
 - `DESKORB_AGENT_RECENT_TURNS`: verbatim API recency window (defaults to `6`)
 - `DESKORB_AGENT_SUMMARY_TOKENS`: rolling-summary output cap (defaults to `1200`)
+- `DESKORB_AGENT_OFFICE_MAX_NONEMPTY_CELLS`: Excel attachment cell cap (defaults to `10000`)
+- `DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS`: Office attachment character cap (defaults to `120000`)
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
 - `DESKORB_AGENT_SERVICE_TIER`: CLI service tier (defaults to `fast`)
 - `DESKORB_AGENT_SHOT_SCOPE`: `screens` or `window`
@@ -161,6 +163,29 @@ only the document name and character count, and DeskOrb clears the extracted tex
 from local memory after sending, cancellation, timeout, or failure. Normal local
 Chat context and later turns cannot retrieve the Word text; any provider-side
 retention remains governed by the selected Codex or API provider's policy.
+
+### Word and Excel edit previews
+
+Focus an editable Word document or Excel workbook before opening DeskOrb, then choose
+**Read current Word** or **Read current Excel**. Excel reads every worksheet's used
+range, subject to the configured limits. Ask for an analysis or a text/cell/formula
+change. DeskOrb sends the Office content in a one-turn, no-tools planning request and
+shows the model answer plus a local **Apply changes** / **Discard** choice when a
+validated edit plan is available.
+
+Apply is never automatic: it rereads the current Office source and rejects it if the
+window, document identity, structure, value, or formula changed after the preview.
+The first release edits only Word body/table text and Excel cell values/formulas; it
+does not alter formatting, comments, charts, macros, or workbook structure. It never
+saves, closes, or creates Office files. Save or undo from Office yourself.
+
+### Known local environment issue: PowerShell 7
+
+The maintained Agent-runtime regression `test_shell_runner_returns_bounded_evidence`
+requires PowerShell 7 (`pwsh`). On a machine without it, that one test fails because
+shell execution is intentionally unavailable; this is an environment prerequisite, not
+an Office feature failure. Install PowerShell 7 or set `DESKORB_AGENT_PWSH` to its
+executable path, then rerun the test suite.
 
 ### Startup diagnostics
 
