@@ -3166,8 +3166,14 @@ class Overlay:
 
     def _add_office_plan_actions(self, plan: OfficeEditPlan):
         actions = tk.Frame(self.chat, bg=T["bg"])
-        tk.Label(actions, text=f"Preview: {len(plan.edits)} change(s); document will not be saved.",
-                 bg=T["bg"], fg=T["muted"], font=self.f_small).pack(side="left", padx=(0, self.px(6)))
+        previews = []
+        for edit in plan.edits:
+            before = edit.expected_value
+            after = edit.value if getattr(edit, "formula", None) is None else edit.formula
+            previews.append(f"{edit.locator}: {before!r} → {after!r}")
+        tk.Label(actions, text=("Preview (not saved):\n" + "\n".join(previews)),
+                 bg=T["bg"], fg=T["muted"], font=self.f_small, justify="left",
+                 anchor="w").pack(side="left", padx=(0, self.px(6)))
         tk.Button(actions, text="Apply changes", command=self._apply_pending_office_plan,
                   bg=T["accent"], fg=T["on_accent"], relief="flat", bd=0,
                   font=self.f_small, cursor="hand2").pack(side="left")
