@@ -82,6 +82,20 @@ settings window take precedence over this file.
 API mode provides chat and image/screenshot understanding. Use **agent** mode for
 local shell/file tools and Windows mouse/keyboard control; Codex mode is optional.
 
+### Model providers
+
+DeskOrb has a model adapter layer. It uses OpenAI's **Responses API** for OpenAI and
+Responses-compatible gateways, and automatically switches to the OpenAI-compatible
+**Chat Completions API** for DeepSeek and Qwen/DashScope. Agent tool calls, tool results,
+images, and multi-step tasks remain in one internal format, so the desktop tools do not
+need vendor-specific implementations.
+
+Choose a provider in **Connection settings**, or set `DESKORB_AGENT_PROVIDER` to one of
+`auto`, `openai`, `responses`, `openai-compatible`, `qwen`, or `deepseek`. In `auto`
+mode, official DeepSeek and DashScope URLs are detected; unknown custom URLs retain the
+existing Responses-compatible behavior. Use `openai-compatible` for compatible
+Chat-Completions endpoints such as a trusted local gateway.
+
 ### Local MCP: browser and PowerToys
 
 Agent mode includes two local MCP servers on demand: Microsoft's Playwright MCP for

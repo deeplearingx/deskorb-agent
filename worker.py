@@ -23,11 +23,12 @@ from typing import Any
 
 from config import (API_BASE_URL, API_CONTEXT_RECENT_TURNS, API_CONTEXT_SUMMARY_TOKENS,
                     API_CONTEXT_TOKEN_BUDGET, API_MODEL, API_PROXY_URL, API_TIMEOUT,
-                    CONNECTION_BACKEND, MODEL, PERMISSION_MODE, SYSTEM_APPEND, WORKING_DIR)
+                    CONNECTION_BACKEND, MODEL, MODEL_PROVIDER, PERMISSION_MODE, SYSTEM_APPEND, WORKING_DIR)
 from agent_runtime import AgentRuntime
 from conversation_context import ConversationContext
 from credential_store import get_api_key
 from debuglog import DEBUG_LOG, _UIQueueTap, dbg
+from model_adapter import ModelAdapter, normalize_provider
 
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -39,7 +40,8 @@ class CodexWorker(threading.Thread):
 
     def __init__(self, ui_queue: "queue.Queue", permission_mode: str | None = None,
                  backend: str | None = None, model: str | None = None,
-                 api_base_url: str | None = None, api_proxy_url: str | None = None):
+                 api_base_url: str | None = None, api_proxy_url: str | None = None,
+                 model_provider: str | None = None):
         super().__init__(daemon=True, name="deskorb-agent-worker")
         self.ui = _UIQueueTap(ui_queue) if DEBUG_LOG else ui_queue
         self.req: "queue.Queue[tuple[str, Any]]" = queue.Queue()
@@ -51,6 +53,9 @@ class CodexWorker(threading.Thread):
         self._backend = self._normalize_backend(backend or CONNECTION_BACKEND)
         self._api_base_url = self._normalize_api_base(api_base_url or API_BASE_URL)
         self._api_proxy_url = self._normalize_proxy(api_proxy_url if api_proxy_url is not None else API_PROXY_URL)
+        self._model_provider = normalize_provider(model_provider or MODEL_PROVIDER)
+        self._adapter = ModelAdapter(self._model_provider, self._api_base_url)
+        self._api_base_url = self._adapter.profile.base_url
         self._api_context = ConversationContext(
             token_budget=API_CONTEXT_TOKEN_BUDGET,
             recent_turns=API_CONTEXT_RECENT_TURNS,
@@ -59,7 +64,8 @@ class CodexWorker(threading.Thread):
         self._api_lock = threading.Lock()
         self._permission_mode = permission_mode or PERMISSION_MODE
         self._agent = AgentRuntime(self.ui, self._model, self._api_base_url, self._api_proxy_url,
-                                   full_access=self._permission_mode != "plan")
+                                   full_access=self._permission_mode != "plan",
+                                   model_provider=self._model_provider)
         self._proc: subprocess.Popen[str] | None = None
         self._proc_lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -87,10 +93,10 @@ class CodexWorker(threading.Thread):
         self.req.put(("set_model", str(model)))
 
     def configure_connection(self, backend: str, model: str, api_base_url: str,
-                             api_proxy_url: str = ""):
+                             api_proxy_url: str = "", model_provider: str = "auto"):
         self.req.put(("configure_connection", {
             "backend": backend, "model": model, "api_base_url": api_base_url,
-            "api_proxy_url": api_proxy_url,
+            "api_proxy_url": api_proxy_url, "model_provider": model_provider,
         }))
 
     def set_permission_mode(self, mode: str):
@@ -160,7 +166,7 @@ class CodexWorker(threading.Thread):
                     self._model = self._normalize_model(payload)
                     self._session_id = None
                     self._api_context.clear()
-                    self._agent.configure(self._model, self._api_base_url, self._api_proxy_url)
+                    self._agent.configure(self._model, self._api_base_url, self._api_proxy_url, self._model_provider)
                     self.ui.put(("model", self._model))
                     self.ui.put(("status", "model changed; a new chat will start on the next turn"))
                 elif kind == "configure_connection":
@@ -168,15 +174,18 @@ class CodexWorker(threading.Thread):
                     self._model = self._normalize_model(payload.get("model"))
                     self._api_base_url = self._normalize_api_base(payload.get("api_base_url"))
                     self._api_proxy_url = self._normalize_proxy(payload.get("api_proxy_url"))
+                    self._model_provider = normalize_provider(payload.get("model_provider"))
+                    self._adapter = ModelAdapter(self._model_provider, self._api_base_url)
+                    self._api_base_url = self._adapter.profile.base_url
                     self._session_id = None
                     self._api_context.clear()
-                    self._agent.configure(self._model, self._api_base_url, self._api_proxy_url)
+                    self._agent.configure(self._model, self._api_base_url, self._api_proxy_url, self._model_provider)
                     self.ui.put(("model", self._model))
                     self.ui.put(("backend", self._backend_status()))
                     self.ui.put(("connection_done", {
                         "backend": self._backend, "active": self._resolved_backend(),
                         "model": self._model, "api_base_url": self._api_base_url,
-                        "api_proxy_url": self._api_proxy_url,
+                        "api_proxy_url": self._api_proxy_url, "model_provider": self._model_provider,
                     }))
                 elif kind == "set_permission_mode":
                     self._permission_mode = str(payload)
@@ -469,7 +478,27 @@ class CodexWorker(threading.Thread):
                 except json.JSONDecodeError:
                     continue
                 event_type = str(event.get("type", ""))
-                if event_type == "response.output_text.delta":
+                if self._adapter.protocol == "chat_completions" and isinstance(event.get("choices"), list):
+                    choice = event["choices"][0] if event["choices"] else {}
+                    message = choice.get("message") if isinstance(choice, dict) else None
+                    if isinstance(message, dict):
+                        # Some compatible gateways ignore stream=true and return
+                        # one ordinary chat-completion object.
+                        completed = True
+                        if not saw_delta:
+                            text_out = self._extract_api_text(self._adapter.normalize_response(event))
+                            if text_out:
+                                answer_parts.append(text_out)
+                                self.ui.put(("delta", text_out))
+                    delta = choice.get("delta") if isinstance(choice, dict) else {}
+                    text_delta = delta.get("content") if isinstance(delta, dict) else None
+                    if text_delta:
+                        saw_delta = True
+                        answer_parts.append(str(text_delta))
+                        self.ui.put(("delta", str(text_delta)))
+                    if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+                        completed = True
+                elif event_type == "response.output_text.delta":
                     delta = event.get("delta")
                     if delta:
                         saw_delta = True
@@ -489,7 +518,7 @@ class CodexWorker(threading.Thread):
                 elif not event_type and isinstance(event, dict) and event.get("id"):
                     # A compatible endpoint may ignore stream=true and return one JSON object.
                     completed = True
-                    text_out = self._extract_api_text(event)
+                    text_out = self._extract_api_text(self._adapter.normalize_response(event))
                     if text_out:
                         answer_parts.append(text_out)
                         self.ui.put(("delta", text_out))
@@ -514,12 +543,11 @@ class CodexWorker(threading.Thread):
             self._agent.run_turn(text, image_paths)
 
     def _open_api_response(self, payload: dict[str, Any], api_key: str, accept: str):
-        endpoint = self._api_base_url
-        if not endpoint.lower().endswith("/responses"):
-            endpoint += "/responses"
+        endpoint = self._adapter.endpoint
+        request_body = self._adapter.prepare_request(payload)
         request = urllib.request.Request(
             endpoint,
-            data=json.dumps(payload).encode("utf-8"),
+            data=json.dumps(request_body).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -583,7 +611,7 @@ class CodexWorker(threading.Thread):
             self._api_response = response
         try:
             raw = response.read(2 * 1024 * 1024).decode("utf-8", "replace")
-            result = json.loads(raw)
+            result = self._adapter.normalize_response(json.loads(raw))
             if isinstance(result, dict) and result.get("error"):
                 raise RuntimeError(self._api_error_detail(result))
             summary = self._extract_api_text(result)
@@ -751,4 +779,3 @@ class CodexWorker(threading.Thread):
         except Exception:
             try: proc.kill()
             except Exception: pass
-

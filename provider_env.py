@@ -37,8 +37,13 @@ _VALUES = _read_file()
 
 
 def api_key() -> str:
-    return (os.environ.get("OPENAI_API_KEY", "").strip() or _VALUES.get("api-key", "")
-            or _VALUES.get("openai_api_key", ""))
+    return (os.environ.get("OPENAI_API_KEY", "").strip()
+            or os.environ.get("DEEPSEEK_API_KEY", "").strip()
+            or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+            or os.environ.get("QWEN_API_KEY", "").strip()
+            or _VALUES.get("api-key", "") or _VALUES.get("openai_api_key", "")
+            or _VALUES.get("deepseek_api_key", "") or _VALUES.get("dashscope_api_key", "")
+            or _VALUES.get("qwen_api_key", ""))
 
 
 def api_base_url() -> str:

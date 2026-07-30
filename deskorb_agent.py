@@ -142,6 +142,7 @@ class Overlay:
             self._backend = CONNECTION_BACKEND
         self._api_base_url = _state_text(saved_state, "api_base_url", API_BASE_URL)
         self._api_proxy_url = _state_text(saved_state, "api_proxy_url", API_PROXY_URL)
+        self._model_provider = _state_text(saved_state, "model_provider", MODEL_PROVIDER)
         startup_model = _state_text(saved_state, "model", API_MODEL)
         self._active_backend = self._backend
         _ensure_shot_dir()          # before the worker, so a bad TEMP can't crash us mid-startup
@@ -152,7 +153,8 @@ class Overlay:
         self.worker = CodexWorker(self.ui_q, permission_mode=_launch_mode,
                                   backend=self._backend, model=startup_model,
                                   api_base_url=self._api_base_url,
-                                  api_proxy_url=self._api_proxy_url)
+                                  api_proxy_url=self._api_proxy_url,
+                                  model_provider=self._model_provider)
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
@@ -3647,7 +3649,7 @@ class Overlay:
         self._backend = value
         _save_state(connection_backend=value)
         self.worker.configure_connection(value, self._model, self._api_base_url,
-                                         self._api_proxy_url)
+                                         self._api_proxy_url, self._model_provider)
         self._set_status("switching connection…")
 
     def _open_connection_settings(self):
@@ -3662,6 +3664,7 @@ class Overlay:
         win.transient(self.root)
 
         backend_var = tk.StringVar(value=self._backend)
+        provider_var = tk.StringVar(value=self._model_provider)
         model_var = tk.StringVar(value=self._model or API_MODEL)
         base_var = tk.StringVar(value=self._api_base_url or API_BASE_URL)
         proxy_var = tk.StringVar(value=self._api_proxy_url)
@@ -3671,7 +3674,7 @@ class Overlay:
 
         body = tk.Frame(win, bg=T["bg"], padx=18, pady=16)
         body.grid(row=0, column=0, sticky="nsew")
-        labels = ("Connection", "Model ID", "API base URL", "HTTP proxy (optional)", "API Key")
+        labels = ("Connection", "Provider", "Model ID", "API base URL", "HTTP proxy (optional)", "API Key")
         for row, label in enumerate(labels):
             tk.Label(body, text=label, bg=T["bg"], fg=T["muted"],
                      font=self.f_small, anchor="w").grid(row=row, column=0, sticky="w", pady=5)
@@ -3683,24 +3686,31 @@ class Overlay:
         backend_menu["menu"].configure(bg=T["field"], fg=T["text"])
         backend_menu.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=5)
 
+        provider_menu = tk.OptionMenu(body, provider_var, "auto", "openai", "responses",
+                                      "openai-compatible", "qwen", "deepseek")
+        provider_menu.configure(bg=T["field"], fg=T["text"], activebackground=T["accent"],
+                                activeforeground=T["on_accent"], bd=0, highlightthickness=0, width=28)
+        provider_menu["menu"].configure(bg=T["field"], fg=T["text"])
+        provider_menu.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=5)
+
         entries = []
-        for row, variable, show in ((1, model_var, ""), (2, base_var, ""),
-                                    (3, proxy_var, ""), (4, key_var, "•")):
+        for row, variable, show in ((2, model_var, ""), (3, base_var, ""),
+                                    (4, proxy_var, ""), (5, key_var, "•")):
             entry = tk.Entry(body, textvariable=variable, show=show, bg=T["field"], fg=T["text"],
                              insertbackground=T["text"], relief="flat", width=38)
             entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=5, ipady=5)
             entries.append(entry)
 
         tk.Label(body, textvariable=status_var, bg=T["bg"], fg=T["faint"],
-                 font=self.f_small, anchor="w").grid(row=5, column=0, columnspan=2,
+                 font=self.f_small, anchor="w").grid(row=6, column=0, columnspan=2,
                                                       sticky="w", pady=(6, 10))
         error_var = tk.StringVar()
         tk.Label(body, textvariable=error_var, bg=T["bg"], fg=T["err"],
-                 font=self.f_small, anchor="w", wraplength=390).grid(row=6, column=0,
+                 font=self.f_small, anchor="w", wraplength=390).grid(row=7, column=0,
                                                                       columnspan=2, sticky="w")
 
         buttons = tk.Frame(body, bg=T["bg"])
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def clear_key():
             try:
@@ -3712,11 +3722,15 @@ class Overlay:
 
         def save():
             backend = backend_var.get().strip().lower()
+            provider = provider_var.get().strip().lower()
             model = model_var.get().strip()
             base = base_var.get().strip().rstrip("/")
             proxy = proxy_var.get().strip().rstrip("/")
             if backend not in ("auto", "codex", "api", "agent"):
                 error_var.set("Connection must be auto, agent, api, or codex.")
+                return
+            if provider not in ("auto", "openai", "responses", "openai-compatible", "qwen", "deepseek"):
+                error_var.set("Provider must be auto, openai, responses, openai-compatible, qwen, or deepseek.")
                 return
             if not model:
                 error_var.set("Model ID cannot be empty.")
@@ -3736,12 +3750,13 @@ class Overlay:
                     return
                 self._backend = backend
                 self._model = model
+                self._model_provider = provider
                 self._api_base_url = base
                 self._api_proxy_url = proxy
-                _save_state(connection_backend=backend, model=model, api_base_url=base,
-                            api_proxy_url=proxy)
-                self.worker.configure_connection(backend, model, base, proxy)
-                self.add_sys(f"🔌 Connection updated: {backend} · {model}")
+                _save_state(connection_backend=backend, model_provider=provider, model=model,
+                            api_base_url=base, api_proxy_url=proxy)
+                self.worker.configure_connection(backend, model, base, proxy, provider)
+                self.add_sys(f"🔌 Connection updated: {provider} · {model}")
                 win.destroy()
             except Exception as exc:
                 error_var.set(f"Could not save settings: {exc}")
@@ -3917,6 +3932,7 @@ class Overlay:
                                         if self._backend == "auto" else self._backend)
                 self._api_base_url = str(payload.get("api_base_url") or self._api_base_url)
                 self._api_proxy_url = str(payload.get("api_proxy_url") or "")
+                self._model_provider = str(payload.get("model_provider") or self._model_provider)
             self._set_status("")
             self._refresh_statusline()
         elif kind == "ctx":

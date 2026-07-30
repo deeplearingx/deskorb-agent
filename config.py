@@ -58,6 +58,10 @@ if CONNECTION_BACKEND not in ("auto", "codex", "api", "agent"):
     CONNECTION_BACKEND = "auto"
 API_BASE_URL = (os.environ.get("OPENAI_BASE_URL", "").strip() or _provider_api_base_url()
                 or "https://api.openai.com/v1").rstrip("/")
+# ``auto`` detects DeepSeek and DashScope/Qwen from their official base URLs;
+# unknown custom endpoints retain the project's existing Responses-compatible
+# behaviour.  Set openai-compatible for Ollama, vLLM and similar chat APIs.
+MODEL_PROVIDER = os.environ.get("DESKORB_AGENT_PROVIDER", "auto").strip().lower() or "auto"
 API_PROXY_URL = os.environ.get("DESKORB_AGENT_API_PROXY", os.environ.get("CODEX_OVERLAY_API_PROXY", "")).strip()
 API_MODEL = _provider_api_model("gpt-5.6-terra")
 API_TIMEOUT = _env_int("DESKORB_AGENT_API_TIMEOUT", 180, 15, 900)
