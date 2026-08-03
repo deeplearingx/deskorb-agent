@@ -7,7 +7,14 @@ import json
 import re
 from typing import Any, Callable
 
-from office_sources import OfficeSnapshot, OfficeTarget, _load_com_modules, root_window, read_active_office_snapshot
+from office_sources import (
+    OfficeSnapshot,
+    OfficeTarget,
+    _load_com_modules,
+    _normalize_word_text,
+    read_active_office_snapshot,
+    root_window,
+)
 
 
 class OfficePlanError(ValueError):
@@ -222,7 +229,7 @@ def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> None
         for edit in plan.edits:
             if kind == "word":
                 actual = _read_word_text(document, edit.locator)
-                expected = edit.value
+                expected = _normalize_word_text(edit.value)
             elif edit.formula is not None:
                 actual = str(_resolve_excel_cell(document, edit.locator).Formula or "")
                 expected = edit.formula
@@ -266,7 +273,7 @@ def _write_word_text(document: Any, edit: WordTextEdit) -> None:
 
 def _read_word_text(document: Any, locator: str) -> str:
     text = str(_resolve_word_range(document, locator).Text or "")
-    return text.replace("\r\x07", "").replace("\r", "").replace("\x07", "")
+    return _normalize_word_text(text)
 
 
 def _resolve_word_range(document: Any, locator: str) -> Any:

@@ -151,6 +151,21 @@ class OfficeHistoryTests(unittest.TestCase):
 
 
 class OfficePlanApplyTests(unittest.TestCase):
+    def test_word_verification_normalizes_word_paragraph_breaks(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, _verify_targets
+
+        plan = OfficeEditPlan(
+            "word", "word-fingerprint",
+            (WordTextEdit("paragraph:3", "Old", "Summary\n\nSecond line"),),
+        )
+        word_range = Mock()
+        word_range.Text = "Summary\rSecond line\r"
+
+        with patch("office_edits._resolve_word_range", return_value=word_range), \
+                patch("office_edits._with_active_document") as with_document:
+            with_document.side_effect = lambda kind, root, fingerprint, callback: callback(Mock())
+            _verify_targets("word", 101, plan)
+
     def test_post_write_verification_does_not_require_prewrite_fingerprint(self):
         from office_edits import _with_active_document
 
