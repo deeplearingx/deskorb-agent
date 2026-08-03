@@ -3181,11 +3181,13 @@ class Overlay:
             previews.append(f"{edit.locator}: {before!r} → {after!r}")
         tk.Label(actions, text=("Preview (not saved):\n" + "\n".join(previews)),
                  bg=T["bg"], fg=T["muted"], font=self.f_small, justify="left",
-                 anchor="w").pack(side="left", padx=(0, self.px(6)))
-        tk.Button(actions, text="Apply changes", command=self._apply_pending_office_plan,
+                 anchor="w").pack(side="top", fill="x")
+        buttons = tk.Frame(actions, bg=T["bg"])
+        buttons.pack(side="top", anchor="w", pady=(self.px(3), 0))
+        tk.Button(buttons, text="Apply changes", command=self._apply_pending_office_plan,
                   bg=T["accent"], fg=T["on_accent"], relief="flat", bd=0,
                   font=self.f_small, cursor="hand2").pack(side="left")
-        tk.Button(actions, text="Discard", command=self._discard_pending_office_plan,
+        tk.Button(buttons, text="Discard", command=self._discard_pending_office_plan,
                   bg=T["field"], fg=T["muted"], relief="flat", bd=0,
                   font=self.f_small, cursor="hand2").pack(side="left", padx=self.px(4))
         self.chat.window_create("end", window=actions, pady=self.px(3))

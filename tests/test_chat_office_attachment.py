@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from deskorb_agent import Overlay
 from office_sources import OfficeSnapshot, OfficeTarget
@@ -51,6 +51,24 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
 
         self.assertEqual(overlay._office_plan_raw, ['{"answer":"private"}'])
         overlay.add_delta.assert_not_called()
+
+    def test_office_preview_places_actions_below_long_preview_text(self):
+        from office_edits import OfficeEditPlan, WordTextEdit
+
+        overlay = self._overlay()
+        overlay.chat = Mock()
+        overlay.px = lambda value: value
+        overlay.f_small = "small"
+        plan = OfficeEditPlan("word", "fingerprint", (
+            WordTextEdit("paragraph:3", "A long original paragraph", "A long replacement paragraph"),
+        ))
+
+        with patch("deskorb_agent.tk.Frame", side_effect=[Mock(), Mock()]), \
+                patch("deskorb_agent.tk.Label") as label, \
+                patch("deskorb_agent.tk.Button"):
+            overlay._add_office_plan_actions(plan)
+
+        label.return_value.pack.assert_called_once_with(side="top", fill="x")
 
 
 if __name__ == "__main__":
