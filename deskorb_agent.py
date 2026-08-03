@@ -1073,7 +1073,7 @@ class Overlay:
         self._office_apply_active = False
         self._office_generation = getattr(self, "_office_generation", 0) + 1
 
-    def _clear_chat_word_attachment(self, cancel_read=False):
+    def _clear_chat_word_attachment(self, cancel_read=True):
         self._clear_persistent_office(cancel_read=cancel_read)
         self.chat_word_attachment = None
         self._refresh_chat_word_attachment()
@@ -3145,7 +3145,7 @@ class Overlay:
         self.add_user(f"{question} [{snapshot.kind.title()} attachment: {snapshot.name}]")
         self._office_plan_active = True
         self._office_plan_raw = []
-        self.worker.ask_office_context(question, prompt)
+        self.worker.ask_office_context(question, prompt, self._office_generation)
         self._set_busy(True)
 
     @staticmethod
@@ -3213,6 +3213,7 @@ class Overlay:
         self._office_plan_active = False
         raw = "".join(self._office_plan_raw)
         self._office_plan_raw = []
+        self._pending_office_plan = None
         snapshot = self.chat_office_snapshot
         self._set_busy(False)
         if snapshot is None:
@@ -4141,6 +4142,15 @@ class Overlay:
                 self._office_plan_raw.append("" if payload is None else str(payload))
             else:
                 self.add_delta(payload)
+        elif kind == "office_delta":
+            try:
+                generation, delta = payload
+            except (TypeError, ValueError):
+                return
+            if generation != getattr(self, "_office_generation", 0):
+                return
+            if getattr(self, "_office_plan_active", False):
+                self._office_plan_raw.append("" if delta is None else str(delta))
         elif kind == "think":
             self.add_think(payload)
         elif kind == "tool":
@@ -4169,6 +4179,8 @@ class Overlay:
             self._set_busy(False)
             self._maybe_flag_done()      # badge the orb if this finished while collapsed
         elif kind == "office_plan_done":
+            if payload is not None and payload != getattr(self, "_office_generation", 0):
+                return
             self._finish_office_plan()
         elif kind == "compacting":
             self._start_compact_anim()

@@ -81,9 +81,9 @@ class CodexWorker(threading.Thread):
         """Run an isolated, no-tools Office planning turn."""
         self.req.put(("ask_office_plan", str(text)))
 
-    def ask_office_context(self, question: str, office_prompt: str):
+    def ask_office_context(self, question: str, office_prompt: str, generation: int | None = None):
         """Run a persistent Office follow-up with a temporary document prompt."""
-        self.req.put(("ask_office_context", (str(question), str(office_prompt))))
+        self.req.put(("ask_office_context", (str(question), str(office_prompt), generation)))
 
     def reset(self):
         self.req.put(("reset", None))
@@ -159,9 +159,11 @@ class CodexWorker(threading.Thread):
                 elif kind == "ask_office_plan":
                     self._run_turn(payload, [], ephemeral=True, office_plan=True)
                 elif kind == "ask_office_context":
+                    generation = payload[2] if len(payload) > 2 else None
                     self._run_turn(
                         payload[1], [], ephemeral=True,
                         office_plan=True, office_context=True,
+                        office_generation=generation,
                     )
                 elif kind == "reset":
                     self._session_id = None
@@ -352,20 +354,29 @@ class CodexWorker(threading.Thread):
 
     # -- turn execution ------------------------------------------------
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                  office_plan: bool = False, office_context: bool = False):
+                  office_plan: bool = False, office_context: bool = False,
+                  office_generation: int | None = None):
         self._interrupted = False
         self._tool_items_seen.clear()
+        previous_office_generation = getattr(self, "_office_event_generation", None)
+        self._office_event_generation = office_generation if office_plan else None
         active = self._resolved_backend()
         self.ui.put(("backend", self._backend_status()))
         try:
             if active == "api":
                 try:
-                    self._run_api_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
+                    self._run_api_turn(
+                        text, image_paths, ephemeral=ephemeral,
+                        office_plan=office_plan, office_generation=office_generation,
+                    )
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ API 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
-                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
+                        self._run_codex_turn(
+                            text, image_paths, ephemeral=ephemeral,
+                            office_plan=office_plan, office_generation=office_generation,
+                        )
                     else:
                         raise
             elif active == "agent":
@@ -373,12 +384,16 @@ class CodexWorker(threading.Thread):
                     self._run_agent_turn(
                         text, image_paths, ephemeral=ephemeral,
                         office_plan=office_plan, office_context=office_context,
+                        office_generation=office_generation,
                     )
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ Agent 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
                         self.ui.put(("backend", "auto→codex"))
-                        self._run_codex_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
+                        self._run_codex_turn(
+                            text, image_paths, ephemeral=ephemeral,
+                            office_plan=office_plan, office_generation=office_generation,
+                        )
                     else:
                         raise
             else:
@@ -394,10 +409,12 @@ class CodexWorker(threading.Thread):
             with self._api_lock:
                 self._api_response = None
             self.ui.put(("status", ""))
-            self.ui.put(("office_plan_done" if office_plan else "turn_done", None))
+            self._office_event_generation = previous_office_generation
+            done_payload = office_generation if office_generation is not None else None
+            self.ui.put(("office_plan_done" if office_plan else "turn_done", done_payload))
 
     def _run_codex_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                         office_plan: bool = False):
+                         office_plan: bool = False, office_generation: int | None = None):
         if not self._codex:
             raise RuntimeError("Codex CLI is not installed or is not on PATH")
         if ephemeral:
@@ -446,7 +463,7 @@ class CodexWorker(threading.Thread):
                 raise
 
     def _run_api_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                      office_plan: bool = False):
+                      office_plan: bool = False, office_generation: int | None = None):
         api_key = get_api_key()
         if not api_key:
             raise RuntimeError("API Key 未配置；点击底部状态栏打开 Connection settings")
@@ -499,7 +516,7 @@ class CodexWorker(threading.Thread):
                         saw_delta = True
                         text_delta = str(delta)
                         answer_parts.append(text_delta)
-                        self.ui.put(("delta", text_delta))
+                        self._emit_delta(text_delta, office_generation)
                 elif event_type == "response.completed":
                     completed = True
                     result = event.get("response") or {}
@@ -507,7 +524,7 @@ class CodexWorker(threading.Thread):
                         text_out = self._extract_api_text(result)
                         if text_out:
                             answer_parts.append(text_out)
-                            self.ui.put(("delta", text_out))
+                            self._emit_delta(text_out, office_generation)
                 elif event_type in ("response.failed", "response.incomplete", "error"):
                     raise RuntimeError(self._api_error_detail(event))
                 elif not event_type and isinstance(event, dict) and event.get("id"):
@@ -516,7 +533,7 @@ class CodexWorker(threading.Thread):
                     text_out = self._extract_api_text(event)
                     if text_out:
                         answer_parts.append(text_out)
-                        self.ui.put(("delta", text_out))
+                        self._emit_delta(text_out, office_generation)
         finally:
             try:
                 response.close()
@@ -532,9 +549,13 @@ class CodexWorker(threading.Thread):
                 self.ui.put(("ctx", self._api_context.usage_percent()))
 
     def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                        office_plan: bool = False, office_context: bool = False):
+        office_plan: bool = False, office_context: bool = False,
+                        office_generation: int | None = None):
         if office_context:
-            self._agent.run_office_context_turn(text)
+            if office_generation is None:
+                self._agent.run_office_context_turn(text)
+            else:
+                self._agent.run_office_context_turn(text, event_token=office_generation)
             return
         if office_plan:
             self._agent.run_office_plan_turn(text)
@@ -543,6 +564,12 @@ class CodexWorker(threading.Thread):
             self._agent.run_ephemeral_turn(text, image_paths)
         else:
             self._agent.run_turn(text, image_paths)
+
+    def _emit_delta(self, text: str, office_generation: int | None = None):
+        if office_generation is None:
+            self.ui.put(("delta", text))
+        else:
+            self.ui.put(("office_delta", (office_generation, text)))
 
     def _open_api_response(self, payload: dict[str, Any], api_key: str, accept: str):
         endpoint = self._api_base_url
@@ -672,7 +699,7 @@ class CodexWorker(threading.Thread):
         if method == "item/agentMessage/delta":
             delta = params.get("delta")
             if delta:
-                self.ui.put(("delta", str(delta)))
+                self._emit_delta(str(delta), getattr(self, "_office_event_generation", None))
         elif method in ("item/started", "item/updated", "item/completed"):
             self._handle_item(params.get("item"), method.replace("/", "."))
         elif method == "error":
@@ -724,7 +751,7 @@ class CodexWorker(threading.Thread):
         if item_type == "agent_message":
             text = item.get("text") or item.get("message")
             if event_type == "item.completed" and text:
-                self.ui.put(("delta", str(text)))
+                self._emit_delta(str(text), getattr(self, "_office_event_generation", None))
             return
         if item_type in ("reasoning", "reasoning_summary"):
             text = item.get("text") or item.get("summary")

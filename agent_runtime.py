@@ -434,9 +434,11 @@ class AgentRuntime:
             self._task_authorized_until = 0.0
             raise
 
-    def run_office_context_turn(self, question: str, office_prompt: str | None = None):
+    def run_office_context_turn(self, question: str, office_prompt: str | None = None,
+                                event_token: int | None = None):
         """Answer a persistent Office follow-up without storing Office text in context."""
         try:
+            self._office_event_token = event_token
             return self._run_turn(
                 office_prompt if office_prompt is not None else question,
                 [], ephemeral=True, allow_tools=False,
@@ -444,6 +446,8 @@ class AgentRuntime:
         except BaseException:
             self._task_authorized_until = 0.0
             raise
+        finally:
+            self._office_event_token = None
 
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                   allow_tools: bool = True):
@@ -534,7 +538,8 @@ class AgentRuntime:
         answer = self._extract_text(response)
         if not answer:
             raise RuntimeError("Office planning response contained no text")
-        self.ui.put(("delta", answer))
+        token = getattr(self, "_office_event_token", None)
+        self.ui.put(("office_delta", (token, answer)) if token is not None else ("delta", answer))
 
     def _run_task_loop(self, api_key: str, transcript: list[dict[str, Any]], original_text: str,
                        ephemeral: bool) -> None:

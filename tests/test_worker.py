@@ -82,7 +82,7 @@ class CodexWorkerTests(unittest.TestCase):
         self.worker.ask_office_context("撤回刚才的修改", "private Office snapshot and history")
         self.assertEqual(
             self.worker.req.get_nowait(),
-            ("ask_office_context", ("撤回刚才的修改", "private Office snapshot and history")),
+            ("ask_office_context", ("撤回刚才的修改", "private Office snapshot and history", None)),
         )
 
     def test_office_plan_agent_turn_uses_no_tools_runtime_and_terminal_event(self):
@@ -97,10 +97,14 @@ class CodexWorkerTests(unittest.TestCase):
         with patch.object(self.worker._agent, "run_office_context_turn") as run_turn:
             self.worker._run_turn(
                 "question and private Office context", [],
-                ephemeral=True, office_plan=True, office_context=True,
+                ephemeral=True, office_plan=True, office_context=True, office_generation=7,
             )
-        run_turn.assert_called_once_with("question and private Office context")
-        self.assertIn(("office_plan_done", None), self.drain())
+        run_turn.assert_called_once_with("question and private Office context", event_token=7)
+        self.assertIn(("office_plan_done", 7), self.drain())
+
+    def test_office_delta_is_tagged_with_generation(self):
+        self.worker._emit_delta("private Office response", 7)
+        self.assertEqual(self.drain(), [("office_delta", (7, "private Office response"))])
 
     def test_office_plan_codex_turn_uses_temporary_read_only_thread(self):
         self.worker._codex = "codex"

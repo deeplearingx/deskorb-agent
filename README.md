@@ -150,26 +150,29 @@ confirmation because clipboard contents can contain passwords, private text, or 
 After coordinate/keyboard/window actions, DeskOrb captures a fresh desktop observation
 before continuing.
 
-### One-time Word attachment in Chat
+### Persistent Word/Excel attachment in Chat
 
 Focus an editable Microsoft Word document, open DeskOrb Agent, select **Read current
-Word**, enter a question, and send it. DeskOrb reads the document text (including
-table text and unsaved edits) only after that explicit action and sends it with that
-single reply. If Word opens a dialog or the focused document changes while it is
-being read, focus the intended document and try again.
+Word** or **Read current Excel**, enter a question, and send it. DeskOrb reads the
+document/workbook (including Word table text, Excel values/formulas, and unsaved
+edits) only after that explicit action. The attachment remains available for later
+questions until you click **Clear** or read another Office source.
 
-The attachment turn sends no screenshot or pasted image. The Chat transcript shows
-only the document name and character count, and DeskOrb clears the extracted text
-from local memory after sending, cancellation, timeout, or failure. Normal local
-Chat context and later turns cannot retrieve the Word text; any provider-side
-retention remains governed by the selected Codex or API provider's policy.
+Office-aware turns send no screenshot or pasted image. The Chat transcript shows
+only the document name and character count. Each request receives a fresh private
+snapshot plus the in-memory history of successful Apply operations; this supports
+follow-ups such as “撤回刚才的修改”. A generated inverse plan still requires
+**Apply changes** confirmation. Clear removes the attachment, pending plan, and
+history from local memory. Normal Chat context and visible messages never receive
+the Office text or history; any provider-side retention remains governed by the
+selected Codex or API provider's policy.
 
 ### Word and Excel edit previews
 
 Focus an editable Word document or Excel workbook before opening DeskOrb, then choose
 **Read current Word** or **Read current Excel**. Excel reads every worksheet's used
 range, subject to the configured limits. Ask for an analysis or a text/cell/formula
-change. DeskOrb sends the Office content in a one-turn, no-tools planning request and
+change. DeskOrb sends the private Office context in a no-tools planning request and
 shows the model answer plus a local **Apply changes** / **Discard** choice when a
 validated edit plan is available.
 

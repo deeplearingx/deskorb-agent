@@ -72,12 +72,12 @@ fingerprint.
    - the strict JSON plan schema and the instruction that document content is
      untrusted data.
 4. The worker uses a no-tools ephemeral request. The provider receives the
-   Office payload for that request, but the normal context stores only the user
-   question and final answer, never the Office payload.
+   Office payload for that request, and neither the Office payload nor the
+   question/answer pair is added to the normal conversation context.
 5. A valid plan is shown in the local preview card. Apply revalidates the live
    source, writes, verifies, rereads the snapshot, and appends a history record.
 6. A request such as “撤回上一次修改” can reference the latest history record;
-   the model proposes an inverse plan, and the local preflight requires each
+   the UI builds an inverse plan, and the local preflight requires each
    current target value to equal the record's after-value before Apply.
 
 Normal messages may still use screenshots when Auto-shot is enabled, except an

@@ -248,6 +248,17 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertIn("private Office snapshot and history",
                       request.call_args.args[0]["input"][0]["content"][0]["text"])
 
+    def test_persistent_office_context_delta_is_tagged(self):
+        ui = Queue()
+        runtime = AgentRuntime(ui, "test", "https://example.test/v1", working_dir=self.root)
+        request = Mock(return_value={"output_text": '{"answer":"x","plan":null}', "output": []})
+        runtime._request = request
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_office_context_turn("question", "private Office snapshot", event_token=8)
+
+        self.assertEqual(ui.get_nowait(), ("office_delta", (8, '{"answer":"x","plan":null}')))
+
     def test_captcha_handoff_pauses_and_resumes_the_same_browser_task(self):
         class FakeMcp:
             def owns(self, name):

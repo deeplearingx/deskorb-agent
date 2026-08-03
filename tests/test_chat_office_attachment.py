@@ -17,6 +17,9 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         overlay.office_edit_history = []
         overlay._office_generation = 0
         overlay._office_operation_sequence = 0
+        overlay._chat_word_read_sequence = 0
+        overlay._chat_word_read_request = None
+        overlay._chat_word_read_timeout_after = None
         overlay.add_user = Mock()
         overlay.add_err = Mock()
         overlay.add_delta = Mock()
@@ -103,6 +106,48 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         self.assertEqual(overlay._office_plan_raw, [])
         self.assertFalse(overlay._office_plan_active)
         self.assertEqual(overlay._office_generation, 1)
+
+    def test_late_office_delta_and_done_are_ignored_after_clear(self):
+        overlay = self._overlay()
+        overlay._office_generation = 4
+        overlay._office_plan_active = True
+        overlay._handle("office_delta", (4, "private response"))
+        self.assertEqual(overlay._office_plan_raw, ["private response"])
+        overlay._finish_office_plan = Mock()
+
+        overlay._clear_persistent_office()
+        overlay._handle("office_delta", (4, "late private response"))
+        overlay._handle("office_plan_done", 4)
+
+        self.assertEqual(overlay._office_plan_raw, [])
+        overlay._finish_office_plan.assert_not_called()
+
+    def test_malformed_office_response_keeps_attachment_for_retry(self):
+        overlay = self._overlay()
+        snapshot = Mock()
+        overlay.chat_office_snapshot = snapshot
+        overlay._office_plan_active = True
+        overlay._office_plan_raw = ["not-json"]
+        overlay._pending_office_plan = Mock()
+        overlay._md_finalize = Mock()
+        overlay._finish_turn_copy = Mock()
+
+        overlay._finish_office_plan()
+
+        self.assertIs(overlay.chat_office_snapshot, snapshot)
+        self.assertIsNone(overlay._pending_office_plan)
+
+    def test_clear_cancels_pending_read_and_invalidates_late_read(self):
+        overlay = self._overlay()
+        overlay.root = Mock()
+        overlay._chat_word_read_request = 3
+        overlay._chat_word_read_timeout_after = "timer"
+
+        overlay._clear_chat_word_attachment()
+
+        overlay.root.after_cancel.assert_called_once_with("timer")
+        self.assertIsNone(overlay._chat_word_read_request)
+        self.assertEqual(overlay._chat_word_read_sequence, 1)
 
     def test_successful_office_apply_keeps_attachment_for_follow_up(self):
         overlay = self._overlay()
