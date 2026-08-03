@@ -105,12 +105,13 @@ def inverse_plan(record: OfficeEditRecord, snapshot: OfficeSnapshot) -> OfficeEd
     targets = {target.locator: target for target in snapshot.targets}
     inverse_edits: list[WordTextEdit | ExcelCellEdit] = []
     for edit in record.edits:
-        target = _target_for(edit.locator, targets)
         if isinstance(edit, WordTextEdit):
-            if target.value != edit.value:
+            current_value = _word_target_value_or_empty(targets, edit.locator)
+            if current_value != edit.value:
                 raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
             inverse_edits.append(WordTextEdit(edit.locator, edit.value, edit.expected_value))
             continue
+        target = _target_for(edit.locator, targets)
         if edit.formula is not None:
             if target.formula != edit.formula:
                 raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
@@ -202,15 +203,25 @@ def _target_for(locator: str, targets: dict[str, OfficeTarget]) -> OfficeTarget:
 def _validate_live_targets(current: OfficeSnapshot, plan: OfficeEditPlan) -> None:
     targets = {target.locator: target for target in current.targets}
     for edit in plan.edits:
-        target = _target_for(edit.locator, targets)
         if isinstance(edit, WordTextEdit):
-            matches = target.value == edit.expected_value
+            matches = _word_target_value_or_empty(targets, edit.locator) == edit.expected_value
         else:
+            target = _target_for(edit.locator, targets)
             matches = target.value == edit.expected_value and target.formula == edit.expected_formula
         if not matches:
             raise OfficePlanError(
                 f"The Office target {edit.locator} changed since the preview. Read it again before applying edits."
             )
+
+
+def _word_target_value_or_empty(targets: dict[str, OfficeTarget], locator: str) -> str:
+    """Word snapshots omit empty paragraphs, but an omitted paragraph is still editable."""
+    target = targets.get(locator)
+    if target is not None:
+        return str(target.value)
+    if re.fullmatch(r"paragraph:\d+", locator):
+        return ""
+    raise OfficePlanError(f"The target {locator} is not present in the snapshot.")
 
 
 def _apply_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> None:

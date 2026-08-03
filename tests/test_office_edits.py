@@ -149,6 +149,29 @@ class OfficeHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(OfficePlanError, "changed"):
             inverse_plan(record, current)
 
+    def test_inverse_allows_a_word_paragraph_that_became_empty(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, inverse_plan, record_from_plan
+
+        snapshot = word_snapshot()
+        plan = OfficeEditPlan("word", snapshot.fingerprint,
+                              (WordTextEdit("paragraph:1", "Old", ""),))
+        record = record_from_plan(plan, snapshot, "op-empty")
+        current = replace(snapshot, fingerprint="after", targets=())
+
+        inverse = inverse_plan(record, current)
+
+        self.assertEqual(inverse.edits,
+                         (WordTextEdit("paragraph:1", "", "Old"),))
+
+    def test_live_validation_allows_an_empty_word_paragraph(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, _validate_live_targets
+
+        current = replace(word_snapshot(), targets=())
+        plan = OfficeEditPlan("word", current.fingerprint,
+                              (WordTextEdit("paragraph:1", "", "Old"),))
+
+        _validate_live_targets(current, plan)
+
 
 class OfficePlanApplyTests(unittest.TestCase):
     def test_word_verification_normalizes_word_paragraph_breaks(self):
