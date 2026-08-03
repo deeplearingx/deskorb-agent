@@ -35,6 +35,9 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         prompt = overlay.worker.ask_office_plan.call_args.args[0]
         self.assertIn("Budget!C3", prompt)
         self.assertIn("Update the total.", prompt)
+        self.assertIn('"plan": null', prompt)
+        self.assertIn("word_replace_text", prompt)
+        self.assertIn("excel_set_cell", prompt)
         self.assertTrue(overlay._office_plan_active)
         display = overlay.add_user.call_args.args[0]
         self.assertIn("Plan.xlsx", display)
