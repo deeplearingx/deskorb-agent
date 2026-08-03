@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from deskorb_agent import Overlay
 from office_sources import OfficeSnapshot, OfficeTarget
-from office_edits import OfficeEditRecord, WordTextEdit
+from office_edits import OfficeApplyResult, OfficeEditPlan, OfficeEditRecord, WordTextEdit
 
 
 class ChatOfficeAttachmentTests(unittest.TestCase):
@@ -16,11 +16,13 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         overlay._office_apply_active = False
         overlay.office_edit_history = []
         overlay._office_generation = 0
+        overlay._office_operation_sequence = 0
         overlay.add_user = Mock()
         overlay.add_err = Mock()
         overlay.add_delta = Mock()
         overlay.add_sys = Mock()
         overlay._set_busy = Mock()
+        overlay._refresh_chat_word_attachment = Mock()
         overlay.worker = Mock()
         return overlay
 
@@ -66,7 +68,7 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
             edits=(WordTextEdit("paragraph:1", "Old", "New"),),
         )]
 
-        overlay._send_chat_office_attachment("Undo the last change.")
+        overlay._send_chat_office_attachment("Summarize the latest change.")
 
         prompt = overlay.worker.ask_office_context.call_args.args[1]
         self.assertIn("paragraph:1", prompt)
@@ -116,6 +118,52 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
 
         self.assertIs(overlay.chat_office_snapshot, snapshot)
         self.assertIsNone(overlay._pending_office_plan)
+
+    def test_successful_office_apply_refreshes_snapshot_and_records_history(self):
+        before = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='Old'", fingerprint="before",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "Old"),), has_unsaved_changes=True,
+        )
+        after = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='New'", fingerprint="after",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "New"),), has_unsaved_changes=True,
+        )
+        overlay = self._overlay()
+        overlay.chat_office_snapshot = before
+        result = OfficeApplyResult(1, 1, "written")
+        record = OfficeEditRecord(
+            "office-1", "word", before.identity,
+            (WordTextEdit("paragraph:1", "Old", "New"),),
+        )
+
+        overlay._handle("office_apply", (0, after, record, result, None))
+
+        self.assertIs(overlay.chat_office_snapshot, after)
+        self.assertEqual(overlay.office_edit_history, [record])
+        overlay._refresh_chat_word_attachment.assert_called_once_with()
+
+    def test_undo_request_builds_inverse_preview_from_latest_history(self):
+        overlay = self._overlay()
+        snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='New'", fingerprint="after",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "New"),), has_unsaved_changes=True,
+        )
+        overlay.chat_office_snapshot = snapshot
+        overlay.office_edit_history = [OfficeEditRecord(
+            "office-1", "word", snapshot.identity,
+            (WordTextEdit("paragraph:1", "Old", "New"),),
+        )]
+        overlay._add_office_plan_actions = Mock()
+
+        overlay._send_chat_office_attachment("撤回刚才的修改")
+
+        overlay.worker.ask_office_context.assert_not_called()
+        self.assertEqual(overlay._pending_office_plan.edits,
+                         (WordTextEdit("paragraph:1", "New", "Old"),))
+        overlay._add_office_plan_actions.assert_called_once_with(overlay._pending_office_plan)
 
     def test_office_preview_places_actions_below_long_preview_text(self):
         from office_edits import OfficeEditPlan, WordTextEdit

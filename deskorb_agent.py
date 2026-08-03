@@ -41,7 +41,8 @@ from worker import CodexWorker
 from word_sources import WordMaterial, is_word_window, read_active_word_document
 from office_sources import OfficeSnapshot, is_excel_window, read_active_office_snapshot
 from office_edits import (OfficeEditPlan, OfficeEditRecord, OfficePlanError,
-                           apply_office_plan, parse_office_plan)
+                           apply_office_plan, inverse_plan, parse_office_plan,
+                           record_from_plan)
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Ask DeskOrb Agent…"
@@ -249,6 +250,7 @@ class Overlay:
         self._office_apply_active = False
         self.office_edit_history: list[OfficeEditRecord] = []
         self._office_generation = 0
+        self._office_operation_sequence = 0
 
         self._build()
         self._register_hotkey()
@@ -3135,6 +3137,8 @@ class Overlay:
         snapshot = self.chat_office_snapshot
         if snapshot is None:
             return
+        if self._prepare_office_undo(question, snapshot):
+            return
         prompt = self._build_persistent_office_prompt(
             snapshot, self.office_edit_history, question,
         )
@@ -3143,6 +3147,28 @@ class Overlay:
         self._office_plan_raw = []
         self.worker.ask_office_context(question, prompt)
         self._set_busy(True)
+
+    @staticmethod
+    def _is_office_undo_request(question):
+        text = str(question or "").casefold()
+        return bool(re.search(r"(?:撤回|撤销|回滚|恢复).{0,12}(?:刚才|上次|上一条|最近)?|(?:undo|revert)", text))
+
+    def _prepare_office_undo(self, question, snapshot):
+        if not self.office_edit_history or not self._is_office_undo_request(question):
+            return False
+        try:
+            plan = inverse_plan(self.office_edit_history[-1], snapshot)
+        except OfficePlanError as exc:
+            self.add_err(str(exc))
+            return True
+        self.add_user(f"{question} [{snapshot.kind.title()} attachment: {snapshot.name}]")
+        self._office_plan_active = False
+        self._office_plan_raw = []
+        self._pending_office_plan = plan
+        self._set_busy(False)
+        self.add_sys("An inverse Office change is ready for review. Use Apply changes or Discard.")
+        self._add_office_plan_actions(plan)
+        return True
 
     def _build_persistent_office_prompt(self, snapshot, history, question):
         """Build private Office context for one request without touching chat memory."""
@@ -3195,7 +3221,6 @@ class Overlay:
             answer, plan = parse_office_plan(snapshot, raw)
         except OfficePlanError as exc:
             self.add_err(str(exc))
-            self._clear_chat_word_attachment()
             return
         self.add_delta(answer)
         self._md_finalize()
@@ -3238,14 +3263,20 @@ class Overlay:
         if pending is None or snapshot is None or self._office_apply_active:
             return
         self._office_apply_active = True
-        threading.Thread(target=self._apply_office_plan_bg, args=(snapshot, pending),
+        generation = self._office_generation
+        self._office_operation_sequence += 1
+        operation_id = f"office-{self._office_operation_sequence}"
+        threading.Thread(target=self._apply_office_plan_bg, args=(snapshot, pending, generation, operation_id),
                          name="office-apply", daemon=True).start()
 
-    def _apply_office_plan_bg(self, snapshot, plan):
+    def _apply_office_plan_bg(self, snapshot, plan, generation, operation_id):
         try:
-            self.ui_q.put(("office_apply", (apply_office_plan(snapshot, plan), None)))
+            result = apply_office_plan(snapshot, plan)
+            refreshed = read_active_office_snapshot(snapshot.kind, snapshot.expected_root)
+            record = record_from_plan(plan, snapshot, operation_id)
+            self.ui_q.put(("office_apply", (generation, refreshed, record, result, None)))
         except Exception as exc:
-            self.ui_q.put(("office_apply", (None, exc)))
+            self.ui_q.put(("office_apply", (generation, None, None, None, exc)))
 
     def _inline_text(self, text, shots, images):
         """Short text companion for inline-image turns: the model sees the images
@@ -4170,12 +4201,23 @@ class Overlay:
         elif kind == "chat_excel_read":
             self._finish_chat_excel_read(*payload)
         elif kind == "office_apply":
-            result, error = payload
+            if len(payload) == 2:
+                # Compatibility for queued results created before persistent history support.
+                result, error = payload
+                generation, refreshed, record = self._office_generation, None, None
+            else:
+                generation, refreshed, record, result, error = payload
+            if generation != getattr(self, "_office_generation", 0):
+                return
             self._office_apply_active = False
             self._pending_office_plan = None
             if error is not None:
                 self.add_err(str(error))
             else:
+                if refreshed is not None and record is not None:
+                    self.chat_office_snapshot = refreshed
+                    self.office_edit_history.append(record)
+                    self._refresh_chat_word_attachment()
                 self.add_sys(result.message)
         elif kind == "precapture_done":
             self._capture_busy = False
