@@ -78,11 +78,28 @@ class CodexWorkerTests(unittest.TestCase):
         self.worker.ask_office_plan("private Office snapshot")
         self.assertEqual(self.worker.req.get_nowait(), ("ask_office_plan", "private Office snapshot"))
 
+    def test_ask_office_context_queues_question_and_isolated_prompt(self):
+        self.worker.ask_office_context("撤回刚才的修改", "private Office snapshot and history")
+        self.assertEqual(
+            self.worker.req.get_nowait(),
+            ("ask_office_context", ("撤回刚才的修改", "private Office snapshot and history")),
+        )
+
     def test_office_plan_agent_turn_uses_no_tools_runtime_and_terminal_event(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "run_office_plan_turn") as run_turn:
             self.worker._run_turn("private Office snapshot", [], ephemeral=True, office_plan=True)
         run_turn.assert_called_once_with("private Office snapshot")
+        self.assertIn(("office_plan_done", None), self.drain())
+
+    def test_office_context_agent_turn_uses_persistent_context_runtime(self):
+        self.worker._backend = "agent"
+        with patch.object(self.worker._agent, "run_office_context_turn") as run_turn:
+            self.worker._run_turn(
+                "question and private Office context", [],
+                ephemeral=True, office_plan=True, office_context=True,
+            )
+        run_turn.assert_called_once_with("question and private Office context")
         self.assertIn(("office_plan_done", None), self.drain())
 
     def test_office_plan_codex_turn_uses_temporary_read_only_thread(self):

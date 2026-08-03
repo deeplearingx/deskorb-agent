@@ -234,6 +234,20 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(payload["input"][0]["content"][0]["text"], "private Office snapshot")
         self.assertEqual(runtime.context.build_input("next"), before)
 
+    def test_persistent_office_context_turn_does_not_mutate_normal_context(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.context.add_turn("ordinary", "answer")
+        before = runtime.context.build_input("next")
+        request = Mock(return_value={"output_text": '{"answer":"x","plan":null}', "output": []})
+        runtime._request = request
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_office_context_turn("question", "private Office snapshot and history")
+
+        self.assertEqual(runtime.context.build_input("next"), before)
+        self.assertIn("private Office snapshot and history",
+                      request.call_args.args[0]["input"][0]["content"][0]["text"])
+
     def test_captcha_handoff_pauses_and_resumes_the_same_browser_task(self):
         class FakeMcp:
             def owns(self, name):

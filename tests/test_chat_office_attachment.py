@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 from deskorb_agent import Overlay
 from office_sources import OfficeSnapshot, OfficeTarget
+from office_edits import OfficeEditRecord, WordTextEdit
 
 
 class ChatOfficeAttachmentTests(unittest.TestCase):
@@ -31,20 +32,49 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
             targets=(OfficeTarget("Budget!C3", "Budget!C3", 120, "=SUM(C1:C2)"),),
             has_unsaved_changes=False,
         )
+        overlay.office_edit_history = [OfficeEditRecord(
+            operation_id="op-1", kind="excel", identity="excel:202:Plan.xlsx",
+            edits=(),
+        )]
 
         overlay._send_chat_office_attachment("Update the total.")
 
-        prompt = overlay.worker.ask_office_plan.call_args.args[0]
+        prompt = overlay.worker.ask_office_context.call_args.args[1]
         self.assertIn("Budget!C3", prompt)
         self.assertIn("Update the total.", prompt)
         self.assertIn('"plan": null', prompt)
+        self.assertIn("operation op-1", prompt)
         self.assertIn("word_replace_text", prompt)
         self.assertIn("excel_set_cell", prompt)
+        self.assertEqual(overlay.worker.ask_office_context.call_args.args[0], "Update the total.")
         self.assertTrue(overlay._office_plan_active)
         self.assertIsNotNone(overlay.chat_office_snapshot)
         display = overlay.add_user.call_args.args[0]
         self.assertIn("Plan.xlsx", display)
         self.assertNotIn("Budget!C3", display)
+
+    def test_persistent_prompt_includes_word_edit_history_without_displaying_it(self):
+        overlay = self._overlay()
+        overlay.chat_office_snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='New'", fingerprint="after",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "New"),),
+            has_unsaved_changes=True,
+        )
+        overlay.office_edit_history = [OfficeEditRecord(
+            operation_id="op-2", kind="word", identity="word:101:Draft.docx",
+            edits=(WordTextEdit("paragraph:1", "Old", "New"),),
+        )]
+
+        overlay._send_chat_office_attachment("Undo the last change.")
+
+        prompt = overlay.worker.ask_office_context.call_args.args[1]
+        self.assertIn("paragraph:1", prompt)
+        self.assertIn("'Old'", prompt)
+        self.assertIn("'New'", prompt)
+        display = overlay.add_user.call_args.args[0]
+        self.assertNotIn("Old", display)
+        self.assertNotIn("New", display)
 
     def test_office_plan_delta_is_buffered_not_rendered(self):
         overlay = self._overlay()

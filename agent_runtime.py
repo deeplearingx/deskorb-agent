@@ -434,6 +434,17 @@ class AgentRuntime:
             self._task_authorized_until = 0.0
             raise
 
+    def run_office_context_turn(self, question: str, office_prompt: str | None = None):
+        """Answer a persistent Office follow-up without storing Office text in context."""
+        try:
+            return self._run_turn(
+                office_prompt if office_prompt is not None else question,
+                [], ephemeral=True, allow_tools=False,
+            )
+        except BaseException:
+            self._task_authorized_until = 0.0
+            raise
+
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                   allow_tools: bool = True):
         api_key = get_api_key()

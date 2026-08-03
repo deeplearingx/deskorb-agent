@@ -81,6 +81,10 @@ class CodexWorker(threading.Thread):
         """Run an isolated, no-tools Office planning turn."""
         self.req.put(("ask_office_plan", str(text)))
 
+    def ask_office_context(self, question: str, office_prompt: str):
+        """Run a persistent Office follow-up with a temporary document prompt."""
+        self.req.put(("ask_office_context", (str(question), str(office_prompt))))
+
     def reset(self):
         self.req.put(("reset", None))
 
@@ -154,6 +158,11 @@ class CodexWorker(threading.Thread):
                     self._run_turn(*payload, ephemeral=True)
                 elif kind == "ask_office_plan":
                     self._run_turn(payload, [], ephemeral=True, office_plan=True)
+                elif kind == "ask_office_context":
+                    self._run_turn(
+                        payload[1], [], ephemeral=True,
+                        office_plan=True, office_context=True,
+                    )
                 elif kind == "reset":
                     self._session_id = None
                     self._api_context.clear()
@@ -343,7 +352,7 @@ class CodexWorker(threading.Thread):
 
     # -- turn execution ------------------------------------------------
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                  office_plan: bool = False):
+                  office_plan: bool = False, office_context: bool = False):
         self._interrupted = False
         self._tool_items_seen.clear()
         active = self._resolved_backend()
@@ -361,7 +370,10 @@ class CodexWorker(threading.Thread):
                         raise
             elif active == "agent":
                 try:
-                    self._run_agent_turn(text, image_paths, ephemeral=ephemeral, office_plan=office_plan)
+                    self._run_agent_turn(
+                        text, image_paths, ephemeral=ephemeral,
+                        office_plan=office_plan, office_context=office_context,
+                    )
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ Agent 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
@@ -520,7 +532,10 @@ class CodexWorker(threading.Thread):
                 self.ui.put(("ctx", self._api_context.usage_percent()))
 
     def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                        office_plan: bool = False):
+                        office_plan: bool = False, office_context: bool = False):
+        if office_context:
+            self._agent.run_office_context_turn(text)
+            return
         if office_plan:
             self._agent.run_office_plan_turn(text)
             return
