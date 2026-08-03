@@ -149,7 +149,8 @@ def _verify_active_root(application: Any, expected_hwnd: int, product: str) -> i
 
 
 def _ensure_word_editable(document: Any) -> None:
-    if bool(document.ReadOnly) or int(document.ProtectionType or 0) != 0:
+    # Word's WdProtectionType uses wdNoProtection = -1, not zero.
+    if bool(document.ReadOnly) or int(document.ProtectionType) != -1:
         raise OfficeSourceError("Word document is read-only or protected; enable editing before continuing.")
 
 

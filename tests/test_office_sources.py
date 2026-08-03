@@ -19,7 +19,8 @@ class OfficeSourceTests(unittest.TestCase):
         document.Name = "Project.docx"
         document.FullName = "C:/docs/Project.docx"
         document.ReadOnly = False
-        document.ProtectionType = 0
+        # Word COM uses wdNoProtection = -1 for an editable, unprotected document.
+        document.ProtectionType = -1
         document.Saved = False
         document.Paragraphs = [body]
         document.Tables = [table]
