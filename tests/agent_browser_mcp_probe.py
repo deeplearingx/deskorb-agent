@@ -13,6 +13,11 @@ from queue import Empty, Queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Windows consoles may still default to GBK. The public fixture intentionally
+# contains £ prices, so make the probe's JSON evidence portable.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 from agent_runtime import AgentRuntime
 from config import API_BASE_URL, API_MODEL, API_PROXY_URL
 

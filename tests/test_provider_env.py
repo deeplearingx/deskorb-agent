@@ -24,3 +24,8 @@ class ProviderEnvTests(unittest.TestCase):
         with patch.object(provider_env, "_VALUES", {"deepseek_api_key": "deepseek-key"}), \
              patch.dict(provider_env.os.environ, {}, clear=True):
             self.assertEqual(provider_env.api_key(), "deepseek-key")
+
+    def test_provider_specific_key_wins_over_generic_key(self):
+        with patch.object(provider_env, "_VALUES", {"openai_api_key": "generic", "deepseek_api_key": "deep"}), \
+             patch.dict(provider_env.os.environ, {}, clear=True):
+            self.assertEqual(provider_env.api_key("deepseek"), "deep")

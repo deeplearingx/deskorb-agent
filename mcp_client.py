@@ -33,9 +33,13 @@ class MCPServerSpec:
     cwd: str | None = None
     intent_keywords: tuple[str, ...] = ()
     description: str = ""
+    allowed_tools: tuple[str, ...] = ()
+    allowed_domains: tuple[str, ...] = ()
+    allow_safe_tools: bool = False
 
 
-def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool = True) -> list[MCPServerSpec]:
+def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool = True,
+                     playwright_mode: str = "isolated-playwright") -> list[MCPServerSpec]:
     """Load trusted local servers from a standard ``mcpServers`` JSON file."""
     value = str(config_path or "").strip()
     if value:
@@ -60,9 +64,14 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
     console_python = interpreter.with_name("python.exe") if interpreter.name.lower() == "pythonw.exe" else interpreter
     if not console_python.is_file():
         console_python = interpreter
+    connected = str(playwright_mode).strip().lower() == "connected-playwright"
     return [
-        MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest"), {}, None),
-        MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root)),
+        # An isolated profile avoids a stale browser process from a prior task
+        # locking the shared Playwright profile and blocking the next task.
+        MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest", "--extension" if connected else "--isolated"), {}, None,
+                      allow_safe_tools=True),
+        MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root),
+                      allow_safe_tools=True),
     ]
 
 
@@ -100,8 +109,17 @@ def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
         raise MCPError(f"MCP server {name!r} deskorb.keywords must be an array of strings.")
     keywords = tuple(item.strip() for item in raw_keywords if item.strip())
     description = str(metadata.get("description") or "").strip()
+    raw_tools = metadata.get("allowed_tools", [])
+    if not isinstance(raw_tools, list) or not all(isinstance(item, str) for item in raw_tools):
+        raise MCPError(f"MCP server {name!r} deskorb.allowed_tools must be an array of strings.")
+    raw_domains = metadata.get("allowed_domains", [])
+    if not isinstance(raw_domains, list) or not all(isinstance(item, str) for item in raw_domains):
+        raise MCPError(f"MCP server {name!r} deskorb.allowed_domains must be an array of strings.")
+    allowed_tools = tuple(item.strip() for item in raw_tools if item.strip())
+    allowed_domains = tuple(item.strip().lower() for item in raw_domains if item.strip())
     return MCPServerSpec(name.strip(), command, tuple(str(item) for item in raw_args),
-                         {key: str(item) for key, item in raw_env.items()}, cwd, keywords, description)
+                         {key: str(item) for key, item in raw_env.items()}, cwd, keywords, description,
+                         allowed_tools, allowed_domains, False)
 
 
 class StdioMCPClient:
@@ -222,12 +240,19 @@ class MCPToolBridge:
 
     READ_ONLY_WORDS = ("snapshot", "screenshot", "console", "network", "find", "inspect", "list", "get",
                        "status", "schema", "test", "export", "version")
-    BLOCKED_WORDS = ("unsafe",)
-    HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore")
+    # A web page is untrusted input.  Tools that evaluate arbitrary page code,
+    # execute host commands, or move data to/from the host are not a safe part
+    # of a desktop-assistant browser capability.  They stay blocked even when
+    # a custom server is configured.
+    BLOCKED_WORDS = ("unsafe", "run_code", "evaluate", "javascript", "shell", "terminal", "command",
+                     "execute", "file_write", "filesystem", "download")
+    HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore", "submit", "send",
+                       "purchase", "delete", "permission", "login")
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
-                 timeout_seconds: int = 30):
-        self.specs = load_mcp_servers(config_path, enable_playwright=enable_playwright)
+                 timeout_seconds: int = 30, playwright_mode: str = "isolated-playwright"):
+        self.specs = load_mcp_servers(config_path, enable_playwright=enable_playwright,
+                                      playwright_mode=playwright_mode)
         self.timeout_seconds = timeout_seconds
         self.clients = {spec.name: StdioMCPClient(spec, timeout_seconds=timeout_seconds) for spec in self.specs}
         self._tools: dict[str, tuple[str, str, dict[str, Any], bool]] = {}
@@ -284,6 +309,18 @@ class MCPToolBridge:
     def owns(self, name: str) -> bool:
         return name in self._tools
 
+    def server_for(self, name: str) -> str | None:
+        item = self._tools.get(name)
+        return item[0] if item else None
+
+    def find_tool(self, server: str, suffixes: Iterable[str]) -> str | None:
+        """Find an already-discovered allowlisted tool by semantic suffix."""
+        wanted = tuple(str(value).lower() for value in suffixes if str(value).strip())
+        for exposed, (owner, original, _schema, _action) in self._tools.items():
+            if owner == str(server) and any(original.lower().endswith(suffix) for suffix in wanted):
+                return exposed
+        return None
+
     def is_action(self, name: str) -> bool:
         item = self._tools.get(name)
         return bool(item and item[3])
@@ -293,7 +330,13 @@ class MCPToolBridge:
         if not item:
             return {"ok": False, "error": "Unknown MCP tool."}
         server, original, _schema, _action = item
+        spec = next((item for item in self.specs if item.name == server), None)
+        if spec is None or not self._tool_allowed(spec, original):
+            return {"ok": False, "error": "MCP tool is not permitted by the local capability policy."}
         clean = {key: value for key, value in arguments.items() if not key.startswith("_deskorb_")}
+        blocked_url = self._blocked_url(spec, clean)
+        if blocked_url:
+            return {"ok": False, "error": "MCP URL is outside the server's allowed_domains policy.", "url": blocked_url}
         try:
             result = self.clients[server].call_tool(original, clean)
         except MCPError as exc:
@@ -329,7 +372,8 @@ class MCPToolBridge:
             try:
                 for tool in client.list_tools():
                     original = str(tool["name"])
-                    if any(word in original.lower() for word in self.BLOCKED_WORDS):
+                    spec = next((item for item in self.specs if item.name == server), None)
+                    if spec is None or not self._tool_allowed(spec, original):
                         continue
                     exposed = _exposed_tool_name(server, original, self._tools)
                     self._tools[exposed] = (server, original, dict(tool.get("inputSchema") or {}),
@@ -340,6 +384,30 @@ class MCPToolBridge:
     def _is_action(self, tool_name: str) -> bool:
         lowered = tool_name.lower()
         return not any(word in lowered for word in self.READ_ONLY_WORDS)
+
+    def _tool_allowed(self, spec: MCPServerSpec, tool_name: str) -> bool:
+        lowered = str(tool_name).lower()
+        if any(word in lowered for word in self.BLOCKED_WORDS):
+            return False
+        if spec.allow_safe_tools:
+            return True
+        # Custom servers fail closed.  A user explicitly grants individual
+        # tool names in mcp.servers.json instead of trusting whatever schema a
+        # process happens to return after an update.
+        return lowered in {name.lower() for name in spec.allowed_tools}
+
+    @staticmethod
+    def _blocked_url(spec: MCPServerSpec, arguments: dict[str, Any]) -> str | None:
+        if not spec.allowed_domains:
+            return None
+        for value in arguments.values():
+            if not isinstance(value, str) or not value.lower().startswith(("http://", "https://")):
+                continue
+            host = value.split("/", 3)[2].split("@")[-1].split(":", 1)[0].lower()
+            if not any(host == domain or host.endswith("." + domain.lstrip("*."))
+                       for domain in spec.allowed_domains):
+                return value[:240]
+        return None
 
     def is_high_risk(self, name: str) -> bool:
         item = self._tools.get(name)

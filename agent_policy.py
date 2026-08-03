@@ -53,12 +53,13 @@ class ToolPolicy:
     OBSERVE_TOOLS = {
         "desktop_get_active_window", "desktop_screenshot", "filesystem_list",
         "filesystem_read_text", "filesystem_search_text", "process_list", "window_list", "desktop_list_windows", "desktop_capture_state", "desktop_verify_state",
-        "mcp_enable_server",
+        "desktop_uia_observe", "mcp_enable_server",
     }
     REVERSIBLE_TOOLS = {"filesystem_write", "filesystem_patch", "filesystem_copy"}
     DESTRUCTIVE_TOOLS = {"filesystem_move", "filesystem_delete", "process_stop", "shell_run"}
     EXTERNAL_TOOLS = {"desktop_click", "desktop_type", "desktop_hotkey", "desktop_scroll", "window_focus",
-                      "window_control", "desktop_clipboard_read_text", "process_start", "application_launch"}
+                      "window_control", "desktop_clipboard_read_text", "desktop_uia_invoke", "desktop_uia_set_value",
+                      "process_start", "application_launch", "browser_action_batch"}
     TASK_SCOPED_TOOLS = EXTERNAL_TOOLS
 
     def decide(self, tool_name: str, *, execution_requested: bool, full_access: bool,

@@ -39,6 +39,7 @@ from win32utils import *
 from win32utils import _user32, _gdi32
 from worker import CodexWorker
 from word_sources import WordMaterial, is_word_window, read_active_word_document
+from privacy_scope import requires_current_context_consent
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Ask DeskOrb Agent…"
@@ -51,7 +52,6 @@ TOOL_ICONS = {
 _APPROVAL_RE = re.compile(
     r"^⚠ Confirmation required: (?P<summary>[\s\S]+?)\nReply exactly: 确认 (?P<token>[0-9A-F]{6})\nReply 取消 to stop\.$"
 )
-
 
 def _approval_parts(value):
     """Extract the runtime's confirmation token without coupling the UI to tool types."""
@@ -172,6 +172,8 @@ class Overlay:
         self.pending_shot = None
         self.pending_images: list = []
         self._precaptured = None        # (shots, monotonic_ts) grabbed while typing
+        self._live_context_consent = False  # one-turn, user-clicked consent for current state
+        self._live_context_card = None
         self._precapture_after = None   # pending debounce timer id
         self._capture_busy = False      # a background precapture grab is in flight
         self._paste_busy = False        # a background clipboard paste is in flight
@@ -2741,6 +2743,144 @@ class Overlay:
             self.chat.see("end")
         self._prune_chat()
 
+    def _requires_live_context_consent(self, text):
+        """Return whether *text* explicitly requests current screen/diagnostic context.
+
+        This is intentionally a UI privacy gate, not a model-side intent classifier.  It
+        runs before automatic/pre-captured screenshots are reused, so a third-party API
+        cannot receive a current desktop image merely because the user typed a diagnostic
+        question.  A manual screenshot button remains an explicit user action and is not
+        blocked by this helper.
+        """
+        return requires_current_context_consent(text)
+
+    def add_live_context_consent(self, text):
+        """Render a one-turn consent card before a current-desktop diagnostic.
+
+        The card is deliberately clickable.  No screenshot is captured while it is
+        displayed; accepting it invokes the normal send path with a one-shot active-window
+        capture.  Rejecting it leaves the text in the editor so the user can revise it.
+        """
+        existing_card = getattr(self, "_live_context_card", None)
+        if existing_card is not None:
+            try:
+                existing_card.lift()
+            except Exception:
+                pass
+            return
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["accent"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(9))
+        self._live_context_card = card
+        title = tk.Label(card, text="需要授权读取当前状态", bg=T["field"], fg=T["accent"],
+                         font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        detail = tk.Label(
+            card,
+            text=("这条请求会把当前活动窗口截图和用户指定的本地 DeskOrb 诊断信息发送给当前模型。"
+                  "只对本次请求生效，不会读取剪贴板、密码或其他窗口。"),
+            bg=T["field"], fg=T["text"], font=self.f_small, justify="left", anchor="w",
+            wraplength=self.px(300),
+        )
+        detail.pack(fill="x", pady=(self.px(3), self.px(9)))
+        actions = tk.Frame(card, bg=T["field"])
+        actions.pack(fill="x")
+
+        def respond(allow):
+            if getattr(card, "_resolved", False) or self.busy:
+                return
+            card._resolved = True
+            allow_btn.configure(state="disabled")
+            cancel_btn.configure(state="disabled")
+            self._live_context_card = None
+            if allow:
+                self._live_context_consent = True
+                self.add_user("✓ 已允许本次读取当前活动窗口")
+                # Re-enter the regular path.  It will consume the one-turn flag before
+                # capture, so a second send cannot reuse this consent accidentally.
+                self._send_or_stop()
+            else:
+                self._live_context_consent = False
+                self._precaptured = None
+                self.add_user("✕ 已取消读取当前状态")
+
+        allow_btn = tk.Button(actions, text="允许本次读取", command=lambda: respond(True),
+                              bg=T["accent"], fg=T["on_accent"], activebackground=T["accent"],
+                              activeforeground=T["on_accent"], relief="flat", bd=0,
+                              font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        allow_btn.pack(side="left")
+        cancel_btn = tk.Button(actions, text="取消", command=lambda: respond(False),
+                               bg=T["field"], fg=T["muted"], activebackground=T["hover"],
+                               activeforeground=T["text"], relief="flat", bd=0,
+                               font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        cancel_btn.pack(side="left", padx=(self.px(6), 0))
+        for child in (card, title, detail, actions, allow_btn, cancel_btn):
+            child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
+    def add_model_fallback(self, payload):
+        """Render explicit provider choices; selecting one never happens inline."""
+        info = payload if isinstance(payload, dict) else {}
+        candidates = [item for item in info.get("candidates") or [] if isinstance(item, dict)]
+        if not candidates:
+            return
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["accent"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(9))
+        title = tk.Label(card, text="模型连接失败，可手动切换", bg=T["field"], fg=T["accent"],
+                         font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        detail = tk.Label(card, text="以下目标来自本地配置。DeskOrb 不会自动切换；跨供应商共享已有对话需要单独同意。",
+                          bg=T["field"], fg=T["text"], font=self.f_small, justify="left",
+                          anchor="w", wraplength=self.px(300))
+        detail.pack(fill="x", pady=(self.px(3), self.px(7)))
+        controls = []
+
+        def respond(target_id, share_context):
+            if getattr(card, "_resolved", False):
+                return
+            card._resolved = True
+            for button in controls:
+                button.configure(state="disabled")
+            self.add_user("✓ 已选择备用模型" + ("并同意共享当前对话" if share_context else ""))
+            self.worker.authorize_model_fallback(target_id, share_context=share_context)
+
+        for candidate in candidates[:8]:
+            target_id = str(candidate.get("id") or "")
+            if not target_id:
+                continue
+            line = tk.Frame(card, bg=T["field"])
+            line.pack(fill="x", pady=(self.px(2), 0))
+            label = tk.Label(line, text=f"{candidate.get('provider', 'provider')} · {candidate.get('model', target_id)}",
+                             bg=T["field"], fg=T["text"], font=self.f_small, anchor="w")
+            label.pack(side="left", fill="x", expand=True)
+            plain = tk.Button(line, text="仅切换", command=lambda value=target_id: respond(value, False),
+                              bg=T["field"], fg=T["text"], activebackground=T["hover"],
+                              activeforeground=T["text"], relief="flat", bd=0,
+                              font=self.f_small, cursor="hand2", padx=self.px(6), pady=self.px(3))
+            plain.pack(side="right")
+            shared = tk.Button(line, text="切换并共享历史", command=lambda value=target_id: respond(value, True),
+                               bg=T["accent"], fg=T["on_accent"], activebackground=T["accent"],
+                               activeforeground=T["on_accent"], relief="flat", bd=0,
+                               font=self.f_small, cursor="hand2", padx=self.px(6), pady=self.px(3))
+            shared.pack(side="right", padx=(0, self.px(4)))
+            controls.extend((plain, shared))
+            for child in (line, label, plain, shared):
+                child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
     def add_human_verification(self, payload):
         """Render a manual CAPTCHA handoff without exposing a CAPTCHA solution to the agent."""
         info = payload if isinstance(payload, dict) else {}
@@ -2988,8 +3128,26 @@ class Overlay:
             self.entry.delete("1.0", "end")
             self._ph_active = False
             return
+        # Do this before looking at auto-shot or a pre-captured frame.  A diagnostic
+        # question must not cause an already-captured desktop image to leave the machine
+        # without a visible, one-turn user click.
+        needs_live_consent = self._requires_live_context_consent(text)
+        if needs_live_consent and not getattr(self, "_live_context_consent", False):
+            self._precaptured = None
+            self.pending_shot = None
+            self.add_live_context_consent(text)
+            return
+        live_context_consent = bool(getattr(self, "_live_context_consent", False))
+        self._live_context_consent = False  # consume the one-turn grant before capture
         shots = None
-        if self.auto_shot:
+        if live_context_consent:
+            # A diagnostic consent always captures the smallest useful scope, even when
+            # the standing Auto-shot toggle is off or configured for all monitors.
+            shots = self.capture(announce=False, window_only=True)
+            if not shots:
+                self.add_err("当前活动窗口读取失败；本次诊断未发送。")
+                return
+        elif self.auto_shot:
             pc = self._precaptured
             if pc and (time.monotonic() - pc[1]) < PRECAPTURE_MAX_AGE:
                 shots = pc[0]                     # reuse the frame grabbed while you typed
@@ -3012,17 +3170,26 @@ class Overlay:
             label += (f"   🖼×{n}" if n > 1 else "   🖼")
         self.add_user(label)
         if IMAGE_INPUT == "inline":
-            self._dispatch_turn(self._inline_text(text, shots, images), shots, images)
+            self._dispatch_turn(self._inline_text(text, shots, images), shots, images,
+                                current_context_consent=live_context_consent)
         else:
-            self._dispatch_turn(self._build_prompt(text, shots, images), [], [])
+            self._dispatch_turn(self._build_prompt(text, shots, images), [], [],
+                                current_context_consent=live_context_consent)
         self._set_busy(True)
 
-    def _dispatch_turn(self, prompt, shots, images, ephemeral=False):
+    def _dispatch_turn(self, prompt, shots, images, ephemeral=False,
+                       current_context_consent=False):
         paths = [] if ephemeral else [s["path"] for s in (shots or [])] + list(images or [])
         if ephemeral:
-            self.worker.ask_ephemeral(prompt, paths)
+            if current_context_consent:
+                self.worker.ask_ephemeral(prompt, paths, current_context_consent=True)
+            else:
+                self.worker.ask_ephemeral(prompt, paths)
         else:
-            self.worker.ask(prompt, paths)
+            if current_context_consent:
+                self.worker.ask(prompt, paths, current_context_consent=True)
+            else:
+                self.worker.ask(prompt, paths)
 
     def _send_chat_word_attachment(self, question):
         """Submit the visible Word attachment once without leaking its text into Chat."""
@@ -3065,6 +3232,8 @@ class Overlay:
         fresh frame is ready at send time, off the critical path."""
         if not (PRECAPTURE_ON_TYPING and self.auto_shot) or self.busy:
             return
+        if self._requires_live_context_consent(self._entry_text()):
+            return
         if self._precapture_after:
             try:
                 self.root.after_cancel(self._precapture_after)
@@ -3075,6 +3244,8 @@ class Overlay:
     def _do_precapture(self):
         self._precapture_after = None
         if not (PRECAPTURE_ON_TYPING and self.auto_shot) or self.busy:
+            return
+        if self._requires_live_context_consent(self._entry_text()):
             return
         if self._capture_busy:                       # a grab is already in flight — don't pile up
             return
@@ -3201,13 +3372,22 @@ class Overlay:
         except Exception as ex:
             return None, ex
 
-    def _grab_shots_scoped(self, mons):
+    def _grab_shots_scoped(self, mons, window_only=None):
         """Scope dispatcher used by both the send-time and precapture paths: the active
-        window when that scope is on AND a usable window exists, else every monitor."""
-        if self.window_shot:
+        window when that scope is on AND a usable window exists, else every monitor.
+        ``window_only`` is a one-call override used by the explicit privacy-consent path;
+        the user's standing Window-only setting is otherwise left untouched."""
+        use_window = self.window_shot if window_only is None else bool(window_only)
+        if use_window:
             shots, err = self._grab_window_shot()
             if shots:
                 return shots, err
+            # An explicit privacy-consent capture must never broaden its scope when the
+            # active window is unavailable.  The normal remembered Window-only toggle
+            # retains its historical full-screen fallback, but the one-call override
+            # fails closed so a diagnostic cannot silently expose other windows/monitors.
+            if window_only is True:
+                return [], err or RuntimeError("active window is unavailable")
         return self._grab_shots(mons)
 
     def _grab_shots(self, mons):
@@ -3232,14 +3412,16 @@ class Overlay:
         self._prune_shots()
         return shots, err
 
-    def capture(self, announce=True, hide=True, quiet=False):
+    def capture(self, announce=True, hide=True, quiet=False, window_only=None):
         """Grab one screenshot per monitor; returns a list of
         {'path', 'primary', 'index'} dicts. Images are downscaled to
         SHOT_MAX_EDGE before saving (Codex downsamples larger ones anyway).
         hide=True withdraws the overlay during the grab so it isn't in the shot
         (send time); hide=False skips that to avoid a flicker during
         pre-capture-while-typing. quiet=True suppresses the in-chat error if a
-        grab fails (used for the silent pre-capture path)."""
+        grab fails (used for the silent pre-capture path). ``window_only`` is a one-call
+        scope override for an explicit current-context consent; ``None`` uses the normal
+        Window-only setting."""
         mons = enumerate_monitors() or [{"rect": None, "primary": True}]
         geo = self.root.geometry()
         # If the OS is excluding us from capture, the overlay is already invisible to
@@ -3251,7 +3433,7 @@ class Overlay:
             self.root.update()
             time.sleep(0.15)
         try:
-            shots, err = self._grab_shots_scoped(mons)
+            shots, err = self._grab_shots_scoped(mons, window_only=window_only)
         finally:
             if do_hide:
                 self.root.deiconify()
@@ -3977,12 +4159,42 @@ class Overlay:
                 self._precaptured = (payload, time.monotonic())
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "task_progress":
+            if isinstance(payload, dict):
+                if payload.get("waiting_human"):
+                    self._set_status("waiting for manual verification…")
+                elif payload.get("terminal"):
+                    state = "verified" if payload.get("verified") else "needs verification"
+                    self._set_status(f"task finished · {state}")
+                else:
+                    self._set_status(f"task step {payload.get('steps', 0)} · evidence {payload.get('evidence_steps', 0)}")
+        elif kind == "model_health":
+            if isinstance(payload, dict):
+                state = "available" if payload.get("ok") else "unavailable"
+                self.add_sys(f"Model {state} · {payload.get('provider', 'unknown')} · {payload.get('latency_ms', '?')} ms")
+        elif kind == "model_fallback_available":
+            self.add_model_fallback(payload)
+        elif kind == "model_fallback_result":
+            if isinstance(payload, dict) and payload.get("ok"):
+                target = payload.get("target") or {}
+                self.add_sys(f"✓ 已切换到 {target.get('provider', '备用模型')} · {target.get('model', '')}")
+            elif isinstance(payload, dict) and payload.get("requires_context_consent"):
+                self.add_sys("未共享历史，备用模型没有切换。请选择‘切换并共享历史’后再试。")
+            elif isinstance(payload, dict):
+                self.add_err(str(payload.get("error") or "备用模型切换失败"))
         elif kind == "permission_mode":
             self._apply_permission_mode(str(payload))
         elif kind == "system":
             self.add_sys(str(payload))
         elif kind == "diagnostic":
             self.add_sys(str(payload))
+        elif kind == "privacy_consent_required":
+            # Defensive runtime-side gate.  The normal send path already shows this card
+            # before capture; this event covers callers that bypass that UI preflight.
+            info = payload if isinstance(payload, dict) else {}
+            if self.busy:
+                self._set_busy(False)
+            self.add_live_context_consent(str(info.get("text") or self._entry_text()))
         elif kind == "approval":
             self.add_approval(str(payload))
         elif kind == "human_verification":

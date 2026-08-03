@@ -34,8 +34,9 @@ if os.name == "nt":
     _advapi32.CredFree.argtypes = [ctypes.c_void_p]
 
 
-def get_api_key() -> str:
-    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+def get_api_key(provider: str | None = None) -> str:
+    provider_name = str(provider or "").strip().lower()
+    env_key = _provider_api_key(provider_name or None)
     if env_key:
         return env_key
     if os.name != "nt":
@@ -43,13 +44,13 @@ def get_api_key() -> str:
     pointer = ctypes.POINTER(CREDENTIALW)()
     if not _advapi32.CredReadW(TARGET, 1, 0, ctypes.byref(pointer)):
         if not _advapi32.CredReadW(LEGACY_TARGET, 1, 0, ctypes.byref(pointer)):
-            return _provider_api_key()
+            return _provider_api_key(provider_name or None)
     try:
         cred = pointer.contents
         if not cred.CredentialBlob or not cred.CredentialBlobSize:
-            return _provider_api_key()
+            return _provider_api_key(provider_name or None)
         raw = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
-        return raw.decode("utf-16-le").strip("\x00").strip() or _provider_api_key()
+        return raw.decode("utf-16-le").strip("\x00").strip() or _provider_api_key(provider_name or None)
     finally:
         _advapi32.CredFree(pointer)
 

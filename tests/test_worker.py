@@ -74,6 +74,28 @@ class CodexWorkerTests(unittest.TestCase):
             ("ask_ephemeral", ("private Word contents", [])),
         )
 
+    def test_current_context_consent_is_carried_with_a_turn_request(self):
+        self.worker.ask("分析当前桌面", [], current_context_consent=True)
+        self.assertEqual(
+            self.worker.req.get_nowait(),
+            ("ask", ("分析当前桌面", [], True)),
+        )
+
+    def test_worker_blocks_current_context_before_any_backend_transport(self):
+        self.worker._backend = "api"
+        with patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn("分析当前桌面并读取日志", [], current_context_consent=False)
+        run_api.assert_not_called()
+        kind, payload = self.events.get_nowait()
+        self.assertEqual(kind, "privacy_consent_required")
+        self.assertEqual(payload["scope"], "active_window_and_local_diagnostics")
+
+    def test_model_fallback_choice_queues_explicit_consent(self):
+        self.worker.authorize_model_fallback("deepseek", share_context=True)
+        self.assertEqual(self.worker.req.get_nowait(), ("authorize_model_fallback", {
+            "target_id": "deepseek", "share_context": True,
+        }))
+
     def test_agent_compact_routes_to_independent_runtime(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "compact", return_value=None) as compact:
@@ -158,4 +180,3 @@ class CodexWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

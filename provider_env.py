@@ -36,14 +36,48 @@ def _parse_lines(lines: list[str]) -> dict[str, str]:
 _VALUES = _read_file()
 
 
-def api_key() -> str:
-    return (os.environ.get("OPENAI_API_KEY", "").strip()
-            or os.environ.get("DEEPSEEK_API_KEY", "").strip()
-            or os.environ.get("DASHSCOPE_API_KEY", "").strip()
-            or os.environ.get("QWEN_API_KEY", "").strip()
-            or _VALUES.get("api-key", "") or _VALUES.get("openai_api_key", "")
-            or _VALUES.get("deepseek_api_key", "") or _VALUES.get("dashscope_api_key", "")
-            or _VALUES.get("qwen_api_key", ""))
+def api_key(provider: str | None = None) -> str:
+    """Return the key for a provider without exposing it in diagnostics.
+
+    A provider-specific key wins over the legacy generic key.  Calling this
+    without a provider preserves the original priority used by the active
+    connection.
+    """
+    name = str(provider or "").strip().lower().replace("_", "-")
+    provider_keys = {
+        "openai": ("OPENAI_API_KEY", "openai_api_key"),
+        "responses": ("OPENAI_API_KEY", "openai_api_key"),
+        "deepseek": ("DEEPSEEK_API_KEY", "deepseek_api_key"),
+        "qwen": ("QWEN_API_KEY", "qwen_api_key", "DASHSCOPE_API_KEY", "dashscope_api_key"),
+        "dashscope": ("DASHSCOPE_API_KEY", "dashscope_api_key", "QWEN_API_KEY", "qwen_api_key"),
+    }
+    if name in provider_keys:
+        for key in provider_keys[name]:
+            value = os.environ.get(key, "").strip() if key.isupper() else _VALUES.get(key, "")
+            if value:
+                return value
+    candidates = (
+        os.environ.get("OPENAI_API_KEY", "").strip(),
+        os.environ.get("DEEPSEEK_API_KEY", "").strip(),
+        os.environ.get("DASHSCOPE_API_KEY", "").strip(),
+        os.environ.get("QWEN_API_KEY", "").strip(),
+        _VALUES.get("api-key", ""), _VALUES.get("openai_api_key", ""),
+        _VALUES.get("deepseek_api_key", ""), _VALUES.get("dashscope_api_key", ""),
+        _VALUES.get("qwen_api_key", ""),
+    )
+    return next((value for value in candidates if value), "")
+
+
+def model_fallbacks_raw() -> str:
+    return (os.environ.get("DESKORB_AGENT_MODEL_FALLBACKS", "").strip()
+            or _VALUES.get("deskorb_agent_model_fallbacks", "")
+            or _VALUES.get("model_fallbacks", ""))
+
+
+def model_capabilities_raw() -> str:
+    return (os.environ.get("DESKORB_AGENT_MODEL_CAPABILITIES", "").strip()
+            or _VALUES.get("deskorb_agent_model_capabilities", "")
+            or _VALUES.get("model_capabilities", ""))
 
 
 def api_base_url() -> str:

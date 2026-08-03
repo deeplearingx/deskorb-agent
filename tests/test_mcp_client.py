@@ -30,7 +30,7 @@ class MCPClientTests(unittest.TestCase):
             }}), encoding="utf-8")
             specs = load_mcp_servers(path)
         self.assertEqual([spec.name for spec in specs], ["playwright"])
-        self.assertEqual(specs[0].args[-1], "@playwright/mcp@latest")
+        self.assertIn("@playwright/mcp@latest", specs[0].args)
 
     def test_custom_intent_metadata_is_available_without_starting_server(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -62,9 +62,17 @@ class MCPClientTests(unittest.TestCase):
         specs = load_mcp_servers(None, enable_playwright=True)
         names = [spec.name for spec in specs]
         self.assertIn("playwright", names)
+        playwright = next(spec for spec in specs if spec.name == "playwright")
+        self.assertIn("--isolated", playwright.args)
         self.assertIn("powertoys", names)
         powertoys = next(spec for spec in specs if spec.name == "powertoys")
         self.assertTrue(powertoys.args[-1].endswith("powertoys_mcp.py"))
+
+    def test_connected_playwright_mode_requires_extension_instead_of_isolated_profile(self):
+        specs = load_mcp_servers(None, enable_playwright=True, playwright_mode="connected-playwright")
+        playwright = next(spec for spec in specs if spec.name == "playwright")
+        self.assertIn("--extension", playwright.args)
+        self.assertNotIn("--isolated", playwright.args)
 
     def test_powertoys_reads_are_observations_but_apply_is_forced_high_risk(self):
         class PowerToysClient:
@@ -129,6 +137,52 @@ class MCPClientTests(unittest.TestCase):
         bridge.schemas(["playwright"])
         bridge.schemas(["playwright"])
         self.assertEqual(client.list_calls, 1)
+
+    def test_custom_server_requires_an_explicit_tool_allowlist(self):
+        class CustomClient:
+            def list_tools(self):
+                return [
+                    {"name": "knowledge_search", "inputSchema": {"type": "object"}},
+                    {"name": "browser_run_code", "inputSchema": {"type": "object"}},
+                ]
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mcp.json"
+            path.write_text(json.dumps({"mcpServers": {
+                "knowledge": {"command": "knowledge-mcp", "deskorb": {
+                    "allowed_tools": ["knowledge_search"]}},
+            }}), encoding="utf-8")
+            bridge = MCPToolBridge(path)
+        bridge.clients["knowledge"] = CustomClient()
+        schemas = bridge.schemas(["knowledge"])
+        self.assertEqual([item["name"] for item in schemas], ["mcp_knowledge_knowledge_search"])
+
+    def test_custom_server_blocks_urls_outside_allowlisted_domains(self):
+        class CustomClient:
+            def list_tools(self):
+                return [{"name": "knowledge_search", "inputSchema": {"type": "object"}}]
+
+            def call_tool(self, _name, _arguments):
+                raise AssertionError("blocked URL must not reach MCP")
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mcp.json"
+            path.write_text(json.dumps({"mcpServers": {
+                "knowledge": {"command": "knowledge-mcp", "deskorb": {
+                    "allowed_tools": ["knowledge_search"], "allowed_domains": ["example.test"]}},
+            }}), encoding="utf-8")
+            bridge = MCPToolBridge(path)
+        bridge.clients["knowledge"] = CustomClient()
+        name = bridge.schemas(["knowledge"])[0]["name"]
+        result = bridge.call(name, {"url": "https://other.test/private"})
+        self.assertFalse(result["ok"])
+        self.assertIn("allowed_domains", result["error"])
 
 
 if __name__ == "__main__":
