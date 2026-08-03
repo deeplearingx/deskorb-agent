@@ -40,7 +40,8 @@ from win32utils import _user32, _gdi32
 from worker import CodexWorker
 from word_sources import WordMaterial, is_word_window, read_active_word_document
 from office_sources import OfficeSnapshot, is_excel_window, read_active_office_snapshot
-from office_edits import OfficeEditPlan, OfficePlanError, apply_office_plan, parse_office_plan
+from office_edits import (OfficeEditPlan, OfficeEditRecord, OfficePlanError,
+                           apply_office_plan, parse_office_plan)
 
 # ───────────────────────────── the overlay UI ─────────────────────────────
 PLACEHOLDER = "Ask DeskOrb Agent…"
@@ -246,6 +247,8 @@ class Overlay:
         self._office_plan_raw = []
         self._pending_office_plan = None
         self._office_apply_active = False
+        self.office_edit_history: list[OfficeEditRecord] = []
+        self._office_generation = 0
 
         self._build()
         self._register_hotkey()
@@ -1049,7 +1052,7 @@ class Overlay:
         )
         self._refresh_chat_word_attachment()
 
-    def _clear_chat_word_attachment(self, cancel_read=False):
+    def _clear_persistent_office(self, cancel_read=False):
         if cancel_read:
             self._chat_word_read_sequence = getattr(self, "_chat_word_read_sequence", 0) + 1
             self._chat_word_read_request = None
@@ -1060,11 +1063,17 @@ class Overlay:
                     self.root.after_cancel(timeout_after)
                 except Exception:
                     pass
-        self.chat_word_attachment = None
         self.chat_office_snapshot = None
+        self.office_edit_history = []
         self._office_plan_active = False
         self._office_plan_raw = []
         self._pending_office_plan = None
+        self._office_apply_active = False
+        self._office_generation = getattr(self, "_office_generation", 0) + 1
+
+    def _clear_chat_word_attachment(self, cancel_read=False):
+        self._clear_persistent_office(cancel_read=cancel_read)
+        self.chat_word_attachment = None
         self._refresh_chat_word_attachment()
 
     def _add_chat_excel(self):
@@ -3195,7 +3204,8 @@ class Overlay:
 
     def _discard_pending_office_plan(self):
         self._pending_office_plan = None
-        self._clear_chat_word_attachment()
+        self._office_plan_raw = []
+        self._office_plan_active = False
         self.add_sys("Office changes discarded.")
 
     def _apply_pending_office_plan(self):
@@ -4139,7 +4149,6 @@ class Overlay:
             result, error = payload
             self._office_apply_active = False
             self._pending_office_plan = None
-            self._clear_chat_word_attachment()
             if error is not None:
                 self.add_err(str(error))
             else:

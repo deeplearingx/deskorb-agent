@@ -13,6 +13,8 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         overlay._office_plan_raw = []
         overlay._pending_office_plan = None
         overlay._office_apply_active = False
+        overlay.office_edit_history = []
+        overlay._office_generation = 0
         overlay.add_user = Mock()
         overlay.add_err = Mock()
         overlay.add_delta = Mock()
@@ -39,6 +41,7 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         self.assertIn("word_replace_text", prompt)
         self.assertIn("excel_set_cell", prompt)
         self.assertTrue(overlay._office_plan_active)
+        self.assertIsNotNone(overlay.chat_office_snapshot)
         display = overlay.add_user.call_args.args[0]
         self.assertIn("Plan.xlsx", display)
         self.assertNotIn("Budget!C3", display)
@@ -51,6 +54,38 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
 
         self.assertEqual(overlay._office_plan_raw, ['{"answer":"private"}'])
         overlay.add_delta.assert_not_called()
+
+    def test_clear_persistent_office_removes_snapshot_history_plan_and_raw_buffer(self):
+        overlay = self._overlay()
+        overlay.chat_office_snapshot = Mock()
+        overlay.office_edit_history = [Mock()]
+        overlay._pending_office_plan = Mock()
+        overlay._office_plan_raw = ["private document text"]
+        overlay._office_plan_active = True
+
+        overlay._clear_persistent_office()
+
+        self.assertIsNone(overlay.chat_office_snapshot)
+        self.assertEqual(overlay.office_edit_history, [])
+        self.assertIsNone(overlay._pending_office_plan)
+        self.assertEqual(overlay._office_plan_raw, [])
+        self.assertFalse(overlay._office_plan_active)
+        self.assertEqual(overlay._office_generation, 1)
+
+    def test_successful_office_apply_keeps_attachment_for_follow_up(self):
+        overlay = self._overlay()
+        snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='New'", fingerprint="after",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "New"),), has_unsaved_changes=True,
+        )
+        overlay.chat_office_snapshot = snapshot
+        result = Mock(message="Changes were written to the open document and were not saved.")
+
+        overlay._handle("office_apply", (result, None))
+
+        self.assertIs(overlay.chat_office_snapshot, snapshot)
+        self.assertIsNone(overlay._pending_office_plan)
 
     def test_office_preview_places_actions_below_long_preview_text(self):
         from office_edits import OfficeEditPlan, WordTextEdit
