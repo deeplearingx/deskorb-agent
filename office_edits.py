@@ -192,15 +192,16 @@ def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> None
             if actual != expected:
                 raise OfficePlanError(f"Office did not verify the requested change at {edit.locator}.")
 
-    _with_active_document(kind, expected_root, plan.snapshot_fingerprint, verify)
+    _with_active_document(kind, expected_root, None, verify)
 
 
 def _with_active_document(
-    kind: str, expected_root: int, expected_fingerprint: str, callback: Callable[[Any], None]
+    kind: str, expected_root: int, expected_fingerprint: str | None, callback: Callable[[Any], None]
 ) -> None:
-    current = read_active_office_snapshot(kind, expected_root)
-    if current.fingerprint != expected_fingerprint:
-        raise OfficePlanError("The Office document changed since the preview. Read it again before applying edits.")
+    if expected_fingerprint is not None:
+        current = read_active_office_snapshot(kind, expected_root)
+        if current.fingerprint != expected_fingerprint:
+            raise OfficePlanError("The Office document changed since the preview. Read it again before applying edits.")
     pythoncom, client = _load_com_modules()
     initialized = False
     try:

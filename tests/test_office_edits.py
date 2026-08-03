@@ -103,6 +103,25 @@ class OfficePlanParsingTests(unittest.TestCase):
 
 
 class OfficePlanApplyTests(unittest.TestCase):
+    def test_post_write_verification_does_not_require_prewrite_fingerprint(self):
+        from office_edits import _with_active_document
+
+        snapshot_after_write = replace(word_snapshot(), fingerprint="after-write")
+        pythoncom = Mock()
+        client = Mock()
+        application = Mock()
+        application.ActiveWindow.Hwnd = 101
+        application.ActiveDocument = Mock()
+        client.GetActiveObject.return_value = application
+        visited = []
+
+        with patch("office_edits.read_active_office_snapshot", return_value=snapshot_after_write), \
+                patch("office_edits._load_com_modules", return_value=(pythoncom, client)), \
+                patch("office_edits.root_window", side_effect=lambda hwnd: hwnd):
+            _with_active_document("word", 101, None, visited.append)
+
+        self.assertEqual(visited, [application.ActiveDocument])
+
     def test_changed_snapshot_prevents_all_writes(self):
         from office_edits import OfficeEditPlan, WordTextEdit, OfficePlanError, apply_office_plan
 
