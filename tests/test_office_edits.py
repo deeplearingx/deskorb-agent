@@ -102,6 +102,54 @@ class OfficePlanParsingTests(unittest.TestCase):
             parse_office_plan(excel_snapshot(), raw)
 
 
+class OfficeHistoryTests(unittest.TestCase):
+    def test_records_word_change_and_builds_inverse_plan(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, inverse_plan, record_from_plan
+
+        snapshot = word_snapshot()
+        plan = OfficeEditPlan("word", snapshot.fingerprint,
+                              (WordTextEdit("paragraph:1", "Old", "New"),))
+        record = record_from_plan(plan, snapshot, "op-1")
+        current = replace(snapshot, fingerprint="after", targets=(OfficeTarget("paragraph:1", "paragraph:1", "New"),))
+
+        inverse = inverse_plan(record, current)
+
+        self.assertEqual(record.operation_id, "op-1")
+        self.assertEqual((inverse.edits[0].expected_value, inverse.edits[0].value), ("New", "Old"))
+
+    def test_inverts_excel_formula_and_value_without_losing_expected_state(self):
+        from office_edits import ExcelCellEdit, OfficeEditPlan, inverse_plan, record_from_plan
+
+        snapshot = excel_snapshot()
+        plan = OfficeEditPlan("excel", snapshot.fingerprint, (
+            ExcelCellEdit("Budget!C3", 120, "=SUM(C1:C2)", formula="=SUM(C1:C3)"),
+            ExcelCellEdit("Sheet1!A1", "Month", "", value="Period"),
+        ))
+        record = record_from_plan(plan, snapshot, "op-2")
+        current = replace(snapshot, fingerprint="after", targets=(
+            OfficeTarget("Sheet1!A1", "Sheet1!A1", "Period", ""),
+            OfficeTarget("Budget!C3", "Budget!C3", 120, "=SUM(C1:C3)"),
+        ))
+
+        inverse = inverse_plan(record, current)
+
+        self.assertEqual(inverse.edits[0].formula, "=SUM(C1:C2)")
+        self.assertIsNone(inverse.edits[0].value)
+        self.assertEqual((inverse.edits[1].value, inverse.edits[1].formula), ("Month", None))
+
+    def test_rejects_inverse_when_current_target_was_changed_again(self):
+        from office_edits import OfficeEditPlan, OfficePlanError, WordTextEdit, inverse_plan, record_from_plan
+
+        snapshot = word_snapshot()
+        plan = OfficeEditPlan("word", snapshot.fingerprint,
+                              (WordTextEdit("paragraph:1", "Old", "New"),))
+        record = record_from_plan(plan, snapshot, "op-3")
+        current = replace(snapshot, targets=(OfficeTarget("paragraph:1", "paragraph:1", "Someone else"),))
+
+        with self.assertRaisesRegex(OfficePlanError, "changed"):
+            inverse_plan(record, current)
+
+
 class OfficePlanApplyTests(unittest.TestCase):
     def test_post_write_verification_does_not_require_prewrite_fingerprint(self):
         from office_edits import _with_active_document

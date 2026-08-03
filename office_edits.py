@@ -44,6 +44,14 @@ class OfficeApplyResult:
     message: str
 
 
+@dataclass(frozen=True)
+class OfficeEditRecord:
+    operation_id: str
+    kind: str
+    identity: str
+    edits: tuple[WordTextEdit | ExcelCellEdit, ...]
+
+
 def parse_office_plan(snapshot: OfficeSnapshot, raw_json: str) -> tuple[str, OfficeEditPlan | None]:
     """Parse the model's one-object response into a locally validated edit plan."""
     try:
@@ -76,6 +84,38 @@ def parse_office_plan(snapshot: OfficeSnapshot, raw_json: str) -> tuple[str, Off
         seen.add(locator)
         edits.append(edit)
     return answer.strip(), OfficeEditPlan(snapshot.kind, snapshot.fingerprint, tuple(edits))
+
+
+def record_from_plan(plan: OfficeEditPlan, snapshot: OfficeSnapshot, operation_id: str) -> OfficeEditRecord:
+    if plan.kind != snapshot.kind or plan.snapshot_fingerprint != snapshot.fingerprint:
+        raise OfficePlanError("The Office edit plan does not match the snapshot for history recording.")
+    return OfficeEditRecord(operation_id, snapshot.kind, snapshot.identity, tuple(plan.edits))
+
+
+def inverse_plan(record: OfficeEditRecord, snapshot: OfficeSnapshot) -> OfficeEditPlan:
+    if record.kind != snapshot.kind or record.identity != snapshot.identity:
+        raise OfficePlanError("The Office history does not match the current document.")
+    targets = {target.locator: target for target in snapshot.targets}
+    inverse_edits: list[WordTextEdit | ExcelCellEdit] = []
+    for edit in record.edits:
+        target = _target_for(edit.locator, targets)
+        if isinstance(edit, WordTextEdit):
+            if target.value != edit.value:
+                raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
+            inverse_edits.append(WordTextEdit(edit.locator, edit.value, edit.expected_value))
+            continue
+        if edit.formula is not None:
+            if target.formula != edit.formula:
+                raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
+        elif target.formula or target.value != edit.value:
+            raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
+        if edit.expected_formula:
+            inverse_edits.append(ExcelCellEdit(edit.locator, edit.value, edit.formula or "",
+                                               value=None, formula=edit.expected_formula))
+        else:
+            inverse_edits.append(ExcelCellEdit(edit.locator, edit.value, edit.formula or "",
+                                               value=edit.expected_value, formula=None))
+    return OfficeEditPlan(record.kind, snapshot.fingerprint, tuple(inverse_edits))
 
 
 def apply_office_plan(snapshot: OfficeSnapshot, plan: OfficeEditPlan) -> OfficeApplyResult:
