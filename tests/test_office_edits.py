@@ -324,6 +324,19 @@ class OfficePlanApplyTests(unittest.TestCase):
         apply_targets.assert_called_once_with("word", snapshot.expected_root, plan)
         verify_targets.assert_called_once_with("word", snapshot.expected_root, plan)
 
+    def test_apply_reports_preview_fallback_when_selection_fails(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, apply_office_plan
+
+        snapshot = word_snapshot()
+        plan = OfficeEditPlan("word", snapshot.fingerprint,
+                              (WordTextEdit("paragraph:1", "Old", "New"),))
+        with patch("office_edits.read_active_office_snapshot", return_value=snapshot), \
+                patch("office_edits._apply_targets"), \
+                patch("office_edits._verify_targets", return_value=False):
+            result = apply_office_plan(snapshot, plan)
+
+        self.assertIn("preview as the change marker", result.message)
+
 
 if __name__ == "__main__":
     unittest.main()

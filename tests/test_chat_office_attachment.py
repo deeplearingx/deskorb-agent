@@ -210,6 +210,19 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
                          (WordTextEdit("paragraph:1", "New", "Old"),))
         overlay._add_office_plan_actions.assert_called_once_with(overlay._pending_office_plan)
 
+    def test_undo_without_agent_history_recommends_native_office_undo(self):
+        overlay = self._overlay()
+        overlay.chat_office_snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='New'", fingerprint="after",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "New"),), has_unsaved_changes=True,
+        )
+
+        overlay._send_chat_office_attachment("undo the last change")
+
+        overlay.worker.ask_office_context.assert_not_called()
+        self.assertIn("Ctrl+Z", overlay.add_sys.call_args.args[0])
+
     def test_office_preview_places_actions_below_long_preview_text(self):
         from office_edits import OfficeEditPlan, WordTextEdit
 

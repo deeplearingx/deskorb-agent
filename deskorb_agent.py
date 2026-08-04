@@ -3154,8 +3154,16 @@ class Overlay:
         return bool(re.search(r"(?:撤回|撤销|回滚|恢复).{0,12}(?:刚才|上次|上一条|最近)?|(?:undo|revert)", text))
 
     def _prepare_office_undo(self, question, snapshot):
-        if not self.office_edit_history or not self._is_office_undo_request(question):
+        if not self._is_office_undo_request(question):
             return False
+        if not self.office_edit_history:
+            self.add_user(f"{question} [{snapshot.kind.title()} attachment: {snapshot.name}]")
+            self._set_busy(False)
+            self.add_sys(
+                "This session has no confirmed Office edit history for that request. "
+                "If the change is still open in Office, use Ctrl+Z there."
+            )
+            return True
         try:
             plan = inverse_plan(self.office_edit_history[-1], snapshot)
         except OfficePlanError as exc:
