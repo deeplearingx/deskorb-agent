@@ -3201,16 +3201,23 @@ class Overlay:
             '{"answer":"brief answer","plan": null}\n'
             "For Word, plan.edits entries must be:\n"
             '{"type":"word_replace_text","locator":"paragraph:1","expected_value":"old","value":"new"}\n'
+            "For a new paragraph at the end of a Word document, use the last supplied "
+            "paragraph as the anchor and this exact shape:\n"
+            '{"type":"word_insert_paragraph_after","locator":"paragraph:1","expected_value":"old","value":"new paragraph"}\n'
             "For Excel, plan.edits entries must be:\n"
             '{"type":"excel_set_cell","sheet":"Sheet1","address":"A1","expected_value":"old",'
             '"expected_formula":null,"value":"new","formula":null}\n'
             "A non-null plan must contain kind, snapshot_fingerprint, and edits. Use only supplied "
-            "target locators and copy each expected value/formula exactly.\n\n"
+            "target locators and copy each expected value/formula exactly. Never invent a new "
+            "paragraph locator. For an empty Word paragraph shown by the paragraph count, use "
+            'word_replace_text with expected_value ""; for a new final paragraph, use the insert '
+            "operation above.\n\n"
             "Previous applied Office edits are private session history. Use them to answer "
             "follow-up requests such as undo, but do not claim an edit was applied until the "
             "user confirms it.\n"
             f"History:\n{history_text}\n\n"
             f"Office kind: {snapshot.kind}\nSnapshot fingerprint: {snapshot.fingerprint}\n"
+            f"Word paragraph count: {snapshot.paragraph_count if snapshot.kind == 'word' else 'n/a'}\n"
             "Targets and current content:\n"
             f"{snapshot.rendered_text}\n\nUser request:\n{question}"
         )

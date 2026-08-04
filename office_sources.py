@@ -43,6 +43,7 @@ class OfficeSnapshot:
     fingerprint: str
     targets: tuple[OfficeTarget, ...]
     has_unsaved_changes: bool
+    paragraph_count: int | None = None
 
 
 def is_word_window(hwnd: int) -> bool:
@@ -107,6 +108,7 @@ def _read_word_snapshot(application: Any, expected_hwnd: int) -> OfficeSnapshot:
         document = application.ActiveDocument
         _ensure_word_editable(document)
         targets = _word_targets(document)
+        paragraph_count = len(_iter_collection(document.Paragraphs))
         name = _office_name(document.Name, "Untitled Word document")
         identity = _office_identity("word", expected_root, document)
         changed = not bool(document.Saved)
@@ -114,7 +116,7 @@ def _read_word_snapshot(application: Any, expected_hwnd: int) -> OfficeSnapshot:
         raise
     except Exception as exc:
         raise OfficeSourceError(_office_error_message("Word", exc)) from exc
-    return _build_snapshot("word", expected_root, identity, name, targets, changed)
+    return _build_snapshot("word", expected_root, identity, name, targets, changed, paragraph_count)
 
 
 def _read_excel_snapshot(application: Any, expected_hwnd: int) -> OfficeSnapshot:
@@ -218,6 +220,7 @@ def _build_snapshot(
     name: str,
     targets: tuple[OfficeTarget, ...],
     has_unsaved_changes: bool,
+    paragraph_count: int | None = None,
 ) -> OfficeSnapshot:
     rendered_text = _render_targets(targets)
     if len(rendered_text) > OFFICE_MAX_RENDERED_CHARS:
@@ -229,6 +232,8 @@ def _build_snapshot(
         {"locator": target.locator, "value": target.value, "formula": target.formula}
         for target in targets
     ]
+    if kind == "word":
+        fingerprint_payload.insert(0, {"paragraph_count": paragraph_count})
     encoded = json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, default=str)
     fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     return OfficeSnapshot(
@@ -240,6 +245,7 @@ def _build_snapshot(
         fingerprint=fingerprint,
         targets=targets,
         has_unsaved_changes=has_unsaved_changes,
+        paragraph_count=paragraph_count,
     )
 
 

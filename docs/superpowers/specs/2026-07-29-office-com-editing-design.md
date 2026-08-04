@@ -77,7 +77,9 @@ if exceeded, the read fails rather than silently omitting editable cells.
 `office_edits.py` defines dataclasses and strict parsing for the only plans
 that may reach Apply:
 
-- `WordTextEdit(locator, expected_text, replacement_text)`;
+- `WordTextEdit(locator, expected_text, replacement_text)` for replacement,
+  plus a bounded `word_insert_paragraph_after` variant anchored to the final
+  existing Word paragraph;
 - `ExcelCellEdit(sheet, address, expected_value, expected_formula,
   value_or_formula)`.
 
@@ -87,8 +89,11 @@ a plan. The request carries the snapshot only ephemerally. A specialized
 worker/UI request mode captures the completed raw response, validates the
 envelope locally, and never treats free-form model text as a write command.
 Malformed JSON, unsupported operations, duplicate targets, targets absent
-from the snapshot, or edits whose `expected_*` values do not match the
-snapshot are rejected and never displayed as applicable changes.
+from the snapshot, invented paragraph locators, or edits whose `expected_*`
+values do not match the snapshot are rejected and never displayed as
+applicable changes. A legacy end-insertion response that points exactly one
+paragraph beyond the snapshot is accepted only when its expected value is
+empty and the existing final paragraph can be verified as the anchor.
 
 This workflow works with the existing Agent, API, and Codex backends for
 planning. The local UI, not the model, owns writing to Office.
@@ -124,10 +129,12 @@ mutation. A mismatch reports that the document changed and requires a new
 read and preview.
 
 For Word, each locator must still hold its `expected_text`; the writer then
-replaces that complete paragraph or table-cell text. For Excel, each target
-cell must still have its expected value/formula; the writer assigns either a
-formula or a value. The writer validates every target before the first write,
-then applies the plan and rereads all edited targets to verify the result.
+replaces that complete paragraph or table-cell text. A final-paragraph insert
+creates one new body paragraph before the anchor's paragraph marker and copies
+nearby text formatting. For Excel, each target cell must still have its
+expected value/formula; the writer assigns either a formula or a value. The
+writer validates every target before the first write, then applies the plan and
+rereads all edited targets to verify the result.
 
 Office COM does not provide a portable rollback for arbitrary live document
 edits. Therefore the implementation validates all preconditions before writing

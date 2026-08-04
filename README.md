@@ -186,6 +186,11 @@ cannot select it, the DeskOrb preview remains the change marker. Comments, chart
 macros, and workbook structure are not changed. DeskOrb never saves, closes, or
 creates Office files. Save or undo from Office yourself.
 
+When a request adds a new paragraph at the end of a Word document, the plan uses
+the last existing paragraph as a bounded anchor. Invented or out-of-range
+paragraph locators are rejected; the new paragraph remains previewable and
+undoable through the same Apply/Undo flow.
+
 ### Known local environment issue: PowerShell 7
 
 The maintained Agent-runtime regression `test_shell_runner_returns_bounded_evidence`

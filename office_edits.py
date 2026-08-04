@@ -26,6 +26,7 @@ class WordTextEdit:
     locator: str
     expected_value: str
     value: str
+    mode: str = "replace"
 
 
 @dataclass(frozen=True)
@@ -80,11 +81,10 @@ def parse_office_plan(snapshot: OfficeSnapshot, raw_json: str) -> tuple[str, Off
     if not isinstance(raw_plan["edits"], list) or not raw_plan["edits"]:
         raise OfficePlanError("The Office plan must contain at least one edit.")
 
-    targets = {target.locator: target for target in snapshot.targets}
     edits: list[WordTextEdit | ExcelCellEdit] = []
     seen: set[str] = set()
     for raw_edit in raw_plan["edits"]:
-        edit = _parse_edit(snapshot.kind, raw_edit, targets)
+        edit = _parse_edit(snapshot.kind, raw_edit, snapshot)
         locator = edit.locator
         if locator in seen:
             raise OfficePlanError(f"The Office plan contains duplicate edits for {locator}.")
@@ -106,7 +106,25 @@ def inverse_plan(record: OfficeEditRecord, snapshot: OfficeSnapshot) -> OfficeEd
     inverse_edits: list[WordTextEdit | ExcelCellEdit] = []
     for edit in record.edits:
         if isinstance(edit, WordTextEdit):
-            current_value = _word_target_value_or_empty(targets, edit.locator)
+            if edit.mode == "insert_paragraph_after":
+                anchor = _target_for(edit.locator, targets)
+                created_locator = _next_paragraph_locator(edit.locator)
+                created = _target_for(created_locator, targets)
+                if anchor.value != edit.expected_value or created.value != edit.value:
+                    raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
+                inverse_edits.append(WordTextEdit(created_locator, edit.value, "", "delete_paragraph"))
+                continue
+            if edit.mode == "delete_paragraph":
+                current_value = _word_target_value_or_empty(targets, edit.locator, snapshot.paragraph_count)
+                if current_value != edit.value:
+                    raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
+                anchor_locator = _previous_paragraph_locator(edit.locator)
+                anchor = _target_for(anchor_locator, targets)
+                inverse_edits.append(
+                    WordTextEdit(anchor_locator, str(anchor.value), edit.expected_value, "insert_paragraph_after")
+                )
+                continue
+            current_value = _word_target_value_or_empty(targets, edit.locator, snapshot.paragraph_count)
             if current_value != edit.value:
                 raise OfficePlanError(f"The Office target {edit.locator} changed since the recorded edit.")
             inverse_edits.append(WordTextEdit(edit.locator, edit.value, edit.expected_value))
@@ -162,19 +180,43 @@ def apply_office_plan(snapshot: OfficeSnapshot, plan: OfficeEditPlan) -> OfficeA
     )
 
 
-def _parse_edit(kind: str, raw_edit: Any, targets: dict[str, OfficeTarget]):
+def _parse_edit(kind: str, raw_edit: Any, snapshot: OfficeSnapshot):
     if not isinstance(raw_edit, dict):
         raise OfficePlanError("Every Office edit must be a JSON object.")
+    targets = {target.locator: target for target in snapshot.targets}
     if kind == "word":
         _require_exact_keys(raw_edit, {"type", "locator", "expected_value", "value"}, "Word edit")
-        if raw_edit["type"] != "word_replace_text":
-            raise OfficePlanError("Word edits must use word_replace_text.")
+        edit_type = raw_edit["type"]
+        if edit_type not in {"word_replace_text", "word_insert_paragraph_after"}:
+            raise OfficePlanError(
+                "Word edits must use word_replace_text or word_insert_paragraph_after."
+            )
         locator = raw_edit["locator"]
         if not isinstance(locator, str) or not isinstance(raw_edit["expected_value"], str) or not isinstance(raw_edit["value"], str):
             raise OfficePlanError("Word edits require string locator, expected_value, and value fields.")
-        target = _target_for(locator, targets)
+        target = targets.get(locator)
+        if target is None:
+            if (
+                edit_type == "word_replace_text"
+                and raw_edit["expected_value"] == ""
+                and _is_known_word_paragraph(snapshot, locator)
+            ):
+                return WordTextEdit(locator, "", raw_edit["value"])
+            if edit_type == "word_replace_text" and raw_edit["expected_value"] == "":
+                repaired = _repair_legacy_end_insert(snapshot, locator, raw_edit["value"])
+                if repaired is not None:
+                    return repaired
+            _target_for(locator, targets)
         if target.value != raw_edit["expected_value"]:
             raise OfficePlanError(f"The expected content for {locator} does not match the snapshot.")
+        if edit_type == "word_insert_paragraph_after":
+            if not _is_last_word_paragraph(snapshot, locator):
+                raise OfficePlanError(
+                    "word_insert_paragraph_after is only supported after the last Word paragraph."
+                )
+            if not raw_edit["value"]:
+                raise OfficePlanError("word_insert_paragraph_after requires non-empty value.")
+            return WordTextEdit(locator, raw_edit["expected_value"], raw_edit["value"], "insert_paragraph_after")
         return WordTextEdit(locator, raw_edit["expected_value"], raw_edit["value"])
 
     _require_exact_keys(
@@ -212,7 +254,13 @@ def _validate_live_targets(current: OfficeSnapshot, plan: OfficeEditPlan) -> Non
     targets = {target.locator: target for target in current.targets}
     for edit in plan.edits:
         if isinstance(edit, WordTextEdit):
-            matches = _word_target_value_or_empty(targets, edit.locator) == edit.expected_value
+            if edit.mode == "insert_paragraph_after":
+                target = _target_for(edit.locator, targets)
+                matches = target.value == edit.expected_value
+            else:
+                matches = _word_target_value_or_empty(
+                    targets, edit.locator, current.paragraph_count
+                ) == edit.expected_value
         else:
             target = _target_for(edit.locator, targets)
             matches = target.value == edit.expected_value and target.formula == edit.expected_formula
@@ -222,12 +270,15 @@ def _validate_live_targets(current: OfficeSnapshot, plan: OfficeEditPlan) -> Non
             )
 
 
-def _word_target_value_or_empty(targets: dict[str, OfficeTarget], locator: str) -> str:
+def _word_target_value_or_empty(
+    targets: dict[str, OfficeTarget], locator: str, paragraph_count: int | None = None
+) -> str:
     """Word snapshots omit empty paragraphs, but an omitted paragraph is still editable."""
     target = targets.get(locator)
     if target is not None:
         return str(target.value)
-    if re.fullmatch(r"paragraph:\d+", locator):
+    match = re.fullmatch(r"paragraph:(\d+)", locator)
+    if match and (paragraph_count is None or int(match.group(1)) <= paragraph_count):
         return ""
     raise OfficePlanError(f"The target {locator} is not present in the snapshot.")
 
@@ -250,8 +301,20 @@ def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> bool
         nonlocal selected
         for edit in plan.edits:
             if kind == "word":
-                actual = _read_word_text(document, edit.locator)
-                expected = _normalize_word_text(edit.value)
+                if edit.mode == "insert_paragraph_after":
+                    target_locator = _next_paragraph_locator(edit.locator)
+                    actual = _read_word_text(document, target_locator)
+                    expected = _normalize_word_text(edit.value)
+                elif edit.mode == "delete_paragraph":
+                    index = _paragraph_index(edit.locator)
+                    if _word_paragraph_count(document) >= index:
+                        raise OfficePlanError(f"Office did not verify the requested change at {edit.locator}.")
+                    selected = False
+                    continue
+                else:
+                    target_locator = edit.locator
+                    actual = _read_word_text(document, target_locator)
+                    expected = _normalize_word_text(edit.value)
             elif edit.formula is not None:
                 actual = str(_resolve_excel_cell(document, edit.locator).Formula or "")
                 expected = edit.formula
@@ -261,7 +324,7 @@ def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> bool
             if actual != expected:
                 raise OfficePlanError(f"Office did not verify the requested change at {edit.locator}.")
             if kind == "word":
-                selected = _focus_word_target(document, edit.locator) and selected
+                selected = _focus_word_target(document, target_locator) and selected
             else:
                 selected = _focus_excel_cell(document, edit.locator) and selected
 
@@ -293,6 +356,21 @@ def _with_active_document(
 
 def _write_word_text(document: Any, edit: WordTextEdit) -> None:
     source_range = _resolve_word_range(document, edit.locator)
+    if edit.mode == "insert_paragraph_after":
+        if not re.fullmatch(r"paragraph:\d+", edit.locator):
+            raise OfficePlanError("word_insert_paragraph_after requires a body paragraph locator.")
+        inserted = source_range.Duplicate
+        inserted.End = inserted.End - 1
+        inserted.Collapse(0)
+        format_source = _nearest_word_format_source(source_range, at_end=True)
+        inserted.Text = "\r" + _word_text_for_write(edit.value)
+        _copy_word_format(format_source, inserted)
+        return
+    if edit.mode == "delete_paragraph":
+        source_range.Delete()
+        return
+    if edit.mode != "replace":
+        raise OfficePlanError(f"Unsupported Word edit mode {edit.mode}.")
     writable = source_range.Duplicate
     writable.End = writable.End - 1
     old_value = _normalize_word_text(edit.expected_value)
@@ -365,6 +443,62 @@ def _focus_word_target(document: Any, locator: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _paragraph_index(locator: str) -> int:
+    match = re.fullmatch(r"paragraph:(\d+)", locator)
+    if not match:
+        raise OfficePlanError(f"Word paragraph operation requires a paragraph locator, got {locator}.")
+    return int(match.group(1))
+
+
+def _next_paragraph_locator(locator: str) -> str:
+    return f"paragraph:{_paragraph_index(locator) + 1}"
+
+
+def _previous_paragraph_locator(locator: str) -> str:
+    index = _paragraph_index(locator)
+    if index <= 1:
+        raise OfficePlanError("A Word inserted paragraph must have a previous paragraph anchor.")
+    return f"paragraph:{index - 1}"
+
+
+def _word_paragraph_count(document: Any) -> int:
+    try:
+        return int(document.Paragraphs.Count or 0)
+    except Exception:
+        try:
+            return len(list(document.Paragraphs))
+        except Exception:
+            return 0
+
+
+def _is_known_word_paragraph(snapshot: OfficeSnapshot, locator: str) -> bool:
+    try:
+        index = _paragraph_index(locator)
+    except OfficePlanError:
+        return False
+    return snapshot.paragraph_count is not None and 1 <= index <= snapshot.paragraph_count
+
+
+def _is_last_word_paragraph(snapshot: OfficeSnapshot, locator: str) -> bool:
+    return snapshot.paragraph_count is not None and _paragraph_index(locator) == snapshot.paragraph_count
+
+
+def _repair_legacy_end_insert(snapshot: OfficeSnapshot, locator: str, value: str) -> WordTextEdit | None:
+    if snapshot.paragraph_count is None or not value:
+        return None
+    try:
+        index = _paragraph_index(locator)
+    except OfficePlanError:
+        return None
+    if index != snapshot.paragraph_count + 1:
+        return None
+    targets = {target.locator: target for target in snapshot.targets}
+    anchor = targets.get(f"paragraph:{snapshot.paragraph_count}")
+    if anchor is None:
+        return None
+    return WordTextEdit(anchor.locator, str(anchor.value), value, "insert_paragraph_after")
 
 
 def _focus_excel_cell(workbook: Any, locator: str) -> bool:

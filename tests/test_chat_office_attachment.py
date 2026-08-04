@@ -81,6 +81,22 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         self.assertNotIn("Old", display)
         self.assertNotIn("New", display)
 
+    def test_word_prompt_explains_bounded_final_paragraph_insertion(self):
+        overlay = self._overlay()
+        overlay.chat_office_snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='Last'", fingerprint="after",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "Last"),),
+            has_unsaved_changes=True, paragraph_count=1,
+        )
+
+        overlay._send_chat_office_attachment("在文章末尾添加总结")
+
+        prompt = overlay.worker.ask_office_context.call_args.args[1]
+        self.assertIn("word_insert_paragraph_after", prompt)
+        self.assertIn("Word paragraph count: 1", prompt)
+        self.assertIn("Never invent a new paragraph locator", prompt)
+
     def test_office_plan_delta_is_buffered_not_rendered(self):
         overlay = self._overlay()
         overlay._office_plan_active = True

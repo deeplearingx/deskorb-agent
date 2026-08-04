@@ -88,6 +88,7 @@ class OfficeSourceTests(unittest.TestCase):
         self.assertEqual([target.locator for target in snapshot.targets],
                          ["paragraph:1", "table:1/1/1"])
         self.assertEqual([target.value for target in snapshot.targets], ["Project title", "Budget"])
+        self.assertEqual(snapshot.paragraph_count, 1)
         self.assertIn("paragraph:1", snapshot.rendered_text)
         self.assertTrue(snapshot.has_unsaved_changes)
         pythoncom.CoInitialize.assert_called_once_with()

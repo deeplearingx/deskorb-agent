@@ -14,6 +14,18 @@ def word_snapshot():
     )
 
 
+def word_multi_paragraph_snapshot():
+    return OfficeSnapshot(
+        kind="word", expected_root=101, identity="word:101:C:/docs/Project.docx",
+        name="Project.docx", rendered_text="[paragraph:1] value='Old'\n[paragraph:2] value='Last'",
+        fingerprint="word-multi-fingerprint",
+        targets=(
+            OfficeTarget("paragraph:1", "paragraph:1", "Old"),
+            OfficeTarget("paragraph:2", "paragraph:2", "Last"),
+        ), has_unsaved_changes=False, paragraph_count=2,
+    )
+
+
 def excel_snapshot():
     return OfficeSnapshot(
         kind="excel", expected_root=202, identity="excel:202:C:/docs/Plan.xlsx",
@@ -101,6 +113,70 @@ class OfficePlanParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(OfficePlanError, "exactly one"):
             parse_office_plan(excel_snapshot(), raw)
 
+    def test_parses_explicit_word_insert_after_anchor(self):
+        from office_edits import WordTextEdit, parse_office_plan
+
+        snapshot = word_multi_paragraph_snapshot()
+        raw = json.dumps({
+            "answer": "I prepared a new paragraph.",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_insert_paragraph_after", "locator": "paragraph:2",
+                 "expected_value": "Last", "value": "Summary"},
+            ]},
+        })
+
+        _, plan = parse_office_plan(snapshot, raw)
+
+        self.assertEqual(plan.edits,
+                         (WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),))
+
+    def test_repairs_legacy_missing_end_paragraph_plan_to_bounded_insert(self):
+        from office_edits import WordTextEdit, parse_office_plan
+
+        snapshot = word_multi_paragraph_snapshot()
+        raw = json.dumps({
+            "answer": "I prepared a new paragraph.",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_replace_text", "locator": "paragraph:3",
+                 "expected_value": "", "value": "Summary"},
+            ]},
+        })
+
+        _, plan = parse_office_plan(snapshot, raw)
+
+        self.assertEqual(plan.edits,
+                         (WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),))
+
+    def test_rejects_a_missing_paragraph_beyond_the_document_end(self):
+        from office_edits import OfficePlanError, parse_office_plan
+
+        snapshot = word_multi_paragraph_snapshot()
+        raw = json.dumps({
+            "answer": "x",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_replace_text", "locator": "paragraph:4",
+                 "expected_value": "", "value": "Summary"},
+            ]},
+        })
+
+        with self.assertRaisesRegex(OfficePlanError, "not present"):
+            parse_office_plan(snapshot, raw)
+
+    def test_does_not_repair_legacy_end_insert_with_nonempty_expected_value(self):
+        from office_edits import OfficePlanError, parse_office_plan
+
+        snapshot = word_multi_paragraph_snapshot()
+        raw = json.dumps({
+            "answer": "x",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_replace_text", "locator": "paragraph:3",
+                 "expected_value": "not empty", "value": "Summary"},
+            ]},
+        })
+
+        with self.assertRaisesRegex(OfficePlanError, "not present"):
+            parse_office_plan(snapshot, raw)
+
 
 class OfficeHistoryTests(unittest.TestCase):
     def test_records_word_change_and_builds_inverse_plan(self):
@@ -172,6 +248,25 @@ class OfficeHistoryTests(unittest.TestCase):
 
         _validate_live_targets(current, plan)
 
+    def test_inverse_of_inserted_word_paragraph_deletes_the_created_paragraph(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, inverse_plan, record_from_plan
+
+        snapshot = word_multi_paragraph_snapshot()
+        plan = OfficeEditPlan(snapshot.kind, snapshot.fingerprint, (
+            WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),
+        ))
+        record = record_from_plan(plan, snapshot, "op-insert")
+        current = replace(snapshot, fingerprint="after", targets=(
+            OfficeTarget("paragraph:1", "paragraph:1", "Old"),
+            OfficeTarget("paragraph:2", "paragraph:2", "Last"),
+            OfficeTarget("paragraph:3", "paragraph:3", "Summary"),
+        ), paragraph_count=3)
+
+        inverse = inverse_plan(record, current)
+
+        self.assertEqual(inverse.edits,
+                         (WordTextEdit("paragraph:3", "Summary", "", "delete_paragraph"),))
+
 
 class OfficePlanApplyTests(unittest.TestCase):
     def test_word_write_canonicalizes_embedded_line_breaks(self):
@@ -188,6 +283,22 @@ class OfficePlanApplyTests(unittest.TestCase):
             _write_word_text(Mock(), edit)
 
         self.assertEqual(writable.Text, "\vSummary")
+
+    def test_word_insert_after_writes_a_new_paragraph_before_the_anchor_marker(self):
+        from office_edits import WordTextEdit, _write_word_text
+
+        source_range = Mock()
+        writable = Mock()
+        writable.Start = 10
+        writable.End = 20
+        source_range.Duplicate = writable
+        edit = WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after")
+
+        with patch("office_edits._resolve_word_range", return_value=source_range):
+            _write_word_text(Mock(), edit)
+
+        self.assertEqual(writable.End, 19)
+        self.assertEqual(writable.Text, "\rSummary")
 
     def test_word_write_copies_nearest_font_to_inserted_range(self):
         from office_edits import _copy_word_format
@@ -277,6 +388,24 @@ class OfficePlanApplyTests(unittest.TestCase):
                 patch("office_edits._with_active_document") as with_document:
             with_document.side_effect = lambda kind, root, fingerprint, callback: callback(Mock())
             _verify_targets("word", 101, plan)
+
+    def test_word_insert_verification_reads_and_selects_the_created_paragraph(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, _verify_targets
+
+        plan = OfficeEditPlan(
+            "word", "word-fingerprint",
+            (WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),),
+        )
+        word_range = Mock()
+        word_range.Text = "Summary\r"
+        duplicate = Mock()
+        duplicate.End = 20
+        word_range.Duplicate = duplicate
+
+        with patch("office_edits._resolve_word_range", return_value=word_range), \
+                patch("office_edits._with_active_document") as with_document:
+            with_document.side_effect = lambda kind, root, fingerprint, callback: callback(Mock())
+            self.assertTrue(_verify_targets("word", 101, plan))
 
     def test_post_write_verification_does_not_require_prewrite_fingerprint(self):
         from office_edits import _with_active_document
