@@ -187,7 +187,7 @@ class OfficePlanApplyTests(unittest.TestCase):
         with patch("office_edits._resolve_word_range", return_value=source_range):
             _write_word_text(Mock(), edit)
 
-        self.assertEqual(writable.Text, "Old\vSummary")
+        self.assertEqual(writable.Text, "\vSummary")
 
     def test_word_write_copies_nearest_font_to_inserted_range(self):
         from office_edits import _copy_word_format

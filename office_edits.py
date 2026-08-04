@@ -143,7 +143,7 @@ def apply_office_plan(snapshot: OfficeSnapshot, plan: OfficeEditPlan) -> OfficeA
             "Office could not write all requested changes. Inspect the document and use Office Undo if needed."
         ) from exc
     try:
-        _verify_targets(snapshot.kind, snapshot.expected_root, plan)
+        selected = _verify_targets(snapshot.kind, snapshot.expected_root, plan)
     except OfficePlanError:
         raise
     except Exception as exc:
@@ -151,7 +151,15 @@ def apply_office_plan(snapshot: OfficeSnapshot, plan: OfficeEditPlan) -> OfficeA
             "Office wrote changes but could not verify them. Inspect the document and use Office Undo if needed."
         ) from exc
     count = len(plan.edits)
-    return OfficeApplyResult(count, count, "Changes were written to the open document and were not saved.")
+    selection_note = (
+        " Changed Office content was selected."
+        if selected else
+        " Office selection was unavailable; keep the DeskOrb preview as the change marker."
+    )
+    return OfficeApplyResult(
+        count, count,
+        "Changes were written to the open document and were not saved." + selection_note,
+    )
 
 
 def _parse_edit(kind: str, raw_edit: Any, targets: dict[str, OfficeTarget]):
@@ -235,8 +243,11 @@ def _apply_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> None:
     _with_active_document(kind, expected_root, plan.snapshot_fingerprint, write)
 
 
-def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> None:
+def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> bool:
+    selected = True
+
     def verify(document: Any) -> None:
+        nonlocal selected
         for edit in plan.edits:
             if kind == "word":
                 actual = _read_word_text(document, edit.locator)
@@ -249,8 +260,13 @@ def _verify_targets(kind: str, expected_root: int, plan: OfficeEditPlan) -> None
                 expected = edit.value
             if actual != expected:
                 raise OfficePlanError(f"Office did not verify the requested change at {edit.locator}.")
+            if kind == "word":
+                selected = _focus_word_target(document, edit.locator) and selected
+            else:
+                selected = _focus_excel_cell(document, edit.locator) and selected
 
     _with_active_document(kind, expected_root, None, verify)
+    return selected
 
 
 def _with_active_document(
@@ -279,7 +295,84 @@ def _write_word_text(document: Any, edit: WordTextEdit) -> None:
     source_range = _resolve_word_range(document, edit.locator)
     writable = source_range.Duplicate
     writable.End = writable.End - 1
-    writable.Text = edit.value
+    old_value = _normalize_word_text(edit.expected_value)
+    new_value = _normalize_word_text(edit.value)
+    if new_value.startswith(old_value) and len(new_value) > len(old_value):
+        inserted = source_range.Duplicate
+        inserted.End = inserted.End - 1
+        inserted.Collapse(0)
+        format_source = _nearest_word_format_source(source_range, at_end=True)
+        inserted.Text = _word_text_for_write(edit.value[len(edit.expected_value):])
+        _copy_word_format(format_source, inserted)
+        return
+    if old_value and new_value.endswith(old_value) and len(new_value) > len(old_value):
+        inserted = source_range.Duplicate
+        inserted.End = inserted.Start
+        format_source = _nearest_word_format_source(source_range, at_end=False)
+        inserted.Text = _word_text_for_write(edit.value[:-len(edit.expected_value)])
+        _copy_word_format(format_source, inserted)
+        return
+    format_source = _nearest_word_format_source(source_range, at_end=False)
+    writable.Text = _word_text_for_write(edit.value)
+    _copy_word_format(format_source, writable)
+
+
+def _word_text_for_write(value: str) -> str:
+    """Use Word's in-range manual line break for normalized newline characters."""
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\v")
+
+
+def _nearest_word_format_source(source_range: Any, at_end: bool) -> Any:
+    try:
+        source = source_range.Duplicate
+        start = int(source_range.Start)
+        end = int(source_range.End) - 1
+        if end <= start:
+            return source_range
+        if at_end:
+            source.Start = max(start, end - 1)
+            source.End = end
+        else:
+            source.Start = start
+            source.End = min(end, start + 1)
+        return source
+    except Exception:
+        return source_range
+
+
+def _copy_word_format(source_range: Any, target_range: Any) -> None:
+    properties = (
+        "Name", "Size", "Color", "ColorIndex", "Bold", "Italic", "Underline",
+        "HighlightColorIndex", "StrikeThrough", "Subscript", "Superscript",
+    )
+    try:
+        source_font = source_range.Font
+        target_font = target_range.Font
+    except Exception:
+        return
+    for name in properties:
+        try:
+            setattr(target_font, name, getattr(source_font, name))
+        except Exception:
+            continue
+
+
+def _focus_word_target(document: Any, locator: str) -> bool:
+    try:
+        target = _resolve_word_range(document, locator).Duplicate
+        target.End = target.End - 1
+        target.Select()
+        return True
+    except Exception:
+        return False
+
+
+def _focus_excel_cell(workbook: Any, locator: str) -> bool:
+    try:
+        _resolve_excel_cell(workbook, locator).Select()
+        return True
+    except Exception:
+        return False
 
 
 def _read_word_text(document: Any, locator: str) -> str:
