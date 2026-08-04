@@ -248,6 +248,21 @@ class OfficePlanApplyTests(unittest.TestCase):
         self.assertEqual(cell.Value2, "New")
         cell.ClearFormats.assert_not_called()
 
+    def test_excel_selection_failure_returns_fallback_status(self):
+        from office_edits import ExcelCellEdit, OfficeEditPlan, _verify_targets
+
+        plan = OfficeEditPlan(
+            "excel", "excel-fingerprint",
+            (ExcelCellEdit("Sheet1!A1", "Old", "", value="New"),),
+        )
+        cell = Mock(Value2="New", Formula="")
+
+        with patch("office_edits._resolve_excel_cell", return_value=cell), \
+                patch("office_edits._focus_excel_cell", return_value=False), \
+                patch("office_edits._with_active_document") as with_document:
+            with_document.side_effect = lambda kind, root, fingerprint, callback: callback(Mock())
+            self.assertFalse(_verify_targets("excel", 202, plan))
+
     def test_word_verification_normalizes_word_paragraph_breaks(self):
         from office_edits import OfficeEditPlan, WordTextEdit, _verify_targets
 
