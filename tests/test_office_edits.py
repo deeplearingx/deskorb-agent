@@ -174,6 +174,80 @@ class OfficeHistoryTests(unittest.TestCase):
 
 
 class OfficePlanApplyTests(unittest.TestCase):
+    def test_word_write_canonicalizes_embedded_line_breaks(self):
+        from office_edits import OfficeEditPlan, WordTextEdit, _write_word_text
+
+        source_range = Mock()
+        writable = Mock()
+        writable.Start = 10
+        writable.End = 20
+        source_range.Duplicate = writable
+        edit = WordTextEdit("paragraph:1", "Old", "Old\nSummary")
+
+        with patch("office_edits._resolve_word_range", return_value=source_range):
+            _write_word_text(Mock(), edit)
+
+        self.assertEqual(writable.Text, "Old\vSummary")
+
+    def test_word_write_copies_nearest_font_to_inserted_range(self):
+        from office_edits import _copy_word_format
+
+        source = Mock()
+        target = Mock()
+        source.Font.Name = "等线"
+        source.Font.Size = 12
+        source.Font.Color = 0x112233
+        source.Font.Bold = True
+        source.Font.Italic = False
+
+        _copy_word_format(source, target)
+
+        self.assertEqual(target.Font.Name, "等线")
+        self.assertEqual(target.Font.Size, 12)
+        self.assertEqual(target.Font.Color, 0x112233)
+        self.assertTrue(target.Font.Bold)
+        self.assertFalse(target.Font.Italic)
+
+    def test_word_focus_selects_changed_range_without_paragraph_marker(self):
+        from office_edits import _focus_word_target
+
+        target = Mock()
+        target.Start = 10
+        target.End = 20
+        duplicate = Mock()
+        duplicate.Start = 10
+        duplicate.End = 20
+        target.Duplicate = duplicate
+
+        with patch("office_edits._resolve_word_range", return_value=target):
+            self.assertTrue(_focus_word_target(Mock(), "paragraph:1"))
+
+        self.assertEqual(duplicate.End, 19)
+        duplicate.Select.assert_called_once_with()
+
+    def test_excel_focus_selects_verified_cell(self):
+        from office_edits import _focus_excel_cell
+
+        cell = Mock()
+        with patch("office_edits._resolve_excel_cell", return_value=cell):
+            self.assertTrue(_focus_excel_cell(Mock(), "Sheet1!A1"))
+        cell.Select.assert_called_once_with()
+
+    def test_excel_write_keeps_existing_cell_format(self):
+        from office_edits import ExcelCellEdit, _write_excel_cell
+
+        cell = Mock()
+        cell.NumberFormat = "@"
+        cell.Font.Name = "等线"
+        cell.Interior.Color = 123
+        edit = ExcelCellEdit("Sheet1!A1", "Old", "", value="New")
+
+        with patch("office_edits._resolve_excel_cell", return_value=cell):
+            _write_excel_cell(Mock(), edit)
+
+        self.assertEqual(cell.Value2, "New")
+        cell.ClearFormats.assert_not_called()
+
     def test_word_verification_normalizes_word_paragraph_breaks(self):
         from office_edits import OfficeEditPlan, WordTextEdit, _verify_targets
 
