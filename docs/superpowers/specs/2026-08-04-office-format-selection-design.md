@@ -10,8 +10,8 @@ the existing COM safety boundary:
 - Word inserted or replacement content inherits nearby formatting unless the
   user explicitly requests formatting.
 - A successful Apply makes the changed Word text or Excel cell visibly selected.
-- If selection is unavailable, the implementation uses a temporary visual
-  marker and reports that fallback in the UI.
+- If selection is unavailable, the implementation keeps the DeskOrb preview as
+  a non-mutating visual marker and reports that fallback in the UI.
 - Word edits that leave a paragraph empty remain undoable.
 - A failed verification never becomes history; a confirmed, verified operation
   always remains available until Clear, a new Office read, or reset.
@@ -89,10 +89,10 @@ After all edits are written and verified:
   worksheet when a plan spans sheets).
 - Selection is attempted only after verification, so a UI selection failure
   cannot make an unverified edit look successful.
-- If COM selection fails, the implementation applies a temporary highlight or
-  shading marker to the changed target where supported, and the overlay reports
-  that selection fallback. The marker is not saved by DeskOrb and does not
-  replace the user's Apply/Discard decision.
+- If COM selection fails, the overlay reports that Office selection was
+  unavailable and keeps the already-rendered DeskOrb preview as the
+  non-mutating marker. DeskOrb does not add a persistent Office highlight just
+  to mark a change, and the fallback does not replace the Apply/Discard decision.
 
 ### Undo and history
 

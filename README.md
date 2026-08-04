@@ -178,9 +178,13 @@ validated edit plan is available.
 
 Apply is never automatic: it rereads the current Office source and rejects it if the
 window, document identity, structure, value, or formula changed after the preview.
-The first release edits only Word body/table text and Excel cell values/formulas; it
-does not alter formatting, comments, charts, macros, or workbook structure. It never
-saves, closes, or creates Office files. Save or undo from Office yourself.
+The first release edits only Word body/table text and Excel cell values/formulas.
+Word inserted or replaced text inherits nearby formatting unless the request
+specifies formatting; existing Excel cell formatting is retained. After a verified
+Apply, DeskOrb attempts to select the changed Word text or Excel cell. If Office
+cannot select it, the DeskOrb preview remains the change marker. Comments, charts,
+macros, and workbook structure are not changed. DeskOrb never saves, closes, or
+creates Office files. Save or undo from Office yourself.
 
 ### Known local environment issue: PowerShell 7
 
