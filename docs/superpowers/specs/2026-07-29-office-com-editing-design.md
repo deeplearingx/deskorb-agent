@@ -79,7 +79,8 @@ that may reach Apply:
 
 - `WordTextEdit(locator, expected_text, replacement_text)` for replacement,
   plus a bounded `word_insert_paragraph_after` variant anchored to the final
-  existing Word paragraph;
+  non-empty body paragraph (trailing empty paragraphs and table-cell targets
+  are not treated as body anchors);
 - `ExcelCellEdit(sheet, address, expected_value, expected_formula,
   value_or_formula)`.
 

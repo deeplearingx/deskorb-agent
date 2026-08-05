@@ -94,6 +94,35 @@ class OfficeSourceTests(unittest.TestCase):
         pythoncom.CoInitialize.assert_called_once_with()
         pythoncom.CoUninitialize.assert_called_once_with()
 
+    def test_word_snapshot_keeps_body_numbering_when_empty_and_table_paragraphs_follow(self):
+        from office_sources import read_active_office_snapshot
+
+        application = self._word_application()
+        second_body = Mock()
+        second_body.Range.Text = "Last paragraph\r"
+        second_body.Range.Tables.Count = 0
+        trailing_empty = Mock()
+        trailing_empty.Range.Text = "\r"
+        trailing_empty.Range.Tables.Count = 0
+        table_paragraph = Mock()
+        table_paragraph.Range.Text = "\r"
+        table_paragraph.Range.Tables.Count = 1
+        application.ActiveDocument.Paragraphs = [
+            application.ActiveDocument.Paragraphs[0], second_body, trailing_empty, table_paragraph,
+        ]
+        pythoncom = Mock()
+        client = Mock()
+        client.GetActiveObject.return_value = application
+
+        with patch("office_sources.is_word_window", return_value=True), \
+                patch("office_sources.root_window", side_effect=lambda hwnd: hwnd), \
+                patch("office_sources._load_com_modules", return_value=(pythoncom, client)):
+            snapshot = read_active_office_snapshot("word", 101)
+
+        self.assertEqual(snapshot.paragraph_count, 4)
+        self.assertEqual([target.locator for target in snapshot.targets],
+                         ["paragraph:1", "paragraph:2", "table:1/1/1"])
+
     def test_excel_snapshot_enumerates_every_worksheet_and_formula(self):
         from office_sources import read_active_office_snapshot
 

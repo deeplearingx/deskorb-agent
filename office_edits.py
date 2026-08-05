@@ -212,7 +212,7 @@ def _parse_edit(kind: str, raw_edit: Any, snapshot: OfficeSnapshot):
         if edit_type == "word_insert_paragraph_after":
             if not _is_last_word_paragraph(snapshot, locator):
                 raise OfficePlanError(
-                    "word_insert_paragraph_after is only supported after the last Word paragraph."
+                    "word_insert_paragraph_after is only supported after the last non-empty body paragraph."
                 )
             if not raw_edit["value"]:
                 raise OfficePlanError("word_insert_paragraph_after requires non-empty value.")
@@ -482,7 +482,13 @@ def _is_known_word_paragraph(snapshot: OfficeSnapshot, locator: str) -> bool:
 
 
 def _is_last_word_paragraph(snapshot: OfficeSnapshot, locator: str) -> bool:
-    return snapshot.paragraph_count is not None and _paragraph_index(locator) == snapshot.paragraph_count
+    if snapshot.paragraph_count is None:
+        return False
+    index = _paragraph_index(locator)
+    if not 1 <= index <= snapshot.paragraph_count:
+        return False
+    body_indices = _word_body_paragraph_indices(snapshot)
+    return bool(body_indices) and index == max(body_indices)
 
 
 def _repair_legacy_end_insert(snapshot: OfficeSnapshot, locator: str, value: str) -> WordTextEdit | None:
@@ -492,13 +498,22 @@ def _repair_legacy_end_insert(snapshot: OfficeSnapshot, locator: str, value: str
         index = _paragraph_index(locator)
     except OfficePlanError:
         return None
-    if index != snapshot.paragraph_count + 1:
+    body_indices = _word_body_paragraph_indices(snapshot)
+    if not body_indices or index != max(body_indices) + 1:
         return None
     targets = {target.locator: target for target in snapshot.targets}
-    anchor = targets.get(f"paragraph:{snapshot.paragraph_count}")
+    anchor = targets.get(f"paragraph:{max(body_indices)}")
     if anchor is None:
         return None
     return WordTextEdit(anchor.locator, str(anchor.value), value, "insert_paragraph_after")
+
+
+def _word_body_paragraph_indices(snapshot: OfficeSnapshot) -> list[int]:
+    return [
+        _paragraph_index(target.locator)
+        for target in snapshot.targets
+        if re.fullmatch(r"paragraph:\d+", target.locator)
+    ]
 
 
 def _focus_excel_cell(workbook: Any, locator: str) -> bool:

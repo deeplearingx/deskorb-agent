@@ -3202,7 +3202,8 @@ class Overlay:
             "For Word, plan.edits entries must be:\n"
             '{"type":"word_replace_text","locator":"paragraph:1","expected_value":"old","value":"new"}\n'
             "For a new paragraph at the end of a Word document, use the last supplied "
-            "paragraph as the anchor and this exact shape:\n"
+            "non-empty body paragraph as the anchor (empty trailing paragraphs and table "
+            "content are not body anchors) and this exact shape:\n"
             '{"type":"word_insert_paragraph_after","locator":"paragraph:1","expected_value":"old","value":"new paragraph"}\n'
             "For Excel, plan.edits entries must be:\n"
             '{"type":"excel_set_cell","sheet":"Sheet1","address":"A1","expected_value":"old",'

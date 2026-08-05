@@ -187,7 +187,8 @@ macros, and workbook structure are not changed. DeskOrb never saves, closes, or
 creates Office files. Save or undo from Office yourself.
 
 When a request adds a new paragraph at the end of a Word document, the plan uses
-the last existing paragraph as a bounded anchor. Invented or out-of-range
+the last non-empty body paragraph as a bounded anchor; trailing empty paragraphs
+and table content do not change that body anchor. Invented or out-of-range
 paragraph locators are rejected; the new paragraph remains previewable and
 undoable through the same Apply/Undo flow.
 

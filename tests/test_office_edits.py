@@ -26,6 +26,15 @@ def word_multi_paragraph_snapshot():
     )
 
 
+def word_trailing_empty_snapshot():
+    snapshot = word_multi_paragraph_snapshot()
+    return replace(snapshot, paragraph_count=3, targets=(
+        OfficeTarget("paragraph:1", "paragraph:1", "Old"),
+        OfficeTarget("paragraph:2", "paragraph:2", "Last"),
+        OfficeTarget("table:1/1/1", "table:1/1/1", "Table tail"),
+    ))
+
+
 def excel_snapshot():
     return OfficeSnapshot(
         kind="excel", expected_root=202, identity="excel:202:C:/docs/Plan.xlsx",
@@ -130,6 +139,38 @@ class OfficePlanParsingTests(unittest.TestCase):
         self.assertEqual(plan.edits,
                          (WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),))
 
+    def test_accepts_last_nonempty_body_paragraph_before_trailing_empty_or_table_content(self):
+        from office_edits import WordTextEdit, parse_office_plan
+
+        snapshot = word_trailing_empty_snapshot()
+        raw = json.dumps({
+            "answer": "I prepared a new paragraph.",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_insert_paragraph_after", "locator": "paragraph:2",
+                 "expected_value": "Last", "value": "Summary"},
+            ]},
+        })
+
+        _, plan = parse_office_plan(snapshot, raw)
+
+        self.assertEqual(plan.edits,
+                         (WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),))
+
+    def test_rejects_insert_after_an_earlier_body_paragraph(self):
+        from office_edits import OfficePlanError, parse_office_plan
+
+        snapshot = word_trailing_empty_snapshot()
+        raw = json.dumps({
+            "answer": "x",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_insert_paragraph_after", "locator": "paragraph:1",
+                 "expected_value": "Old", "value": "Summary"},
+            ]},
+        })
+
+        with self.assertRaisesRegex(OfficePlanError, "last non-empty body paragraph"):
+            parse_office_plan(snapshot, raw)
+
     def test_repairs_legacy_missing_end_paragraph_plan_to_bounded_insert(self):
         from office_edits import WordTextEdit, parse_office_plan
 
@@ -146,6 +187,23 @@ class OfficePlanParsingTests(unittest.TestCase):
 
         self.assertEqual(plan.edits,
                          (WordTextEdit("paragraph:2", "Last", "Summary", "insert_paragraph_after"),))
+
+    def test_keeps_an_existing_trailing_empty_paragraph_as_a_direct_replacement(self):
+        from office_edits import WordTextEdit, parse_office_plan
+
+        snapshot = word_trailing_empty_snapshot()
+        raw = json.dumps({
+            "answer": "I prepared a new paragraph.",
+            "plan": {"kind": "word", "snapshot_fingerprint": snapshot.fingerprint, "edits": [
+                {"type": "word_replace_text", "locator": "paragraph:3",
+                 "expected_value": "", "value": "Summary"},
+            ]},
+        })
+
+        _, plan = parse_office_plan(snapshot, raw)
+
+        self.assertEqual(plan.edits,
+                         (WordTextEdit("paragraph:3", "", "Summary"),))
 
     def test_rejects_a_missing_paragraph_beyond_the_document_end(self):
         from office_edits import OfficePlanError, parse_office_plan
