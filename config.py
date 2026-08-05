@@ -135,7 +135,10 @@ SHOW_IN_SCREEN_SHARE_DEFAULT = _env_bool("DESKORB_AGENT_SHOW_IN_SCREEN_SHARE", T
 # variable to 0 only after confirming the private screen-share mode remains visible.
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
-THEME = "light"                  # "light" (Codex paper) or "dark" (warm dark)
+# The default DeskOrb surface is a restrained "Obsidian Aurora" theme. Existing light and
+# dark palettes remain available for people who prefer them; set DESKORB_AGENT_THEME per
+# machine instead of editing source (light | dark | tech).
+THEME = os.environ.get("DESKORB_AGENT_THEME", "tech").strip().lower()
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
 TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button (with the
@@ -144,9 +147,11 @@ TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button
                                  # (overrideredirect) window gets NO taskbar button by default;
                                  # this forces one via WS_EX_APPWINDOW. False → the pure
                                  # no-taskbar floating overlay (original behaviour).
-FRAMELESS_WINDOW = _env_bool("DESKORB_AGENT_FRAMELESS_WINDOW", False)
-# Standard decorations avoid an invisible Tk window on some desktops. The matching
-# custom Win32 window region is also opt-in, because it clips native title bars.
+# The custom titlebar is the single source of window controls. Native decorations are opt-in
+# for troubleshooting only; leaving both enabled creates duplicate close/minimize buttons.
+FRAMELESS_WINDOW = _env_bool("DESKORB_AGENT_FRAMELESS_WINDOW", True)
+# The matching Win32 region is enabled with the custom titlebar so the expanded surface and
+# collapsed orb keep the same rounded silhouette.
 CUSTOM_WINDOW_REGION = _env_bool("DESKORB_AGENT_CUSTOM_WINDOW_REGION", FRAMELESS_WINDOW)
 APP_ICON = ""  # use the Tk default unless a local icon is supplied
                                  # script (or absolute). "" → no custom icon (Tk default).
@@ -295,16 +300,25 @@ THEMES = {
     "light": {
         "bg": "#FAF9F5", "field": "#FFFFFF", "user_card": "#EFEBE1",
         "text": "#28261F", "muted": "#73706A", "faint": "#A9A59B",
-        "accent": "#D97757", "accent_hi": "#C25E40", "on_accent": "#FFFFFF",
+        "accent": "#D97757", "accent_hi": "#C25E40", "accent_alt": "#7C6AE6",
+        "on_accent": "#FFFFFF",
         "border": "#E6E2D8", "tool_bg": "#F2EFE7", "err": "#B4413A",
         "sel": "#EADDD3", "hover": "#EFEBE1",
     },
     "dark": {
         "bg": "#262624", "field": "#1F1E1D", "user_card": "#34332F",
         "text": "#ECEAE3", "muted": "#9B978D", "faint": "#6F6C64",
-        "accent": "#D97757", "accent_hi": "#E68A6C", "on_accent": "#FFFFFF",
+        "accent": "#D97757", "accent_hi": "#E68A6C", "accent_alt": "#9A8CFF",
+        "on_accent": "#FFFFFF",
         "border": "#3A3934", "tool_bg": "#2E2D2A", "err": "#E0897D",
         "sel": "#3A3934", "hover": "#30302E",
+    },
+    "tech": {
+        "bg": "#08111F", "field": "#0F1B2D", "user_card": "#142A40",
+        "text": "#EAF5FF", "muted": "#91A9C5", "faint": "#58708E",
+        "accent": "#58D9FF", "accent_hi": "#A5EEFF", "accent_alt": "#8D7BFF",
+        "on_accent": "#06111D", "border": "#1D3856", "tool_bg": "#102238",
+        "err": "#FF8197", "sel": "#20425F", "hover": "#17334F",
     },
 }
 T = THEMES.get(THEME, THEMES["light"])

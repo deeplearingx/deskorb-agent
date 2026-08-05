@@ -131,6 +131,18 @@ class CodexWorkerTests(unittest.TestCase):
             "https://example.test/v1",
         )
 
+    def test_api_401_retries_once_after_key_rotation(self):
+        refreshed_response = object()
+        with patch.object(self.worker, "_open_api_response",
+                          side_effect=[RuntimeError("API HTTP 401: Invalid API key"),
+                                       refreshed_response]) as request, \
+             patch("worker.get_api_key", return_value="new-key"):
+            result = self.worker._open_api_response_with_key_refresh(
+                {"model": "test-model"}, "old-key", "application/json")
+        self.assertIs(result, refreshed_response)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[-1].args[1], "new-key")
+
     def test_legacy_none_configuration_falls_back_to_safe_defaults(self):
         self.assertEqual(self.worker._normalize_model("None"), API_MODEL)
         self.assertEqual(self.worker._normalize_api_base("null"), API_BASE_URL)

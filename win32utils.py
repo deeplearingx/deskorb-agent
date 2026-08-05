@@ -7,6 +7,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -226,7 +227,7 @@ def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="Des
     and spawns NO subprocess. The one-shot PowerShell builder runs only when the .lnk is
     missing or its recorded signature changed (first launch, the folder moved via OneDrive,
     a new interpreter or icon). Windows-only, never raises; returns one of
-    'skipped' / 'ok' / 'created' / 'error' for logging."""
+    'skipped' / 'ok' / 'created' / 'error:...' for logging."""
     if sys.platform != "win32" or not (TASKBAR_BUTTON and app_id):
         return "skipped"
     try:
@@ -259,8 +260,13 @@ def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="Des
             pass
         ps1 = os.path.join(repo, "install-startmenu-shortcut.ps1")
         if not os.path.exists(ps1):
-            return "error"
-        args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
+            return "error: builder script missing"
+        # Prefer the configured PowerShell 7 executable. Windows PowerShell 5.1 remains a
+        # compatibility fallback for machines that have not installed pwsh yet.
+        ps_exe = shutil.which("pwsh") or shutil.which("powershell")
+        if not ps_exe:
+            return "error: PowerShell executable not found"
+        args = [ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
                 "-Lnk", lnk, "-Target", target, "-Arguments", script_path,
                 "-WorkingDir", repo, "-AppId", app_id]
         if icon_abs:
@@ -268,13 +274,18 @@ def ensure_taskbar_shortcut(script_path, app_id=APP_ID, icon=APP_ICON, name="Des
         r = subprocess.run(args, capture_output=True, timeout=60,
                            creationflags=_CREATE_NO_WINDOW)
         if r.returncode != 0:
-            return "error"
+            detail = r.stderr or r.stdout or b""
+            if isinstance(detail, bytes):
+                detail = detail.decode(errors="replace")
+            detail = " ".join(str(detail).split())[:140]
+            return "error: builder exit %s%s" % (
+                r.returncode, (" - " + detail) if detail else "")
         os.makedirs(state_dir, exist_ok=True)
         with open(marker, "w", encoding="utf-8") as f:
             json.dump(desired, f)
         return "created"
-    except Exception:
-        return "error"
+    except Exception as exc:
+        return "error: %s" % type(exc).__name__
 
 def relaunch_overlay(script_path):
     """Start a FRESH overlay instance (pythonw + the script) that OUTLIVES this process, so the
@@ -652,4 +663,3 @@ def compute_onscreen_move(win, monitors, min_vis_w=48, min_vis_h=32):
         if best_d is None or d < best_d:
             best, best_d = rect, d
     return _clamp_into(x, y, w, h, best)
-

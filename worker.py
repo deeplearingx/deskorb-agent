@@ -495,7 +495,7 @@ class CodexWorker(threading.Thread):
             "input": [{"role": "user", "content": content}],
             "stream": True,
         }
-        response = self._open_api_response(payload, api_key, "text/event-stream")
+        response = self._open_api_response_with_key_refresh(payload, api_key, "text/event-stream")
         with self._api_lock:
             self._api_response = response
         completed = False
@@ -613,6 +613,25 @@ class CodexWorker(threading.Thread):
             detail = exc.read(32 * 1024).decode("utf-8", "replace")
             raise RuntimeError(f"API HTTP {exc.code}: {self._api_error_detail(detail)}") from exc
 
+    def _open_api_response_with_key_refresh(self, payload: dict[str, Any], api_key: str,
+                                            accept: str):
+        """Retry one 401 with a freshly resolved key.
+
+        ``.env`` is intentionally editable while the overlay is running. A
+        provider may reject the import-time key during rotation; one retry avoids
+        forcing a restart while keeping retries bounded and never retrying other
+        failures.
+        """
+        try:
+            return self._open_api_response(payload, api_key, accept)
+        except RuntimeError as exc:
+            if "API HTTP 401" not in str(exc):
+                raise
+            refreshed_key = get_api_key()
+            if not refreshed_key or refreshed_key == api_key:
+                raise
+            return self._open_api_response(payload, refreshed_key, accept)
+
     def _maybe_compact_api_context(self, api_key: str):
         if not self._api_context.compaction_candidate():
             return
@@ -653,7 +672,7 @@ class CodexWorker(threading.Thread):
             "stream": False,
             "max_output_tokens": API_CONTEXT_SUMMARY_TOKENS,
         }
-        response = self._open_api_response(payload, api_key, "application/json")
+        response = self._open_api_response_with_key_refresh(payload, api_key, "application/json")
         with self._api_lock:
             self._api_response = response
         try:

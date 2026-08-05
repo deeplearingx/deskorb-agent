@@ -253,12 +253,14 @@ class Overlay:
 
     # ── construction ──
     def _apply_window_style(self):
-        """Apply native decorations unless optional frameless mode is explicitly enabled."""
+        """Keep the custom titlebar as the single control surface by default."""
         self.root.overrideredirect(FRAMELESS_WINDOW)
 
     def _build(self):
         self.root = tk.Tk()
         self.root.title("DeskOrb Agent")
+        # Keep Alt+F4, taskbar close and the custom ✕ button on the same graceful shutdown path.
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.s = max(1.0, self.root.winfo_fpixels("1i") / 96.0)   # DPI scale factor
         self._apply_window_style()
         self._apply_app_icon()                 # Clawd icon for the taskbar button / alt-tab
@@ -288,7 +290,10 @@ class Overlay:
             f = tkfont.Font(family=fam, size=-self.px(base), **k)
             self._fonts.append((f, base))
             return f
-        self.f_title = mk(self.serif, 16, weight="bold")
+        # The tech surface uses the same sans face for brand and body: a compact, engineered
+        # wordmark reads better than the old editorial serif once the palette goes dark.
+        self.f_title = mk(self.sans if THEME == "tech" else self.serif,
+                          15 if THEME == "tech" else 16, weight="bold")
         self.f_body  = mk(self.sans, 15)
         self.f_small = mk(self.sans, 12)
         self.f_chip  = mk(self.sans, 11, weight="bold")
@@ -305,9 +310,13 @@ class Overlay:
         # Collapsed-orb name pill: a fixed-size label (NOT registered for zoom — it only shows
         # while collapsed, where the chat-text zoom is irrelevant). Kept as a ref so Tk won't GC it.
         self.f_pill  = tkfont.Font(family=self.sans, size=-self.px(13), weight="bold")
+        # One class-level hover treatment keeps every confirmation/settings button consistent,
+        # including buttons created later inside streamed approval cards.
+        self.root.bind_class("Button", "<Enter>", self._button_hover_in, add="+")
+        self.root.bind_class("Button", "<Leave>", self._button_hover_out, add="+")
 
         self._build_titlebar()
-        self.hairline = tk.Frame(self.root, bg=T["border"], height=1)
+        self.hairline = tk.Frame(self.root, bg=T["border"], height=self.px(1))
         self.hairline.pack(fill="x")
         self._build_statusline()   # very bottom: model + context %
         self._build_statusbar()    # controls row (above statusline)
@@ -647,12 +656,12 @@ class Overlay:
         self._raise_to_front(focus=False)
 
     def _build_titlebar(self):
-        bar = tk.Frame(self.root, bg=T["bg"], height=self.px(44))
+        bar = tk.Frame(self.root, bg=T["bg"], height=self.px(48))
         bar.pack(fill="x", side="top")
         self.titlebar = bar
         bar.pack_propagate(False)
         self._bind_drag(bar)
-        sz = self.px(24)
+        sz = self.px(26)
         mark = tk.Canvas(bar, width=sz, height=sz, bg=T["bg"], highlightthickness=0)
         mark.pack(side="left", padx=(self.px(14), self.px(7)))
         self._draw_spark(mark, sz / 2, sz / 2, self.px(9))
@@ -668,11 +677,14 @@ class Overlay:
         # Faint hint to the right of the title, shown ONLY before this overlay is named (and not
         # while editing) — invites the user to click and name the session. Clicking it starts the
         # rename too. Hidden the moment a name exists.
-        self.title_hint = tk.Label(bar, text="Click to name this session",
+        self.title_hint = tk.Label(bar, text="· LIVE  |  click title to rename",
                                    bg=T["bg"], fg=T["faint"], font=self.f_small, cursor="hand2")
         self.title_hint.bind("<Button-1>", lambda e: self._begin_rename())
-        self._title_btn(bar, "✕", self.quit)
-        self._title_btn(bar, "—", self.toggle_collapse)
+        # In the normal frameless mode these are the only window controls. If someone opts
+        # back into native decorations for troubleshooting, do not render a second pair here.
+        if FRAMELESS_WINDOW:
+            self._title_btn(bar, "✕", self.quit)
+            self._title_btn(bar, "—", self.toggle_collapse)
         self._update_title_hint()
 
     def _update_title_hint(self):
@@ -913,6 +925,9 @@ class Overlay:
                              wrap="word", font=self.f_body, insertbackground=T["accent"],
                              highlightthickness=0, padx=0, pady=0)
         self.entry_win = self.canvas.create_window(0, 0, window=self.entry, anchor="nw")
+        self.input_glyph = self.canvas.create_text(0, 0, text="✦", fill=T["accent_alt"],
+                                                   font=self.f_chip, anchor="center",
+                                                   tags=("input_glyph",))
         self.entry.bind("<Return>", self._on_return)
         self.entry.bind("<KP_Enter>", self._on_return)
         self.entry.bind("<Control-v>", self._on_paste)
@@ -920,6 +935,8 @@ class Overlay:
         self.entry.bind("<Shift-Insert>", self._on_paste)
         self.entry.bind("<FocusIn>", self._ph_out)
         self.entry.bind("<FocusOut>", self._ph_in)
+        self.entry.bind("<FocusIn>", lambda e: self._input_focus(True), add="+")
+        self.entry.bind("<FocusOut>", lambda e: self._input_focus(False), add="+")
         self.entry.bind("<FocusIn>", self._precapture_soon, add="+")
         self.entry.bind("<KeyRelease>", self._precapture_soon, add="+")
         self._ph_active = False
@@ -1048,11 +1065,12 @@ class Overlay:
         self._refresh_chat_word_attachment()
 
     def _build_statusbar(self):
-        st = tk.Frame(self.root, bg=T["bg"])
+        st = tk.Frame(self.root, bg=T["field"], highlightbackground=T["border"],
+                      highlightthickness=1)
         st.pack(fill="x", side="bottom")
         self.status_frame = st
         pad = self.px(4)
-        self.toggle_screen = tk.Label(st, bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.toggle_screen = tk.Label(st, bg=T["field"], font=self.f_small, cursor="hand2")
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
@@ -1062,17 +1080,17 @@ class Overlay:
         # crowded the bar. They now live behind a single ⚙ settings menu (see _gear_menu).
         # The gear turns the accent color while Read-only is ON, so that safety state stays
         # visible at a glance without opening the menu.
-        self.gear = tk.Label(st, text="⚙", bg=T["bg"], font=self.f_small, cursor="hand2")
+        self.gear = tk.Label(st, text="⚙", bg=T["field"], font=self.f_small, cursor="hand2")
         self.gear.pack(side="left", padx=(self.px(10), self.px(2)), pady=pad)
         self.gear.bind("<Button-1>", self._gear_menu)
         self.gear.bind("<Enter>", lambda e: self.gear.configure(fg=T["accent"]))
         self.gear.bind("<Leave>", lambda e: self._paint_gear())
         self._paint_gear()
-        self.attach_lbl = tk.Label(st, text="", bg=T["bg"], fg=T["accent"],
+        self.attach_lbl = tk.Label(st, text="", bg=T["field"], fg=T["accent"],
                                    font=self.f_small, cursor="hand2")
         self.attach_lbl.pack(side="left", padx=self.px(6), pady=pad)
         self.attach_lbl.bind("<Button-1>", lambda e: self._clear_attachments())
-        self.grip = tk.Label(st, text="◢", bg=T["bg"], fg=T["faint"], font=self.f_small,
+        self.grip = tk.Label(st, text="◢", bg=T["field"], fg=T["faint"], font=self.f_small,
                              cursor="size_nw_se")
         self.grip.pack(side="right", padx=(0, self.px(8)), pady=pad)
         self.grip.bind("<ButtonPress-1>", self._resize_start)
@@ -1082,9 +1100,14 @@ class Overlay:
         sl = tk.Frame(self.root, bg=T["bg"])
         sl.pack(fill="x", side="bottom")
         self.statusline_frame = sl
+        self.status_dot = tk.Canvas(sl, width=self.px(8), height=self.px(8), bg=T["bg"],
+                                    highlightthickness=0)
+        self.status_dot.pack(side="left", padx=(self.px(16), self.px(5)),
+                             pady=(0, self.px(7)))
+        self._paint_status_signal()
         self.statusline = tk.Label(sl, text="connecting…", bg=T["bg"], fg=T["faint"],
                                    font=self.f_small, anchor="w", cursor="hand2")
-        self.statusline.pack(side="left", padx=(self.px(16), self.px(6)), pady=(0, self.px(6)))
+        self.statusline.pack(side="left", padx=(0, self.px(6)), pady=(0, self.px(6)))
         self.statusline.bind("<Button-1>", self._model_menu)
         self.busy_lbl = tk.Label(sl, text="", bg=T["bg"], fg=T["accent"],
                                  font=self.f_small, anchor="e")
@@ -1307,10 +1330,9 @@ class Overlay:
         return ImageTk.PhotoImage(out)
 
     def _orb_image(self, s, hover):
-        """Render a glossy terracotta sphere: off-centre radial gradient (volume),
-        a soft top-left specular highlight, a darker bottom rim + lighter top rim
-        (bevel), then the cream Codex spark with a faint drop shadow. Supersampled
-        ×4 then LANCZOS-downscaled for crisp edges at any DPI. Cached per (size,hover)."""
+        """Render the collapsed tech orb: a cool radial glow, a quiet violet signal ring,
+        and a crisp central spark. Supersampled ×4 then LANCZOS-downscaled for clean edges
+        at any DPI. Cached per (size, hover)."""
         import math
         key = (s, hover)
         if key in self._orb_imgs:
@@ -1362,6 +1384,18 @@ class Overlay:
         rim.putalpha(ImageChops.multiply(rim.split()[3], mask))
         orb = Image.alpha_composite(orb, rim)
 
+        # Signature element: one restrained violet telemetry ring. It gives the floating orb
+        # an instrument-like identity without turning the rest of the surface into neon noise.
+        ring = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        ring_draw = ImageDraw.Draw(ring)
+        ring_col = self._rgb(T.get("accent_alt", T["accent"])) + (105 if not hover else 145,)
+        ring_draw.arc([n * 0.17, n * 0.17, n * 0.83, n * 0.83], 205, 330,
+                      fill=ring_col, width=max(2, SS))
+        ring_draw.arc([n * 0.23, n * 0.23, n * 0.77, n * 0.77], 25, 150,
+                      fill=self._rgb(T["accent_hi"]) + (85 if not hover else 125,), width=max(2, SS))
+        ring.putalpha(ImageChops.multiply(ring.split()[3], mask))
+        orb = Image.alpha_composite(orb, ring)
+
         # soft specular highlight near the top-left
         hl = Image.new("RGBA", (n, n), (0, 0, 0, 0))
         hw, hh = n * 0.46, n * 0.32
@@ -1372,7 +1406,7 @@ class Overlay:
         hl.putalpha(ImageChops.multiply(hl.split()[3], mask))
         orb = Image.alpha_composite(orb, hl)
 
-        # Codex spark (cream sunburst) with a faint drop shadow for depth
+        # Central spark with a faint drop shadow for depth.
         cx = cy = n / 2
         R = n * 0.24
         spokes = []
@@ -1387,14 +1421,14 @@ class Overlay:
         sd = ImageDraw.Draw(sh)
         off = SS
         for x0, y0, x1, y1 in spokes:
-            sd.line([x0, y0 + off, x1, y1 + off], fill=(60, 24, 12, 110), width=wln)
+            sd.line([x0, y0 + off, x1, y1 + off], fill=self._rgb(T["bg"]) + (145,), width=wln)
         sh = sh.filter(ImageFilter.GaussianBlur(SS * 0.8))
         sh.putalpha(ImageChops.multiply(sh.split()[3], mask))
         orb = Image.alpha_composite(orb, sh)
 
         sp = Image.new("RGBA", (n, n), (0, 0, 0, 0))
         spd = ImageDraw.Draw(sp)
-        cream = (255, 252, 246, 255)
+        cream = self._rgb(T["text"]) + (255,)
         for x0, y0, x1, y1 in spokes:
             spd.line([x0, y0, x1, y1], fill=cream, width=wln)
             for (ex, ey) in ((x0, y0), (x1, y1)):           # round the spoke ends
@@ -1432,19 +1466,42 @@ class Overlay:
 
     def _title_btn(self, parent, text, cmd):
         b = tk.Label(parent, text=text, bg=T["bg"], fg=T["muted"], font=self.f_small,
-                     cursor="hand2", width=3)
-        b.pack(side="right", padx=(0, self.px(6)))
+                     cursor="hand2", width=2, padx=self.px(5), pady=self.px(3))
+        b.pack(side="right", padx=(0, self.px(5)))
         b.bind("<Button-1>", lambda e: cmd())
         b.bind("<Enter>", lambda e: b.configure(bg=T["hover"], fg=T["text"]))
         b.bind("<Leave>", lambda e: b.configure(bg=T["bg"], fg=T["muted"]))
         return b
 
+    def _button_hover_in(self, event):
+        button = event.widget
+        try:
+            if str(button.cget("state")) == "disabled":
+                return
+            base = str(button.cget("bg"))
+            button._deskorb_base_bg = base
+            hot = T["accent_hi"] if base.lower() == T["accent"].lower() else T["hover"]
+            button.configure(bg=hot)
+        except Exception:
+            pass
+
+    def _button_hover_out(self, event):
+        button = event.widget
+        try:
+            base = getattr(button, "_deskorb_base_bg", None)
+            if base and str(button.cget("state")) != "disabled":
+                button.configure(bg=base)
+        except Exception:
+            pass
+
     def _chip(self, parent, text, cmd):
-        b = tk.Label(parent, text=text, bg=T["bg"], fg=T["muted"], font=self.f_small, cursor="hand2")
-        b.pack(side="left", padx=self.px(8), pady=self.px(4))
+        b = tk.Label(parent, text=text, bg=T["field"], fg=T["muted"], font=self.f_small,
+                     cursor="hand2", padx=self.px(7), pady=self.px(2),
+                     highlightbackground=T["border"], highlightthickness=1)
+        b.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
         b.bind("<Button-1>", lambda e: cmd())
-        b.bind("<Enter>", lambda e: b.configure(fg=T["accent"]))
-        b.bind("<Leave>", lambda e: b.configure(fg=T["muted"]))
+        b.bind("<Enter>", lambda e: b.configure(bg=T["hover"], fg=T["text"]))
+        b.bind("<Leave>", lambda e: b.configure(bg=T["field"], fg=T["muted"]))
         return b
 
     def _paint_screen_toggle(self):
@@ -1509,11 +1566,13 @@ class Overlay:
         h, pad = self.in_h, self.px(5)
         c.delete("box")
         round_rect(c, pad, pad, w - pad, h - pad, self.px(15), fill=T["field"],
-                   outline=T["border"], width=1, tags="box")
+                   outline=(T["accent"] if getattr(self, "_entry_focus", False) else T["border"]),
+                   width=(2 if getattr(self, "_entry_focus", False) else 1), tags="box")
         c.tag_lower("box")
         rad = self.px(15)
         bx, by = w - pad - self.px(38), h / 2
-        ex1, ey1 = pad + self.px(14), pad + self.px(8)
+        self.canvas.coords(self.input_glyph, pad + self.px(12), h / 2)
+        ex1, ey1 = pad + self.px(26), pad + self.px(8)
         c.coords(self.entry_win, ex1, ey1)
         c.itemconfigure(self.entry_win, width=max(self.px(40), bx - rad - self.px(8) - ex1),
                         height=max(self.px(20), h - 2 * pad - self.px(14)))
@@ -1526,6 +1585,14 @@ class Overlay:
         c.tag_bind("send", "<Button-1>", lambda ev: self._send_or_stop())
         c.tag_bind("send", "<Enter>", lambda ev: self._on_send_hover(True))
         c.tag_bind("send", "<Leave>", lambda ev: self._on_send_hover(False))
+
+    def _input_focus(self, focused):
+        """Paint a quiet focus ring around the composer without changing layout."""
+        self._entry_focus = bool(focused)
+        try:
+            self._layout_input()
+        except Exception:
+            pass
 
     def _send_state(self):
         return ("busy" if self.busy else "idle") + ("_hover" if self._send_hover else "")
@@ -3579,7 +3646,84 @@ class Overlay:
         self.worker.compact()
         self._set_status("compacting…")   # instant feedback; the animation starts on ("compacting")
 
+    def _animate_overlay_transition(self):
+        """Fade the surface through a short eased hand-off before changing layout.
+
+        Tk cannot interpolate a packed widget tree, so a bounded alpha hand-off is less
+        distracting than resizing a live transcript one pixel at a time. The state swap still
+        happens on the UI thread and region work is performed only by the existing final timers.
+        """
+        if getattr(self, "_collapse_animating", False):
+            return
+        self._collapse_animating = True
+        try:
+            base = float(self.root.attributes("-alpha"))
+        except Exception:
+            base = float(WINDOW_ALPHA) if WINDOW_ALPHA > 0 else 1.0
+        base = max(0.35, min(1.0, base))
+        low = max(0.72, base * 0.72)
+        frames = 5
+
+        def ease(t):
+            return t * t * (3.0 - 2.0 * t)
+
+        def set_alpha(value):
+            try:
+                self.root.attributes("-alpha", max(0.35, min(1.0, value)))
+                return True
+            except Exception:
+                return False
+
+        def fade_up(frame=0):
+            if self._quitting:
+                return
+            if frame > frames:
+                set_alpha(base)
+                self._collapse_animating = False
+                try:
+                    self._draw_orb(hover=False)
+                except Exception:
+                    pass
+                return
+            if not set_alpha(low + (base - low) * ease(frame / frames)):
+                self._collapse_animating = False
+                return
+            self._collapse_anim_after = self.root.after(18, lambda: fade_up(frame + 1))
+
+        def swap_state():
+            if self._quitting:
+                return
+            self._set_collapsed_state()
+            # A brighter orb at the hand-off gives the collapsed state a deliberate pulse;
+            # it settles to the normal cached sprite when the fade completes.
+            try:
+                self._draw_orb(hover=not self.expanded)
+            except Exception:
+                pass
+            fade_up()
+
+        def fade_down(frame=0):
+            if self._quitting:
+                return
+            if frame > frames:
+                swap_state()
+                return
+            if not set_alpha(base - (base - low) * ease(frame / frames)):
+                self._set_collapsed_state()
+                self._collapse_animating = False
+                return
+            self._collapse_anim_after = self.root.after(18, lambda: fade_down(frame + 1))
+
+        if not set_alpha(base):
+            self._set_collapsed_state()
+            self._collapse_animating = False
+            return
+        fade_down()
+
     def toggle_collapse(self):
+        self._animate_overlay_transition()
+
+    def _set_collapsed_state(self):
         if self.expanded:
             # editing the name when the — / double-click collapses → commit it first
             if getattr(self, "_rename_entry", None) is not None:
@@ -3675,13 +3819,37 @@ class Overlay:
 
     # ── status / busy ──
     def _set_status(self, text):
+        self._status_text = str(text or "")
         self.busy_lbl.configure(text=text)
+        self._paint_status_signal(text)
 
     def _set_busy(self, busy):
         self.busy = busy
         self._refresh_send()
         self._refresh_chat_word_attachment()
-        self.busy_lbl.configure(text="thinking…" if busy else "")
+        self.busy_lbl.configure(text="⟳ thinking…" if busy else "")
+        self._paint_status_signal()
+
+    def _paint_status_signal(self, status=None):
+        """Render the tiny connection/activity signal used by the tech status rail."""
+        dot = getattr(self, "status_dot", None)
+        if dot is None:
+            return
+        text = str(status if status is not None else getattr(self, "_status_text", ""))
+        if hasattr(self, "busy") and self.busy:
+            color = T["accent_alt"]
+        elif any(word in text.lower() for word in ("error", "failed", "unavailable", "offline")):
+            color = T["err"]
+        else:
+            color = T["accent"]
+        try:
+            dot.delete("all")
+            r = max(2, self.px(3))
+            cx = max(r, self.px(4))
+            dot.create_oval(cx - r, self.px(4) - r, cx + r, self.px(4) + r,
+                            fill=color, outline="")
+        except Exception:
+            pass
 
     def _refresh_statusline(self):
         p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
@@ -3690,6 +3858,7 @@ class Overlay:
         backend = getattr(self, "_active_backend", self._backend).upper()
         self.statusline.configure(
             text=f"{backend} · {self._model or 'DeskOrb Agent'} ▾   ·   context {p}   ·   {ver}", fg=T["muted"])
+        self._paint_status_signal()
 
     # ── compaction animation (mirrors the Codex Code CLI's /compact spinner) ──
     def _start_compact_anim(self):
@@ -4131,6 +4300,8 @@ class Overlay:
             self._stop_compact_anim(payload)
         elif kind == "error":
             self.add_err(str(payload))
+            self._status_text = str(payload)
+            self._paint_status_signal(payload)
             self._set_busy(False)
         elif kind == "result":
             self._md_finalize()          # finalize before any error line is appended
@@ -4139,6 +4310,8 @@ class Overlay:
             # our side; surface it WITH the CLI's reason (subtype/result) instead of a generic line.
             if isinstance(payload, dict) and payload.get("is_error"):
                 self.add_err(self._format_turn_error(payload))
+                self._status_text = self._format_turn_error(payload)
+                self._paint_status_signal(self._status_text)
             self._set_busy(False)
         elif kind == "attach":          # background paste finished (paths, failed_count)
             self._paste_busy = False

@@ -7,13 +7,23 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 
 
-def _read_file() -> dict[str, str]:
-    path = Path(__file__).resolve().parents[1] / ".env"
+_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+
+
+def _file_mtime_ns() -> int | None:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        return _ENV_PATH.stat().st_mtime_ns
+    except Exception:
+        return None
+
+
+def _read_file() -> dict[str, str]:
+    try:
+        lines = _ENV_PATH.read_text(encoding="utf-8").splitlines()
     except Exception:
         return {}
     return _parse_lines(lines)
@@ -34,6 +44,25 @@ def _parse_lines(lines: list[str]) -> dict[str, str]:
 
 
 _VALUES = _read_file()
+_ENV_MTIME_NS = _file_mtime_ns()
+_VALUES_LOCK = threading.RLock()
+
+
+def _values() -> dict[str, str]:
+    """Return current file settings, refreshing after an in-place .env edit.
+
+    The overlay is a long-lived process and users commonly rotate a key while it
+    is open.  Import-time-only loading made the UI keep sending the old key until
+    a full process restart.  Reloading is cheap (one stat per lookup) and never
+    exposes the values in diagnostics.
+    """
+    global _VALUES, _ENV_MTIME_NS
+    current_mtime = _file_mtime_ns()
+    with _VALUES_LOCK:
+        if current_mtime != _ENV_MTIME_NS:
+            _VALUES = _read_file()
+            _ENV_MTIME_NS = current_mtime
+        return _VALUES
 
 
 def api_key(provider: str | None = None) -> str:
@@ -43,6 +72,7 @@ def api_key(provider: str | None = None) -> str:
     without a provider preserves the original priority used by the active
     connection.
     """
+    values = _values()
     name = str(provider or "").strip().lower().replace("_", "-")
     provider_keys = {
         "openai": ("OPENAI_API_KEY", "openai_api_key"),
@@ -53,7 +83,7 @@ def api_key(provider: str | None = None) -> str:
     }
     if name in provider_keys:
         for key in provider_keys[name]:
-            value = os.environ.get(key, "").strip() if key.isupper() else _VALUES.get(key, "")
+            value = os.environ.get(key, "").strip() if key.isupper() else values.get(key, "")
             if value:
                 return value
     candidates = (
@@ -61,35 +91,39 @@ def api_key(provider: str | None = None) -> str:
         os.environ.get("DEEPSEEK_API_KEY", "").strip(),
         os.environ.get("DASHSCOPE_API_KEY", "").strip(),
         os.environ.get("QWEN_API_KEY", "").strip(),
-        _VALUES.get("api-key", ""), _VALUES.get("openai_api_key", ""),
-        _VALUES.get("deepseek_api_key", ""), _VALUES.get("dashscope_api_key", ""),
-        _VALUES.get("qwen_api_key", ""),
+        values.get("api-key", ""), values.get("openai_api_key", ""),
+        values.get("deepseek_api_key", ""), values.get("dashscope_api_key", ""),
+        values.get("qwen_api_key", ""),
     )
     return next((value for value in candidates if value), "")
 
 
 def model_fallbacks_raw() -> str:
+    values = _values()
     return (os.environ.get("DESKORB_AGENT_MODEL_FALLBACKS", "").strip()
-            or _VALUES.get("deskorb_agent_model_fallbacks", "")
-            or _VALUES.get("model_fallbacks", ""))
+            or values.get("deskorb_agent_model_fallbacks", "")
+            or values.get("model_fallbacks", ""))
 
 
 def model_capabilities_raw() -> str:
+    values = _values()
     return (os.environ.get("DESKORB_AGENT_MODEL_CAPABILITIES", "").strip()
-            or _VALUES.get("deskorb_agent_model_capabilities", "")
-            or _VALUES.get("model_capabilities", ""))
+            or values.get("deskorb_agent_model_capabilities", "")
+            or values.get("model_capabilities", ""))
 
 
 def api_base_url() -> str:
-    return (os.environ.get("OPENAI_BASE_URL", "").strip() or _VALUES.get("url", "")
-            or _VALUES.get("openai_base_url", ""))
+    values = _values()
+    return (os.environ.get("OPENAI_BASE_URL", "").strip() or values.get("url", "")
+            or values.get("openai_base_url", ""))
 
 
 def api_model(default: str) -> str:
+    values = _values()
     value = (os.environ.get("DESKORB_AGENT_API_MODEL", "").strip()
              or os.environ.get("CODEX_OVERLAY_API_MODEL", "").strip()
-             or _VALUES.get("model_name", "")
-             or _VALUES.get("codex_overlay_api_model", ""))
+             or values.get("model_name", "")
+             or values.get("codex_overlay_api_model", ""))
     # The supplied model_name was an endpoint URL, not a model ID. Do not pass
     # a URL to the model field; the tested interactive default is Terra.
     return default if not value or "://" in value else value

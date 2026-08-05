@@ -33,10 +33,10 @@ Configuration overrides:
 - `DESKORB_AGENT_SHOW_IN_SCREEN_SHARE`: whether the overlay appears in screen shares
   (defaults to `1`). Set to `0` to request private mode only after verifying the
   window remains visible on the current desktop environment.
-- `DESKORB_AGENT_FRAMELESS_WINDOW`: set to `1` to opt into the legacy frameless window
-  style. It is off by default for Windows/Tk compatibility.
-- `DESKORB_AGENT_CUSTOM_WINDOW_REGION`: set to `1` to apply the legacy rounded Win32
-  window region; it defaults to the frameless-window setting.
+- `DESKORB_AGENT_FRAMELESS_WINDOW`: `1` by default, so the custom titlebar is the only
+  close/minimize control; set to `0` only when troubleshooting native Windows decorations.
+- `DESKORB_AGENT_CUSTOM_WINDOW_REGION`: applies the rounded Win32 window region; it defaults
+  to the frameless-window setting.
 - `DESKORB_AGENT_RECENT_TURNS`: verbatim API recency window (defaults to `6`)
 - `DESKORB_AGENT_SUMMARY_TOKENS`: rolling-summary output cap (defaults to `1200`)
 - `DESKORB_AGENT_MODEL_FALLBACKS`: optional JSON catalog of explicitly authorized fallback models; it never switches automatically
@@ -44,6 +44,7 @@ Configuration overrides:
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
 - `DESKORB_AGENT_SERVICE_TIER`: CLI service tier (defaults to `fast`)
 - `DESKORB_AGENT_SHOT_SCOPE`: `screens` or `window`
+- `DESKORB_AGENT_THEME`: `tech` (默认科技风)、`dark` 或 `light`
 
 ## Connection modes
 
@@ -79,7 +80,9 @@ Use [`.env.example`](.env.example) as a safe template. Keep the real `.env`
 outside version control.
 
 `model_name` must be a model ID, not an API URL. Environment variables and the
-settings window take precedence over this file.
+settings window take precedence over this file. The overlay watches the file for
+changes while it is running; after an authentication 401 it refreshes the key
+once and retries the request, so rotating a key does not require a full restart.
 
 API mode provides chat and image/screenshot understanding. Use **agent** mode for
 local shell/file tools and Windows mouse/keyboard control; Codex mode is optional.
