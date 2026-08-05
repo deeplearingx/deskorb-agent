@@ -29,6 +29,7 @@ from conversation_context import ConversationContext
 from credential_store import get_api_key
 from debuglog import DEBUG_LOG, _UIQueueTap, dbg
 from model_adapter import ModelAdapter, normalize_provider
+from privacy_scope import requires_current_context_consent
 
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -76,18 +77,30 @@ class CodexWorker(threading.Thread):
         self._codex = self._find_codex()
 
     # -- UI-facing API -------------------------------------------------
-    def ask(self, text: str, image_paths=None):
-        self.req.put(("ask", (text, list(image_paths or []))))
+    def ask(self, text: str, image_paths=None, current_context_consent: bool = False):
+        payload = (text, list(image_paths or []))
+        if current_context_consent:
+            payload = (*payload, True)
+        self.req.put(("ask", payload))
 
-    def ask_ephemeral(self, text: str, image_paths=None):
+    def ask_ephemeral(self, text: str, image_paths=None, current_context_consent: bool = False):
         """Run one turn without adding its input to normal conversation memory."""
-        self.req.put(("ask_ephemeral", (text, list(image_paths or []))))
+        payload = (text, list(image_paths or []))
+        if current_context_consent:
+            payload = (*payload, True)
+        self.req.put(("ask_ephemeral", payload))
 
     def reset(self):
         self.req.put(("reset", None))
 
     def compact(self):
         self.req.put(("compact", None))
+
+    def authorize_model_fallback(self, target_id: str, share_context: bool = False):
+        """Queue an explicit user choice for the independent Agent runtime."""
+        self.req.put(("authorize_model_fallback", {
+            "target_id": str(target_id), "share_context": bool(share_context),
+        }))
 
     def set_model(self, model: str):
         self.req.put(("set_model", str(model)))
@@ -162,6 +175,20 @@ class CodexWorker(threading.Thread):
                     self.ui.put(("reset_done", None))
                 elif kind == "compact":
                     self._compact()
+                elif kind == "authorize_model_fallback":
+                    payload = payload if isinstance(payload, dict) else {}
+                    result = self._agent.authorize_model_fallback(
+                        payload.get("target_id", ""), user_confirmed=True,
+                        share_context=bool(payload.get("share_context")),
+                    )
+                    self.ui.put(("model_fallback_result", result))
+                    if result.get("ok"):
+                        self._model = self._agent.model
+                        self._model_provider = self._agent.model_provider
+                        self._api_base_url = self._agent.api_base_url
+                        self._api_context.clear()
+                        self.ui.put(("model", self._model))
+                        self.ui.put(("status", "fallback model selected; current task authorization was cleared"))
                 elif kind == "set_model":
                     self._model = self._normalize_model(payload)
                     self._session_id = None
@@ -345,9 +372,20 @@ class CodexWorker(threading.Thread):
         self._session_id = str(response["result"]["thread"]["id"])
 
     # -- turn execution ------------------------------------------------
-    def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def _run_turn(self, text: str, image_paths: list[str], current_context_consent: bool = False,
+                  ephemeral: bool = False):
         self._interrupted = False
         self._tool_items_seen.clear()
+        if requires_current_context_consent(text) and not current_context_consent:
+            # Keep the privacy boundary backend-independent. AgentRuntime has the same
+            # check for direct callers, while this guard prevents API/Codex transports
+            # from receiving an image before a user-clicked grant reaches them.
+            self.ui.put(("privacy_consent_required", {
+                "scope": "active_window_and_local_diagnostics",
+                "message": "Current desktop diagnostics require explicit one-turn user consent.",
+                "text": str(text),
+            }))
+            return
         active = self._resolved_backend()
         self.ui.put(("backend", self._backend_status()))
         try:
@@ -363,7 +401,8 @@ class CodexWorker(threading.Thread):
                         raise
             elif active == "agent":
                 try:
-                    self._run_agent_turn(text, image_paths, ephemeral=ephemeral)
+                    self._run_agent_turn(text, image_paths, ephemeral=ephemeral,
+                                         current_context_consent=current_context_consent)
                 except BaseException as exc:
                     if self._backend == "auto" and self._codex:
                         self.ui.put(("system", f"↪ Agent 不可用（{self._short_status(str(exc))}），已自动切回 Codex。"))
@@ -456,7 +495,7 @@ class CodexWorker(threading.Thread):
             "input": [{"role": "user", "content": content}],
             "stream": True,
         }
-        response = self._open_api_response(payload, api_key, "text/event-stream")
+        response = self._open_api_response_with_key_refresh(payload, api_key, "text/event-stream")
         with self._api_lock:
             self._api_response = response
         completed = False
@@ -536,11 +575,19 @@ class CodexWorker(threading.Thread):
                 self._api_context.add_turn(text, "".join(answer_parts))
                 self.ui.put(("ctx", self._api_context.usage_percent()))
 
-    def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
+    def _run_agent_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
+                        current_context_consent: bool = False):
         if ephemeral:
-            self._agent.run_ephemeral_turn(text, image_paths)
+            if current_context_consent:
+                self._agent.run_ephemeral_turn(text, image_paths,
+                                               current_context_consent=True)
+            else:
+                self._agent.run_ephemeral_turn(text, image_paths)
         else:
-            self._agent.run_turn(text, image_paths)
+            if current_context_consent:
+                self._agent.run_turn(text, image_paths, current_context_consent=True)
+            else:
+                self._agent.run_turn(text, image_paths)
 
     def _open_api_response(self, payload: dict[str, Any], api_key: str, accept: str):
         endpoint = self._adapter.endpoint
@@ -565,6 +612,25 @@ class CodexWorker(threading.Thread):
         except urllib.error.HTTPError as exc:
             detail = exc.read(32 * 1024).decode("utf-8", "replace")
             raise RuntimeError(f"API HTTP {exc.code}: {self._api_error_detail(detail)}") from exc
+
+    def _open_api_response_with_key_refresh(self, payload: dict[str, Any], api_key: str,
+                                            accept: str):
+        """Retry one 401 with a freshly resolved key.
+
+        ``.env`` is intentionally editable while the overlay is running. A
+        provider may reject the import-time key during rotation; one retry avoids
+        forcing a restart while keeping retries bounded and never retrying other
+        failures.
+        """
+        try:
+            return self._open_api_response(payload, api_key, accept)
+        except RuntimeError as exc:
+            if "API HTTP 401" not in str(exc):
+                raise
+            refreshed_key = get_api_key()
+            if not refreshed_key or refreshed_key == api_key:
+                raise
+            return self._open_api_response(payload, refreshed_key, accept)
 
     def _maybe_compact_api_context(self, api_key: str):
         if not self._api_context.compaction_candidate():
@@ -606,7 +672,7 @@ class CodexWorker(threading.Thread):
             "stream": False,
             "max_output_tokens": API_CONTEXT_SUMMARY_TOKENS,
         }
-        response = self._open_api_response(payload, api_key, "application/json")
+        response = self._open_api_response_with_key_refresh(payload, api_key, "application/json")
         with self._api_lock:
             self._api_response = response
         try:

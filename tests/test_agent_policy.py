@@ -16,6 +16,13 @@ class ToolPolicyTests(unittest.TestCase):
         decision = self.policy.decide("desktop_list_windows", execution_requested=False, full_access=False)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
+    def test_uia_observation_is_read_only_but_semantic_actions_are_task_scoped(self):
+        observed = self.policy.decide("desktop_uia_observe", execution_requested=False, full_access=False)
+        self.assertEqual(observed.kind, DecisionKind.ALLOW)
+        action = self.policy.decide("desktop_uia_invoke", execution_requested=True, full_access=True,
+                                    task_authorized=True)
+        self.assertEqual(action.kind, DecisionKind.ALLOW)
+
     def test_write_requires_explicit_execution_intent(self):
         decision = self.policy.decide("filesystem_write", execution_requested=False, full_access=True)
         self.assertEqual(decision.kind, DecisionKind.DENY)

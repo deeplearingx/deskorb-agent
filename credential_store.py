@@ -12,6 +12,23 @@ TARGET = "DeskOrbAgent/OpenAIAPIKey"
 LEGACY_TARGET = "CodexOverlay/OpenAIAPIKey"
 
 
+def _environment_api_key(provider: str | None = None) -> str:
+    """Return only process environment keys, excluding the dotenv fallback."""
+    name = str(provider or "").strip().lower().replace("_", "-")
+    provider_keys = {
+        "openai": ("OPENAI_API_KEY",),
+        "responses": ("OPENAI_API_KEY",),
+        "deepseek": ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"),
+        "qwen": ("QWEN_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"),
+        "dashscope": ("DASHSCOPE_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"),
+    }
+    keys = provider_keys.get(name, (
+        "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY",
+    ))
+    return next((os.environ.get(key, "").strip() for key in keys
+                 if os.environ.get(key, "").strip()), "")
+
+
 if os.name == "nt":
     class CREDENTIALW(ctypes.Structure):
         _fields_ = [
@@ -34,22 +51,27 @@ if os.name == "nt":
     _advapi32.CredFree.argtypes = [ctypes.c_void_p]
 
 
-def get_api_key() -> str:
-    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+def get_api_key(provider: str | None = None) -> str:
+    provider_name = str(provider or "").strip().lower()
+    # Explicit process environment values are the strongest override.  A key
+    # saved from Connection settings comes next, then the parent .env fallback.
+    # This matches the documented precedence and prevents the .env key from
+    # silently overriding a newly entered key.
+    env_key = _environment_api_key(provider_name or None)
     if env_key:
         return env_key
     if os.name != "nt":
-        return _provider_api_key()
+        return _provider_api_key(provider_name or None)
     pointer = ctypes.POINTER(CREDENTIALW)()
     if not _advapi32.CredReadW(TARGET, 1, 0, ctypes.byref(pointer)):
         if not _advapi32.CredReadW(LEGACY_TARGET, 1, 0, ctypes.byref(pointer)):
-            return _provider_api_key()
+            return _provider_api_key(provider_name or None)
     try:
         cred = pointer.contents
         if not cred.CredentialBlob or not cred.CredentialBlobSize:
-            return _provider_api_key()
+            return _provider_api_key(provider_name or None)
         raw = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
-        return raw.decode("utf-16-le").strip("\x00").strip() or _provider_api_key()
+        return raw.decode("utf-16-le").strip("\x00").strip() or _provider_api_key(provider_name or None)
     finally:
         _advapi32.CredFree(pointer)
 

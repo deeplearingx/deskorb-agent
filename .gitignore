@@ -23,6 +23,9 @@ app-server-schema/
 claude_overlay_shots/
 deskorb_agent_shots/
 .playwright-mcp/
+.deskorb-agent/
+tests/fixtures/e2e/matrix_*.json
+artifacts/
 
 # Local launch / marketing / progress notes (keep out of the public repo)
 LAUNCH_KIT.md

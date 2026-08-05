@@ -6,7 +6,10 @@ so anything may import it without a circular-import risk."""
 import os
 from pathlib import Path
 
-from provider_env import api_base_url as _provider_api_base_url, api_model as _provider_api_model
+from provider_env import (api_base_url as _provider_api_base_url, api_model as _provider_api_model,
+                          model_capabilities_raw as _provider_model_capabilities,
+                          model_fallbacks_raw as _provider_model_fallbacks)
+from model_registry import parse_capability_overrides, parse_fallback_targets
 
 __version__ = "0.2.0"
 
@@ -64,6 +67,14 @@ API_BASE_URL = (os.environ.get("OPENAI_BASE_URL", "").strip() or _provider_api_b
 MODEL_PROVIDER = os.environ.get("DESKORB_AGENT_PROVIDER", "auto").strip().lower() or "auto"
 API_PROXY_URL = os.environ.get("DESKORB_AGENT_API_PROXY", os.environ.get("CODEX_OVERLAY_API_PROXY", "")).strip()
 API_MODEL = _provider_api_model("gpt-5.6-terra")
+try:
+    MODEL_FALLBACKS = parse_fallback_targets(_provider_model_fallbacks())
+except Exception:
+    MODEL_FALLBACKS = []
+try:
+    MODEL_CAPABILITY_OVERRIDES = parse_capability_overrides(_provider_model_capabilities())
+except Exception:
+    MODEL_CAPABILITY_OVERRIDES = []
 API_TIMEOUT = _env_int("DESKORB_AGENT_API_TIMEOUT", 180, 15, 900)
 API_REQUEST_RETRIES = _env_int("DESKORB_AGENT_API_REQUEST_RETRIES", 2, 0, 4)
 API_CONTEXT_TOKEN_BUDGET = _env_int("DESKORB_AGENT_CONTEXT_TOKENS", 24_000, 4_000, 200_000)
@@ -74,6 +85,9 @@ API_CONTEXT_SUMMARY_TOKENS = _env_int("DESKORB_AGENT_SUMMARY_TOKENS", 1_200, 256
 # to replace or add trusted local servers; set PLAYWRIGHT_MCP=0 to disable the default.
 MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
 PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
+BROWSER_BACKEND = os.environ.get("DESKORB_AGENT_BROWSER_BACKEND", "isolated-playwright").strip().lower()
+if BROWSER_BACKEND not in {"isolated-playwright", "connected-playwright"}:
+    BROWSER_BACKEND = "isolated-playwright"
 MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
 PERMISSION_MODE = "workspace-write"
                                  # the STARTUP permission mode; flip it at run time with the
@@ -121,7 +135,10 @@ SHOW_IN_SCREEN_SHARE_DEFAULT = _env_bool("DESKORB_AGENT_SHOW_IN_SCREEN_SHARE", T
 # variable to 0 only after confirming the private screen-share mode remains visible.
 HIDE_SCREENSHOT_TOOL = True       # hide the noisy "⚙ Read …shot_*.png" lines every turn
 HOTKEY = "ctrl+alt+space"
-THEME = "light"                  # "light" (Codex paper) or "dark" (warm dark)
+# The default DeskOrb surface is a restrained "Obsidian Aurora" theme. Existing light and
+# dark palettes remain available for people who prefer them; set DESKORB_AGENT_THEME per
+# machine instead of editing source (light | dark | tech).
+THEME = os.environ.get("DESKORB_AGENT_THEME", "tech").strip().lower()
 WINDOW_ALPHA = 1.0
 CORNER_RADIUS = 18
 TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button (with the
@@ -130,9 +147,11 @@ TASKBAR_BUTTON = True            # show a real, clickable Windows taskbar button
                                  # (overrideredirect) window gets NO taskbar button by default;
                                  # this forces one via WS_EX_APPWINDOW. False → the pure
                                  # no-taskbar floating overlay (original behaviour).
-FRAMELESS_WINDOW = _env_bool("DESKORB_AGENT_FRAMELESS_WINDOW", False)
-# Standard decorations avoid an invisible Tk window on some desktops. The matching
-# custom Win32 window region is also opt-in, because it clips native title bars.
+# The custom titlebar is the single source of window controls. Native decorations are opt-in
+# for troubleshooting only; leaving both enabled creates duplicate close/minimize buttons.
+FRAMELESS_WINDOW = _env_bool("DESKORB_AGENT_FRAMELESS_WINDOW", True)
+# The matching Win32 region is enabled with the custom titlebar so the expanded surface and
+# collapsed orb keep the same rounded silhouette.
 CUSTOM_WINDOW_REGION = _env_bool("DESKORB_AGENT_CUSTOM_WINDOW_REGION", FRAMELESS_WINDOW)
 APP_ICON = ""  # use the Tk default unless a local icon is supplied
                                  # script (or absolute). "" → no custom icon (Tk default).
@@ -281,16 +300,25 @@ THEMES = {
     "light": {
         "bg": "#FAF9F5", "field": "#FFFFFF", "user_card": "#EFEBE1",
         "text": "#28261F", "muted": "#73706A", "faint": "#A9A59B",
-        "accent": "#D97757", "accent_hi": "#C25E40", "on_accent": "#FFFFFF",
+        "accent": "#D97757", "accent_hi": "#C25E40", "accent_alt": "#7C6AE6",
+        "on_accent": "#FFFFFF",
         "border": "#E6E2D8", "tool_bg": "#F2EFE7", "err": "#B4413A",
         "sel": "#EADDD3", "hover": "#EFEBE1",
     },
     "dark": {
         "bg": "#262624", "field": "#1F1E1D", "user_card": "#34332F",
         "text": "#ECEAE3", "muted": "#9B978D", "faint": "#6F6C64",
-        "accent": "#D97757", "accent_hi": "#E68A6C", "on_accent": "#FFFFFF",
+        "accent": "#D97757", "accent_hi": "#E68A6C", "accent_alt": "#9A8CFF",
+        "on_accent": "#FFFFFF",
         "border": "#3A3934", "tool_bg": "#2E2D2A", "err": "#E0897D",
         "sel": "#3A3934", "hover": "#30302E",
+    },
+    "tech": {
+        "bg": "#08111F", "field": "#0F1B2D", "user_card": "#142A40",
+        "text": "#EAF5FF", "muted": "#91A9C5", "faint": "#58708E",
+        "accent": "#58D9FF", "accent_hi": "#A5EEFF", "accent_alt": "#8D7BFF",
+        "on_accent": "#06111D", "border": "#1D3856", "tool_bg": "#102238",
+        "err": "#FF8197", "sel": "#20425F", "hover": "#17334F",
     },
 }
 T = THEMES.get(THEME, THEMES["light"])

@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from unittest.mock import patch
 
@@ -24,3 +27,24 @@ class ProviderEnvTests(unittest.TestCase):
         with patch.object(provider_env, "_VALUES", {"deepseek_api_key": "deepseek-key"}), \
              patch.dict(provider_env.os.environ, {}, clear=True):
             self.assertEqual(provider_env.api_key(), "deepseek-key")
+
+    def test_provider_specific_key_wins_over_generic_key(self):
+        with patch.object(provider_env, "_VALUES", {"openai_api_key": "generic", "deepseek_api_key": "deep"}), \
+             patch.dict(provider_env.os.environ, {}, clear=True):
+            self.assertEqual(provider_env.api_key("deepseek"), "deep")
+
+    def test_dotenv_is_reloaded_after_process_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("api-key: old-key\nurl: https://old.example\n", encoding="utf-8")
+            old_mtime = path.stat().st_mtime_ns
+            with patch.object(provider_env, "_ENV_PATH", path), \
+                 patch.object(provider_env, "_ENV_MTIME_NS", old_mtime), \
+                 patch.object(provider_env, "_VALUES", {"api-key": "old-key", "url": "https://old.example"}), \
+                 patch.dict(provider_env.os.environ, {}, clear=True):
+                self.assertEqual(provider_env.api_key(), "old-key")
+                self.assertEqual(provider_env.api_base_url(), "https://old.example")
+                path.write_text("api-key: new-key\nurl: https://new.example\n", encoding="utf-8")
+                os.utime(path, ns=(old_mtime + 1_000_000, old_mtime + 1_000_000))
+                self.assertEqual(provider_env.api_key(), "new-key")
+                self.assertEqual(provider_env.api_base_url(), "https://new.example")

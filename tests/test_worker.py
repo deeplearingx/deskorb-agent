@@ -74,6 +74,28 @@ class CodexWorkerTests(unittest.TestCase):
             ("ask_ephemeral", ("private Word contents", [])),
         )
 
+    def test_current_context_consent_is_carried_with_a_turn_request(self):
+        self.worker.ask("分析当前桌面", [], current_context_consent=True)
+        self.assertEqual(
+            self.worker.req.get_nowait(),
+            ("ask", ("分析当前桌面", [], True)),
+        )
+
+    def test_worker_blocks_current_context_before_any_backend_transport(self):
+        self.worker._backend = "api"
+        with patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn("分析当前桌面并读取日志", [], current_context_consent=False)
+        run_api.assert_not_called()
+        kind, payload = self.events.get_nowait()
+        self.assertEqual(kind, "privacy_consent_required")
+        self.assertEqual(payload["scope"], "active_window_and_local_diagnostics")
+
+    def test_model_fallback_choice_queues_explicit_consent(self):
+        self.worker.authorize_model_fallback("deepseek", share_context=True)
+        self.assertEqual(self.worker.req.get_nowait(), ("authorize_model_fallback", {
+            "target_id": "deepseek", "share_context": True,
+        }))
+
     def test_agent_compact_routes_to_independent_runtime(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "compact", return_value=None) as compact:
@@ -108,6 +130,18 @@ class CodexWorkerTests(unittest.TestCase):
             self.worker._normalize_api_base("https://example.test/v1/"),
             "https://example.test/v1",
         )
+
+    def test_api_401_retries_once_after_key_rotation(self):
+        refreshed_response = object()
+        with patch.object(self.worker, "_open_api_response",
+                          side_effect=[RuntimeError("API HTTP 401: Invalid API key"),
+                                       refreshed_response]) as request, \
+             patch("worker.get_api_key", return_value="new-key"):
+            result = self.worker._open_api_response_with_key_refresh(
+                {"model": "test-model"}, "old-key", "application/json")
+        self.assertIs(result, refreshed_response)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[-1].args[1], "new-key")
 
     def test_legacy_none_configuration_falls_back_to_safe_defaults(self):
         self.assertEqual(self.worker._normalize_model("None"), API_MODEL)
@@ -158,4 +192,3 @@ class CodexWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

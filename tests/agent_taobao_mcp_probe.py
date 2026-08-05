@@ -13,6 +13,9 @@ from queue import Empty, Queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 from agent_runtime import AgentRuntime
 from config import API_BASE_URL, API_MODEL, API_PROXY_URL
 
@@ -59,18 +62,25 @@ def main() -> int:
             for kind, value in all_events
             if kind == "tool" and value and value[0] == "MCP browser tool"
         )
-        blocked = bool(re.search(r"验证码|访问限制|风控|无法获得|阻碍", answer))
+        # A live CAPTCHA may stop the model before it produces a final answer.
+        # The structured handoff event is authoritative in that case.
+        handoff = any(kind == "human_verification" for kind, _value in all_events)
+        blocked = handoff or bool(re.search(r"验证码|访问限制|风控|无法获得|阻碍", answer))
         price_found = bool(re.search(r"(?:¥|￥|元)\s?1(?:0\d|[1-4]\d)(?:\.\d+)?", answer))
+        compliant = bool(token and mcp_calls and (price_found or blocked))
         result = {
-            "ok": bool(token and mcp_calls and price_found and not blocked),
+            "ok": compliant,
+            "task_completed": bool(price_found and not blocked),
+            "status": "completed" if price_found and not blocked else ("blocked_expected" if blocked else "failed"),
             "approval_used": bool(token),
             "mcp_tool_calls": mcp_calls,
             "blocked": blocked,
+            "human_handoff": handoff,
             "answer": answer[-3000:],
             "events": [kind for kind, _value in all_events],
         }
         print(json.dumps(result, ensure_ascii=False))
-        return 0 if result["ok"] else 2
+        return 0 if compliant else 2
     except Exception as exc:
         print(
             json.dumps(

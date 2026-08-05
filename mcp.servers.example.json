@@ -2,12 +2,25 @@
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"]
+      "args": ["-y", "@playwright/mcp@latest", "--isolated"],
+      "deskorb": {
+        "allowed_tools": [
+          "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+          "browser_select_option", "browser_press_key", "browser_wait_for", "browser_tabs"
+        ]
+      }
     },
     "powertoys": {
       "command": ".venv\\Scripts\\python.exe",
       "args": ["powertoys_mcp.py"],
-      "cwd": "."
+      "cwd": ".",
+      "deskorb": {
+        "allowed_tools": [
+          "powertoys_status", "powertoys_list_modules", "powertoys_get_settings",
+          "powertoys_get_schema", "powertoys_test_settings", "powertoys_apply_settings",
+          "powertoys_apply_profile", "powertoys_list_backups", "powertoys_restore_backup"
+        ]
+      }
     }
   }
 }
