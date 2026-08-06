@@ -19,11 +19,13 @@ from typing import Any
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
                     MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
                     OFFICECLI_ENABLED,
+                    MODEL_PROVIDER,
                     PLAYWRIGHT_MCP_ENABLED,
                     SYSTEM_APPEND, WORKING_DIR)
 from agent_policy import ApprovalManager, Risk, ToolPolicy
 from desktop_tools import DesktopTools
 from mcp_client import MCPError, MCPToolBridge
+from model_adapter import ModelAdapter
 from conversation_context import ConversationContext
 from credential_store import get_api_key
 from responses_tool_protocol import continue_input, function_call_output, function_calls
@@ -333,10 +335,13 @@ class AgentRuntime:
     def __init__(self, ui_queue, model: str, api_base_url: str, api_proxy_url: str = "",
                  working_dir: str | Path = WORKING_DIR, full_access: bool = True,
                  context_tokens: int = API_CONTEXT_TOKEN_BUDGET,
-                 recent_turns: int = API_CONTEXT_RECENT_TURNS):
+                 recent_turns: int = API_CONTEXT_RECENT_TURNS,
+                 model_provider: str | None = None):
         self.ui = ui_queue
         self.model = model
-        self.api_base_url = api_base_url.rstrip("/")
+        self.model_provider = model_provider or MODEL_PROVIDER
+        self.adapter = ModelAdapter(self.model_provider, api_base_url)
+        self.api_base_url = self.adapter.profile.base_url
         self.api_proxy_url = api_proxy_url.rstrip("/")
         self.context = ConversationContext(token_budget=context_tokens, recent_turns=recent_turns)
         self.tools = ControlledTools(working_dir)
@@ -363,9 +368,13 @@ class AgentRuntime:
         self._task_authorized_until = 0.0
         self._task_mcp_servers: set[str] = set()
 
-    def configure(self, model: str, api_base_url: str, api_proxy_url: str = ""):
+    def configure(self, model: str, api_base_url: str, api_proxy_url: str = "",
+                  model_provider: str | None = None):
         self.model = model
-        self.api_base_url = api_base_url.rstrip("/")
+        if model_provider is not None:
+            self.model_provider = model_provider
+        self.adapter = ModelAdapter(self.model_provider, api_base_url)
+        self.api_base_url = self.adapter.profile.base_url
         self.api_proxy_url = api_proxy_url.rstrip("/")
         self.context.clear()
         self.approvals.pending = None
@@ -384,7 +393,7 @@ class AgentRuntime:
 
     def compact(self, force: bool = True) -> dict[str, int] | None:
         """Summarize older turns while retaining recent dialogue verbatim."""
-        api_key = get_api_key()
+        api_key = get_api_key(self.model_provider)
         if not api_key:
             raise RuntimeError("API Key is not configured")
         return self._compact_context(api_key, force=force)
@@ -455,7 +464,7 @@ class AgentRuntime:
 
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                   allow_tools: bool = True):
-        api_key = get_api_key()
+        api_key = get_api_key(self.model_provider)
         if not api_key:
             raise RuntimeError("API Key is not configured")
         self._cancelled.clear()
@@ -865,8 +874,8 @@ class AgentRuntime:
         return {"pre_tokens": candidate.pre_tokens, "post_tokens": self.context.estimated_tokens()}
 
     def _request(self, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-        endpoint = self.api_base_url if self.api_base_url.endswith("/responses") else self.api_base_url + "/responses"
-        request = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), method="POST",
+        body = self.adapter.prepare_request(payload)
+        request = urllib.request.Request(self.adapter.endpoint, data=json.dumps(body).encode("utf-8"), method="POST",
             headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json",
                      "Accept": "application/json", "User-Agent": "deskorb-agent/0.2"})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": self.api_proxy_url, "https": self.api_proxy_url})) if self.api_proxy_url else None
@@ -885,7 +894,7 @@ class AgentRuntime:
                         self._active_response = None
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result["error"]))
-                return result
+                return self.adapter.normalize_response(result)
             except urllib.error.HTTPError as exc:
                 detail = exc.read(64 * 1024).decode("utf-8", "replace")[:500]
                 if exc.code in self.TRANSIENT_HTTP_STATUS and attempt < API_REQUEST_RETRIES:

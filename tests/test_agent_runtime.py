@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import io
+import json
 import urllib.error
 from pathlib import Path
 from queue import Queue
@@ -385,6 +386,32 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(response["output_text"], "RECOVERED")
         self.assertEqual(open_call.call_count, 2)
         sleep.assert_called_once()
+
+    def test_request_uses_provider_chat_protocol_and_normalizes_response(self):
+        class Response:
+            def read(self, _limit):
+                return json.dumps({"choices": [{"message": {
+                    "content": "DeepSeek reply", "tool_calls": [],
+                }}]}).encode("utf-8")
+
+            def close(self):
+                pass
+
+        runtime = AgentRuntime(
+            Queue(), "deepseek-chat", "https://api.deepseek.com",
+            working_dir=self.root, model_provider="deepseek",
+        )
+        with patch("agent_runtime.urllib.request.urlopen", return_value=Response()) as open_call:
+            result = runtime._request({
+                "model": "deepseek-chat", "instructions": "Reply briefly.",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hi"}]}],
+                "stream": False,
+            }, "deep-key")
+        request = open_call.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "https://api.deepseek.com/chat/completions")
+        self.assertEqual(body["messages"][1]["content"], "Hi")
+        self.assertEqual(result["output_text"], "DeepSeek reply")
 
 
 
