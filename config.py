@@ -74,6 +74,11 @@ MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
 PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
 OFFICECLI_ENABLED = _env_bool("DESKORB_AGENT_OFFICECLI", True)
 OFFICECLI_BINARY = os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "").strip()
+# OfficeCLI generation/update verbs are approved by the local runtime by default so a
+# DOCX/XLSX/PPTX task does not stop for create/add/set/save confirmations on every step.
+# Destructive verbs such as remove/move/close remain confirmation-protected. Set this to
+# 0 to restore explicit confirmations for all OfficeCLI mutations.
+OFFICECLI_AUTO_APPROVE = _env_bool("DESKORB_AGENT_OFFICECLI_AUTO_APPROVE", True)
 MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
 PERMISSION_MODE = "workspace-write"
                                  # the STARTUP permission mode; flip it at run time with the
@@ -195,6 +200,10 @@ IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 ima
                                  # (no per-turn Read round-trip); "read" → legacy path:
                                  # save PNG + ask Codex to Read it. Flip to "read" if a
                                  # future CLI rejects inline images.
+API_IMAGE_INPUT_ENABLED = _env_bool("DESKORB_AGENT_API_IMAGE_INPUT", False)
+                                 # API-backed models are text-only by default; set this to
+                                 # 1 only after verifying the selected endpoint accepts
+                                 # Responses API input_image blocks.
 PRECAPTURE_ON_TYPING = True      # grab the screen ~as you type (off the send path) so
                                  # send latency excludes the capture.
 PRECAPTURE_MAX_AGE = 6.0         # seconds a pre-captured frame stays reusable; older than

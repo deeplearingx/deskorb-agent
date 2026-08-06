@@ -1,0 +1,2 @@
+D:\Develop\deskorb-agent-main\tools\officecli\officecli.pdb
+D:\Develop\deskorb-agent-main\tools\officecli\officecli.exe

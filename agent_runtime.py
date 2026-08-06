@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
-                    MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_BINARY, OFFICECLI_ENABLED,
+                    MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
+                    OFFICECLI_ENABLED,
                     PLAYWRIGHT_MCP_ENABLED,
                     SYSTEM_APPEND, WORKING_DIR)
 from agent_policy import ApprovalManager, Risk, ToolPolicy
@@ -579,25 +580,28 @@ class AgentRuntime:
                     if not isinstance(arguments, dict):
                         raise ValueError("arguments must be an object")
                     self.ui.put(("tool", (self._tool_label(call.name), arguments)))
-                    high_risk = self._high_risk_call(call.name, arguments)
-                    decision = self.policy.decide(
-                        self._policy_name(call.name, arguments),
-                        execution_requested=self._execution_requested(original_text),
-                        full_access=self.full_access,
-                        task_authorized=self._task_authorized(),
-                        high_risk=high_risk,
-                    )
-                    if decision.kind.value == "deny":
-                        result = {"ok": False, "error": decision.reason}
-                    elif decision.kind.value == "confirm":
-                        summary = self._summary(call.name, arguments)
-                        if self._is_task_scoped(call.name, arguments) and not high_risk and not self._task_authorized():
-                            summary = "Authorize task: " + original_text[:180]
-                        request = self.request_approval(call.name, arguments, decision.risk, summary)
-                        self._pending_execution = (call, continue_input(transcript, response, []), original_text)
-                        return
-                    else:
+                    if self._officecli_auto_approval(call.name, arguments):
                         result = self._run_local_tool(call.name, arguments)
+                    else:
+                        high_risk = self._high_risk_call(call.name, arguments)
+                        decision = self.policy.decide(
+                            self._policy_name(call.name, arguments),
+                            execution_requested=self._execution_requested(original_text),
+                            full_access=self.full_access,
+                            task_authorized=self._task_authorized(),
+                            high_risk=high_risk,
+                        )
+                        if decision.kind.value == "deny":
+                            result = {"ok": False, "error": decision.reason}
+                        elif decision.kind.value == "confirm":
+                            summary = self._summary(call.name, arguments)
+                            if self._is_task_scoped(call.name, arguments) and not high_risk and not self._task_authorized():
+                                summary = "Authorize task: " + original_text[:180]
+                            request = self.request_approval(call.name, arguments, decision.risk, summary)
+                            self._pending_execution = (call, continue_input(transcript, response, []), original_text)
+                            return
+                        else:
+                            result = self._run_local_tool(call.name, arguments)
                 except (json.JSONDecodeError, ValueError) as exc:
                     result = {"ok": False, "error": f"Invalid function call: {exc}"}
                 outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
@@ -666,6 +670,13 @@ class AgentRuntime:
         cleaned = str(text or "").strip()
         cleaned = re.sub(r"^(?:\[Attached:[^\n]*\]\s*)+", "", cleaned, flags=re.IGNORECASE)
         return " ".join(cleaned.split()) or "Desktop task"
+
+    def _officecli_auto_approval(self, name: str, arguments: dict[str, Any]) -> bool:
+        """Allow only configured OfficeCLI generation/update verbs to skip confirmation."""
+        if not (OFFICECLI_AUTO_APPROVE and self.full_access and self.mcp):
+            return False
+        checker = getattr(self.mcp, "is_auto_approvable", None)
+        return bool(checker and checker(name, arguments))
 
     def _high_risk_call(self, name: str, arguments: dict[str, Any]) -> bool:
         if name == "shell_run":

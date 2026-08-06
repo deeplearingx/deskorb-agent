@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import Any
 
 from config import (API_BASE_URL, API_CONTEXT_RECENT_TURNS, API_CONTEXT_SUMMARY_TOKENS,
-                    API_CONTEXT_TOKEN_BUDGET, API_MODEL, API_PROXY_URL, API_TIMEOUT,
-                    CONNECTION_BACKEND, MODEL, PERMISSION_MODE, SYSTEM_APPEND, WORKING_DIR)
+                    API_CONTEXT_TOKEN_BUDGET, API_IMAGE_INPUT_ENABLED, API_MODEL,
+                    API_PROXY_URL, API_TIMEOUT, CONNECTION_BACKEND, MODEL,
+                    PERMISSION_MODE, SYSTEM_APPEND, WORKING_DIR)
 from agent_runtime import AgentRuntime
 from conversation_context import ConversationContext
 from credential_store import get_api_key
@@ -361,12 +362,14 @@ class CodexWorker(threading.Thread):
         previous_office_generation = getattr(self, "_office_event_generation", None)
         self._office_event_generation = office_generation if office_plan else None
         active = self._resolved_backend()
+        remote_image_paths = self._remote_image_paths(image_paths, active)
         self.ui.put(("backend", self._backend_status()))
         try:
             if active == "api":
                 try:
-                    self._run_api_turn(
-                        text, image_paths, ephemeral=ephemeral,
+                    self._run_api_or_officecli_turn(
+                        text, remote_image_paths, ephemeral=ephemeral,
+                        office_context=office_context,
                         office_plan=office_plan, office_generation=office_generation,
                     )
                 except BaseException as exc:
@@ -382,7 +385,7 @@ class CodexWorker(threading.Thread):
             elif active == "agent":
                 try:
                     self._run_agent_turn(
-                        text, image_paths, ephemeral=ephemeral,
+                        text, remote_image_paths, ephemeral=ephemeral,
                         office_plan=office_plan, office_context=office_context,
                         office_generation=office_generation,
                     )
@@ -412,6 +415,45 @@ class CodexWorker(threading.Thread):
             self._office_event_generation = previous_office_generation
             done_payload = office_generation if office_generation is not None else None
             self.ui.put(("office_plan_done" if office_plan else "turn_done", done_payload))
+
+    def _remote_image_paths(self, image_paths: list[str], active: str) -> list[str]:
+        """Avoid sending automatic screenshots to providers configured as text-only."""
+        paths = list(image_paths or [])
+        if active not in {"api", "agent"} or API_IMAGE_INPUT_ENABLED or not paths:
+            return paths
+        dbg("api_images_omitted", {"count": len(paths), "reason": "text_only_default"})
+        self.ui.put((
+            "diagnostic",
+            f"当前 API 模式已忽略 {len(paths)} 个截图/图片；模型配置为文本输入。"
+            "如确认模型支持图片，可设置 DESKORB_AGENT_API_IMAGE_INPUT=1。",
+        ))
+        return []
+
+    def _officecli_task_requested(self, text: str) -> bool:
+        """Use the existing MCP router to detect an OfficeCLI task without spawning it."""
+        try:
+            return "officecli" in self._agent._mcp_servers_for_task(text)
+        except Exception as exc:
+            dbg("officecli_route_error", {"error": self._short_status(str(exc))})
+            return False
+
+    def _run_api_or_officecli_turn(self, text: str, image_paths: list[str],
+                                   ephemeral: bool = False, office_plan: bool = False,
+                                   office_context: bool = False,
+                                   office_generation: int | None = None):
+        """Use the MCP-capable runtime for OfficeCLI while retaining plain API chat."""
+        pending_agent_action = getattr(self._agent.approvals, "pending", None) is not None
+        if not office_plan and (pending_agent_action or self._officecli_task_requested(text)):
+            dbg("backend_route", {"from": "api", "to": "agent", "reason": "officecli"})
+            self.ui.put(("diagnostic", "OfficeCLI 请求已切换到本地 MCP Agent Runtime。"))
+            return self._run_agent_turn(
+                text, image_paths, ephemeral=ephemeral, office_plan=office_plan,
+                office_context=office_context, office_generation=office_generation,
+            )
+        return self._run_api_turn(
+            text, image_paths, ephemeral=ephemeral, office_plan=office_plan,
+            office_generation=office_generation,
+        )
 
     def _run_codex_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                          office_plan: bool = False, office_generation: int | None = None):

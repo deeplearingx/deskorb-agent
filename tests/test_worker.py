@@ -55,6 +55,37 @@ class CodexWorkerTests(unittest.TestCase):
         with patch("worker.get_api_key", return_value="secret"):
             self.assertEqual(self.worker._resolved_backend(), "agent")
 
+    def test_api_backend_does_not_send_images_to_text_only_provider(self):
+        self.worker._backend = "api"
+        with patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn("请回答这个问题", ["C:/tmp/auto-shot.png"])
+        run_api.assert_called_once_with(
+            "请回答这个问题", [], ephemeral=False, office_plan=False, office_generation=None,
+        )
+
+    def test_api_backend_routes_officecli_tasks_to_mcp_agent_runtime(self):
+        self.worker._backend = "api"
+        with patch.object(self.worker._agent, "_mcp_servers_for_task", return_value=("officecli",)), \
+             patch.object(self.worker, "_run_agent_turn") as run_agent, \
+             patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn(
+                "请使用 OfficeCLI 创建一个 docx 文件", ["C:/tmp/auto-shot.png"],
+            )
+        run_agent.assert_called_once_with(
+            "请使用 OfficeCLI 创建一个 docx 文件", [], ephemeral=False,
+            office_plan=False, office_context=False, office_generation=None,
+        )
+        run_api.assert_not_called()
+
+    def test_api_backend_routes_pending_agent_confirmation_to_mcp_runtime(self):
+        self.worker._backend = "api"
+        self.worker._agent.approvals.pending = object()
+        with patch.object(self.worker, "_run_agent_turn") as run_agent, \
+             patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn("确认 ABC123", [])
+        run_agent.assert_called_once()
+        run_api.assert_not_called()
+
     def test_agent_backend_routes_to_independent_runtime(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "run_turn") as run_turn:

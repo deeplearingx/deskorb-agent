@@ -184,6 +184,35 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(decision.kind.value, "confirm")
         self.assertIn("OfficeCLI file operation: set report.docx", runtime._summary(name, write))
 
+    def test_officecli_auto_approval_executes_generation_without_confirmation(self):
+        class OfficeClient:
+            def list_tools(self):
+                return [{"name": "officecli", "inputSchema": {
+                    "type": "object", "properties": {"command": {}}, "required": ["command"]}}]
+
+            def close(self):
+                return None
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        runtime.mcp.clients = {"officecli": OfficeClient()}
+        name = runtime.mcp.schemas(["officecli"])[0]["name"]
+        runtime._request = Mock(side_effect=[
+            {"output": [{"type": "function_call", "call_id": "call-1", "name": name,
+                         "arguments": '{"command":["create","report.docx"]}'}]},
+            {"output_text": "created", "output": []},
+        ])
+        events = runtime.ui
+        with patch("agent_runtime.get_api_key", return_value="test-key"), \
+             patch("agent_runtime.OFFICECLI_AUTO_APPROVE", True, create=True), \
+             patch.object(runtime, "_run_local_tool", return_value={"ok": True}) as run_local:
+            runtime.run_turn("create report.docx", [])
+        event_list = []
+        while not events.empty():
+            event_list.append(events.get_nowait())
+        self.assertFalse(any(kind == "approval" for kind, _ in event_list))
+        run_local.assert_called_once()
+
     def test_window_control_schema_is_non_strict_for_optional_bounds(self):
         schema = next(item for item in ControlledTools.schemas() if item["name"] == "window_control")
         self.assertFalse(schema["strict"])

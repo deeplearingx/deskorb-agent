@@ -39,8 +39,14 @@ Configuration overrides:
   window region; it defaults to the frameless-window setting.
 - `DESKORB_AGENT_RECENT_TURNS`: verbatim API recency window (defaults to `6`)
 - `DESKORB_AGENT_SUMMARY_TOKENS`: rolling-summary output cap (defaults to `1200`)
+- `DESKORB_AGENT_API_IMAGE_INPUT`: set to `1` only when the selected API model accepts
+  Responses API image input; defaults to `0` for text-only endpoints such as the tested
+  `glm-5.2` configuration
 - `DESKORB_AGENT_OFFICE_MAX_NONEMPTY_CELLS`: Excel attachment cell cap (defaults to `10000`)
 - `DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS`: Office attachment character cap (defaults to `120000`)
+- `DESKORB_AGENT_OFFICECLI_AUTO_APPROVE`: OfficeCLI `create/add/set/save`-style
+  generation/update operations skip confirmation by default; set to `0` to restore
+  explicit confirmations. Destructive `remove/move/close` operations remain guarded.
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
 - `DESKORB_AGENT_SERVICE_TIER`: CLI service tier (defaults to `fast`)
 - `DESKORB_AGENT_SHOT_SCOPE`: `screens` or `window`
@@ -81,8 +87,12 @@ outside version control.
 `model_name` must be a model ID, not an API URL. Environment variables and the
 settings window take precedence over this file.
 
-API mode provides chat and image/screenshot understanding. Use **agent** mode for
-local shell/file tools and Windows mouse/keyboard control; Codex mode is optional.
+API mode provides direct text chat. Use **agent** mode for local shell/file tools and
+Windows mouse/keyboard control; Codex mode is optional. If API mode receives an
+OfficeCLI task, DeskOrb automatically routes that task through the MCP-capable Agent
+Runtime. Automatic screenshots are omitted from API/Agent requests by default because
+the configured `glm-5.2` endpoint accepts text only; enable them only after verifying
+the selected model supports image input.
 
 ### Local MCP: browser, PowerToys, and OfficeCLI
 
@@ -123,7 +133,9 @@ machine where DeskOrb runs. If the binary is in a non-default location, set
 `DESKORB_AGENT_OFFICECLI_BINARY=C:\path\to\officecli.exe`. Set
 `DESKORB_AGENT_OFFICECLI=0` to disable automatic discovery. Ordinary desktop tasks do
 not start OfficeCLI; a matching Office file request loads it lazily. OfficeCLI write
-commands always require a fresh confirmation showing the requested path.
+generation and update commands are automatically approved by the local runtime by default;
+destructive `remove`, `move`, and `close` commands still require confirmation. Set
+`DESKORB_AGENT_OFFICECLI_AUTO_APPROVE=0` to require confirmation for all OfficeCLI mutations.
 
 OfficeCLI operates on files saved to disk. The existing Word/Excel attachment and COM
 workflow remains the right path for active documents with unsaved edits. Do not ask

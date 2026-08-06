@@ -355,6 +355,13 @@ class MCPToolBridge:
             return not action
         return _officecli_command_verb(arguments.get("command")) in OFFICECLI_READ_ONLY_VERBS
 
+    def is_auto_approvable(self, exposed_name: str, arguments: dict[str, Any]) -> bool:
+        """Return whether an OfficeCLI generation/update verb may skip confirmation."""
+        item = self._tools.get(exposed_name)
+        if not item or item[0] != "officecli":
+            return False
+        return _officecli_command_verb(arguments.get("command")) in OFFICECLI_AUTO_APPROVE_VERBS
+
     def call(self, exposed_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         item = self._tools.get(exposed_name)
         if not item:
@@ -458,6 +465,11 @@ class MCPToolBridge:
 
 OFFICECLI_READ_ONLY_VERBS = frozenset({
     "help", "load_skill", "view", "get", "query", "validate", "dump",
+})
+
+OFFICECLI_AUTO_APPROVE_VERBS = frozenset({
+    "create", "set", "add", "swap", "batch", "merge", "import", "raw-set",
+    "add-part", "save", "refresh",
 })
 
 
