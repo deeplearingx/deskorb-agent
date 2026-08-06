@@ -76,6 +76,13 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(runtime._mcp_servers_for_task("启用 PowerToys 保持唤醒"), ("powertoys",))
         self.assertEqual(runtime._mcp_servers_for_task("打开记事本并输入 hello"), ())
 
+    def test_mcp_router_recognizes_natural_language_office_file_requests(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        for task in ("创建一个word文档", "创建一个 Word 文档", "创建word和ppt",
+                     "创建一个ppt演示文稿", "创建一个excel文件"):
+            with self.subTest(task=task):
+                self.assertIn("officecli", runtime._mcp_servers_for_task(task))
+
     def test_mcp_router_uses_custom_intent_keywords_and_discovery_tool(self):
         class FakeMcp:
             available_servers = ("knowledge",)

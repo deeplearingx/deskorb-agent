@@ -273,8 +273,11 @@ SYSTEM_APPEND = (
     "once) instead of re-walking the object model, and don't re-read everything to verify "
     "after each write. (3) For Excel bulk writes, set Application.ScreenUpdating=$false, "
     "Calculation=xlManual and EnableEvents=$false around them, then restore. (4) For large "
-    "purely-textual edits where the live open document isn't needed, python-pptx/openpyxl "
-    "on the file is far faster than COM — but only when the file is NOT open in Office."
+    "saved disk-backed .docx, .xlsx, or .pptx requests, prefer the OfficeCLI MCP tool when it is "
+    "available: use it for create, read, modify, validate, and render operations. Do not use "
+    "python-docx, python-pptx/openpyxl, or shell scripts as a substitute, and do not claim to have "
+    "used OfficeCLI without calling its MCP tool. Use COM only for active Word/Excel documents with "
+    "unsaved edits; if OfficeCLI is unavailable, say so explicitly."
 )
 
 THEMES = {

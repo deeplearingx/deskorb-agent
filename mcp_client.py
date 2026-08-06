@@ -100,9 +100,15 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                 cwd=str(root),
                 intent_keywords=(
                     "officecli", "docx", ".docx", "word document",
+                    "word 文档", "word文档", "word 文件", "word文件",
+                    "创建 word", "创建word", "生成 word", "生成word",
                     "xlsx", ".xlsx", "excel workbook",
+                    "excel 文档", "excel文档", "excel 文件", "excel文件", "excelfile",
+                    "创建 excel", "创建excel", "生成 excel", "生成excel",
                     "pptx", ".pptx", "powerpoint",
-                    "word 文件", "excel 文件", "powerpoint 演示文稿",
+                    "ppt", "ppt 演示文稿", "ppt演示文稿",
+                    "创建 ppt", "创建ppt", "生成 ppt", "生成ppt",
+                    "powerpoint 演示文稿",
                     "文档生成", "演示文稿", "工作簿",
                 ),
                 description="Create, read, modify, validate, and render Office files.",
@@ -324,7 +330,7 @@ class MCPToolBridge:
         """
         return [
             {"name": spec.name, "description": spec.description[:240],
-             "keywords": list(spec.intent_keywords[:16])}
+             "keywords": list(spec.intent_keywords[:64])}
             for spec in self.specs
         ]
 
