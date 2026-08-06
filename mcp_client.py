@@ -35,7 +35,31 @@ class MCPServerSpec:
     description: str = ""
 
 
-def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool = True) -> list[MCPServerSpec]:
+def resolve_officecli_binary(explicit: str | Path | None = None) -> str | None:
+    """Find the optional self-contained OfficeCLI executable without starting it."""
+    root = Path(__file__).resolve().parent
+    configured = str(explicit or os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "")).strip()
+    candidates: list[Path] = []
+    if configured:
+        configured_path = Path(configured).expanduser()
+        candidates.append(configured_path if configured_path.is_absolute() else root / configured_path)
+    candidates.extend([
+        root / "tools" / "officecli" / "officecli.exe",
+        root / "OfficeCLI-main" / "build" / "release" / "officecli-win-x64.exe",
+    ])
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    for command in ("officecli.exe", "officecli"):
+        found = shutil.which(command)
+        if found:
+            return str(Path(found).resolve())
+    return None
+
+
+def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool = True,
+                     enable_officecli: bool = True,
+                     officecli_binary: str | Path | None = None) -> list[MCPServerSpec]:
     """Load trusted local servers from a standard ``mcpServers`` JSON file."""
     value = str(config_path or "").strip()
     if value:
@@ -51,8 +75,6 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
             raise MCPError("MCP config must contain an object named mcpServers.")
         result = [_parse_server(name, spec, path.parent) for name, spec in servers.items()]
         return [spec for spec in result if spec is not None]
-    if not enable_playwright:
-        return []
     root = Path(__file__).resolve().parent
     interpreter = Path(sys.executable)
     # The overlay is commonly launched by pythonw.exe.  Use python.exe for the
@@ -60,10 +82,32 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
     console_python = interpreter.with_name("python.exe") if interpreter.name.lower() == "pythonw.exe" else interpreter
     if not console_python.is_file():
         console_python = interpreter
-    return [
-        MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest"), {}, None),
-        MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root)),
-    ]
+    result: list[MCPServerSpec] = []
+    if enable_playwright:
+        result.append(MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest"), {}, None))
+    result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root)))
+    if enable_officecli:
+        binary = resolve_officecli_binary(officecli_binary)
+        if binary:
+            result.append(MCPServerSpec(
+                name="officecli",
+                command=binary,
+                args=("mcp",),
+                env={
+                    "OFFICECLI_SKIP_UPDATE": "1",
+                    "OFFICECLI_NO_AUTO_RESIDENT": "1",
+                },
+                cwd=str(root),
+                intent_keywords=(
+                    "officecli", "docx", ".docx", "word document",
+                    "xlsx", ".xlsx", "excel workbook",
+                    "pptx", ".pptx", "powerpoint",
+                    "word 文件", "excel 文件", "powerpoint 演示文稿",
+                    "文档生成", "演示文稿", "工作簿",
+                ),
+                description="Create, read, modify, validate, and render Office files.",
+            ))
+    return result
 
 
 def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
@@ -226,8 +270,11 @@ class MCPToolBridge:
     HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore")
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
+                 enable_officecli: bool = True, officecli_binary: str | Path | None = None,
                  timeout_seconds: int = 30):
-        self.specs = load_mcp_servers(config_path, enable_playwright=enable_playwright)
+        self.specs = load_mcp_servers(config_path, enable_playwright=enable_playwright,
+                                      enable_officecli=enable_officecli,
+                                      officecli_binary=officecli_binary)
         self.timeout_seconds = timeout_seconds
         self.clients = {spec.name: StdioMCPClient(spec, timeout_seconds=timeout_seconds) for spec in self.specs}
         self._tools: dict[str, tuple[str, str, dict[str, Any], bool]] = {}
@@ -256,7 +303,7 @@ class MCPToolBridge:
             if server not in selected:
                 continue
             parameters = _json_schema_object(schema)
-            if action:
+            if action and server != "officecli":
                 properties = dict(parameters.get("properties") or {})
                 properties["_deskorb_risk_level"] = {"type": "string", "enum": ["normal", "high"]}
                 properties["_deskorb_risk_reason"] = {"type": "string"}
@@ -288,6 +335,20 @@ class MCPToolBridge:
         item = self._tools.get(name)
         return bool(item and item[3])
 
+    def server_name(self, exposed_name: str) -> str | None:
+        item = self._tools.get(exposed_name)
+        return item[0] if item else None
+
+    def is_read_only_call(self, exposed_name: str, arguments: dict[str, Any]) -> bool:
+        """Classify a call whose risk depends on its OfficeCLI command verb."""
+        item = self._tools.get(exposed_name)
+        if not item:
+            return False
+        server, _original, _schema, action = item
+        if server != "officecli":
+            return not action
+        return _officecli_command_verb(arguments.get("command")) in OFFICECLI_READ_ONLY_VERBS
+
     def call(self, exposed_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         item = self._tools.get(exposed_name)
         if not item:
@@ -297,10 +358,18 @@ class MCPToolBridge:
         try:
             result = self.clients[server].call_tool(original, clean)
         except MCPError as exc:
-            return {"ok": False, "error": str(exc)}
+            message = str(exc)
+            if server == "officecli":
+                message = self._officecli_error_message(exposed_name, arguments, message)
+            return {"ok": False, "error": message}
         content = result.get("content", result)
         rendered = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         cap = 64 * 1024
+        if server == "officecli" and result.get("isError"):
+            return {"ok": False, "server": server, "tool": original,
+                    "content": content if len(rendered) <= cap else rendered[:cap],
+                    "truncated": len(rendered) > cap,
+                    "error": self._officecli_error_message(exposed_name, arguments, rendered)}
         return {"ok": not bool(result.get("isError")), "server": server, "tool": original,
                 "content": content if len(rendered) <= cap else rendered[:cap],
                 "truncated": len(rendered) > cap}
@@ -341,16 +410,87 @@ class MCPToolBridge:
         lowered = tool_name.lower()
         return not any(word in lowered for word in self.READ_ONLY_WORDS)
 
-    def is_high_risk(self, name: str) -> bool:
+    def is_high_risk(self, name: str, arguments: dict[str, Any] | None = None) -> bool:
         item = self._tools.get(name)
+        if item and item[0] == "officecli":
+            return not self.is_read_only_call(name, arguments or {})
         return bool(item and any(word in item[1].lower() for word in self.HIGH_RISK_WORDS))
+
+    def command_summary(self, exposed_name: str, arguments: dict[str, Any]) -> str:
+        """Return a bounded, user-facing summary for a tool call."""
+        command = arguments.get("command")
+        if self.server_name(exposed_name) != "officecli":
+            return exposed_name + " requested"
+        if isinstance(command, list):
+            rendered = " ".join(str(item) for item in command)
+        elif isinstance(command, str):
+            rendered = command.strip()
+        else:
+            rendered = "<missing command>"
+        return ("OfficeCLI file operation: " + rendered)[:240]
+
+    def _officecli_error_message(self, exposed_name: str, arguments: dict[str, Any], message: str) -> str:
+        lowered = message.lower()
+        if any(marker in lowered for marker in (
+                "file_locked", "file locked", "file is locked", "sharing violation",
+                "being used by another process", "cannot access the file", "file is in use")):
+            return (self.command_summary(exposed_name, arguments)
+                    + ". The file appears to be locked. Save and close it in Word or Excel, "
+                      "then try again. OfficeCLI reported: " + message[:400])
+        return message[:1024]
 
     @staticmethod
     def _description(server: str, original: str, action: bool) -> str:
+        if server == "officecli":
+            prefix = "Office file action" if action else "Read-only Office file operation"
+            return f"{prefix} from trusted local MCP server {server}: {original}."
         prefix = "Browser/local MCP action" if action else "Read-only browser/local MCP observation"
         suffix = (" Supply _deskorb_risk_level=high only for a consequential action such as submitting, "
                   "sending, purchasing, deleting, uploading private data, or changing permissions." if action else "")
         return f"{prefix} from trusted local MCP server {server}: {original}." + suffix
+
+
+OFFICECLI_READ_ONLY_VERBS = frozenset({
+    "help", "load_skill", "view", "get", "query", "validate", "dump",
+})
+
+
+def _officecli_command_verb(command: Any) -> str | None:
+    if isinstance(command, (list, tuple)):
+        tokens = [str(item) for item in command]
+    elif isinstance(command, str):
+        tokens = _split_command(command)
+    else:
+        return None
+    while tokens and tokens[0].lower() in {"officecli", "officecli.exe"}:
+        tokens.pop(0)
+    if not tokens:
+        return None
+    return tokens[0].strip().lower() or None
+
+
+def _split_command(command: str) -> list[str]:
+    """Split only enough to find the first verb, preserving Windows paths."""
+    tokens: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    for char in command.strip():
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                current.append(char)
+        elif char in {"'", '"'}:
+            quote = char
+        elif char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 def _exposed_tool_name(server: str, original: str, existing: dict[str, Any]) -> str:

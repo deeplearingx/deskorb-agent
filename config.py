@@ -72,6 +72,8 @@ OFFICE_MAX_RENDERED_CHARS = _env_int("DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS", 
 # to replace or add trusted local servers; set PLAYWRIGHT_MCP=0 to disable the default.
 MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
 PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
+OFFICECLI_ENABLED = _env_bool("DESKORB_AGENT_OFFICECLI", True)
+OFFICECLI_BINARY = os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "").strip()
 MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
 PERMISSION_MODE = "workspace-write"
                                  # the STARTUP permission mode; flip it at run time with the

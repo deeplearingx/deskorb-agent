@@ -2,8 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from mcp_client import MCPToolBridge, load_mcp_servers
+from mcp_client import MCPToolBridge, load_mcp_servers, resolve_officecli_binary
 
 
 class FakeClient:
@@ -65,6 +66,93 @@ class MCPClientTests(unittest.TestCase):
         self.assertIn("powertoys", names)
         powertoys = next(spec for spec in specs if spec.name == "powertoys")
         self.assertTrue(powertoys.args[-1].endswith("powertoys_mcp.py"))
+
+    def test_default_servers_include_officecli_when_binary_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "officecli.exe"
+            binary.write_bytes(b"stub")
+            specs = load_mcp_servers(None, officecli_binary=binary)
+        officecli = next(spec for spec in specs if spec.name == "officecli")
+        self.assertEqual(officecli.args, ("mcp",))
+        self.assertEqual(officecli.env["OFFICECLI_SKIP_UPDATE"], "1")
+        self.assertIn("docx", officecli.intent_keywords)
+
+    def test_officecli_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "officecli.exe"
+            binary.write_bytes(b"stub")
+            specs = load_mcp_servers(None, enable_officecli=False, officecli_binary=binary)
+        self.assertNotIn("officecli", [spec.name for spec in specs])
+
+    def test_missing_officecli_binary_does_not_break_existing_mcp(self):
+        with patch("mcp_client.resolve_officecli_binary", return_value=None):
+            specs = load_mcp_servers(None, officecli_binary=Path("missing-officecli.exe"))
+        self.assertEqual([spec.name for spec in specs[:2]], ["playwright", "powertoys"])
+        self.assertNotIn("officecli", [spec.name for spec in specs])
+
+    def test_custom_mcp_config_preserves_existing_replacement_semantics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "officecli.exe"
+            binary.write_bytes(b"stub")
+            path = root / "mcp.json"
+            path.write_text(json.dumps({"mcpServers": {
+                "knowledge": {"command": "knowledge-mcp"},
+            }}), encoding="utf-8")
+            specs = load_mcp_servers(path, officecli_binary=binary)
+        self.assertEqual([spec.name for spec in specs], ["knowledge"])
+
+    def test_officecli_binary_resolution_uses_explicit_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "officecli.exe"
+            binary.write_bytes(b"stub")
+            self.assertEqual(resolve_officecli_binary(binary), str(binary.resolve()))
+
+    def test_officecli_command_verbs_are_classified_from_arrays_and_strings(self):
+        class OfficeClient:
+            def list_tools(self):
+                return [{"name": "officecli", "inputSchema": {
+                    "type": "object", "properties": {"command": {}}, "required": ["command"]}}]
+
+            def close(self):
+                return None
+
+        bridge = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        bridge.clients = {"officecli": OfficeClient()}
+        office_schema = bridge.schemas(["officecli"])[0]
+        name = office_schema["name"]
+        self.assertEqual(office_schema["parameters"]["required"], ["command"])
+        self.assertEqual(bridge.server_name(name), "officecli")
+        self.assertTrue(bridge.is_read_only_call(name, {"command": ["view", "report.docx", "text"]}))
+        self.assertFalse(bridge.is_high_risk(name, {"command": 'view "report.docx" text'}))
+        self.assertFalse(bridge.is_read_only_call(name, {
+            "command": ["set", "report.docx", "/body/p[1]", "--prop", "text=Updated"]}))
+        self.assertTrue(bridge.is_high_risk(name, {
+            "command": 'set "report.docx" "/body/p[1]" --prop text=Updated'}))
+        self.assertTrue(bridge.is_high_risk(name, {"command": ["unknown", "report.docx"]}))
+        summary = bridge.command_summary(name, {"command": ["set", "report.docx", "/body/p[1]"]})
+        self.assertIn("OfficeCLI file operation:", summary)
+        self.assertIn("report.docx", summary)
+
+    def test_officecli_lock_errors_explain_save_and_close(self):
+        class LockedClient:
+            def list_tools(self):
+                return [{"name": "officecli", "inputSchema": {"type": "object"}}]
+
+            def call_tool(self, name, arguments):
+                return {"isError": True, "content": [{"type": "text",
+                        "text": "sharing violation: file is locked by another process"}]}
+
+            def close(self):
+                return None
+
+        bridge = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        bridge.clients = {"officecli": LockedClient()}
+        name = bridge.schemas(["officecli"])[0]["name"]
+        result = bridge.call(name, {"command": ["set", "C:\\Reports\\locked report.docx", "/body"]})
+        self.assertFalse(result["ok"])
+        self.assertIn("Save and close", result["error"])
+        self.assertIn("locked report.docx", result["error"])
 
     def test_powertoys_reads_are_observations_but_apply_is_forced_high_risk(self):
         class PowerToysClient:
