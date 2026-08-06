@@ -26,8 +26,10 @@ Configuration overrides:
 - `DESKORB_AGENT_WORKING_DIR`: working folder (defaults to your home folder)
 - `DESKORB_AGENT_MODEL`: startup model (defaults to `gpt-5.6-sol`)
 - `DESKORB_AGENT_BACKEND`: `agent`, `api`, `codex`, or `auto` (defaults to `agent`)
+- `DESKORB_AGENT_PROVIDER`: `auto`, `openai`, `responses`, `openai-compatible`,
+  `deepseek`, or `qwen` (defaults to `auto`; `auto` detects the configured base URL)
 - `DESKORB_AGENT_API_MODEL`: startup API model
-- `OPENAI_BASE_URL`: Responses-compatible API base URL (defaults to OpenAI `/v1`)
+- `OPENAI_BASE_URL`: API base URL (Responses for OpenAI, Chat Completions for compatible providers)
 - `DESKORB_AGENT_API_PROXY`: optional HTTP/HTTPS proxy URL
 - `DESKORB_AGENT_CONTEXT_TOKENS`: API context budget (defaults to `24000`)
 - `DESKORB_AGENT_SHOW_IN_SCREEN_SHARE`: whether the overlay appears in screen shares
@@ -48,6 +50,8 @@ Configuration overrides:
   generation/update operations skip confirmation by default; set to `0` to restore
   explicit confirmations. Destructive `remove/move/close` operations remain guarded.
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
+- `DEEPSEEK_API_KEY`, `QWEN_API_KEY`, `DASHSCOPE_API_KEY`: provider-specific keys when
+  `DESKORB_AGENT_PROVIDER` selects a compatible provider; they are not sent to another provider
 - `DESKORB_AGENT_SERVICE_TIER`: CLI service tier (defaults to `fast`)
 - `DESKORB_AGENT_SHOT_SCOPE`: `screens` or `window`
 
@@ -81,6 +85,9 @@ url: https://provider.example/v1
 model_name: gpt-5.6-terra
 ```
 
+Provider-specific `.env` keys such as `deepseek_api_key` and `qwen_api_key` are also
+accepted. The long-lived process reloads the `.env` file after an in-place edit.
+
 Use [`.env.example`](.env.example) as a safe template. Keep the real `.env`
 outside version control.
 
@@ -88,7 +95,9 @@ outside version control.
 settings window take precedence over this file.
 
 API mode provides direct text chat. Use **agent** mode for local shell/file tools and
-Windows mouse/keyboard control; Codex mode is optional. If API mode receives an
+Windows mouse/keyboard control; Codex mode is optional. When
+`DESKORB_AGENT_PROVIDER=deepseek` or `qwen` is set, the runtime uses that provider's
+Chat Completions endpoint while retaining the same internal tool transcript. If API mode receives an
 OfficeCLI task, DeskOrb automatically routes that task through the MCP-capable Agent
 Runtime. Automatic screenshots are omitted from API/Agent requests by default because
 the configured `glm-5.2` endpoint accepts text only; enable them only after verifying

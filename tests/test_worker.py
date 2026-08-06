@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from config import API_BASE_URL, API_MODEL
+from model_adapter import ModelAdapter
 from worker import CodexWorker
 
 
@@ -222,6 +223,26 @@ class CodexWorkerTests(unittest.TestCase):
             [(item.role, item.text) for item in self.worker._api_context.messages],
             [("user", "hello"), ("assistant", "fast")],
         )
+
+    def test_chat_completion_stream_becomes_delta_and_keeps_local_history(self):
+        class FakeResponse:
+            def __iter__(self):
+                return iter([
+                    b'data: {"choices":[{"delta":{"content":"chat"},"finish_reason":null}]}\n',
+                    b'data: {"choices":[{"delta":{"content":" reply"},"finish_reason":"stop"}]}\n',
+                    b'data: [DONE]\n',
+                ])
+
+            def close(self):
+                pass
+
+        self.worker._model = "deepseek-chat"
+        self.worker._adapter = ModelAdapter("deepseek", "https://api.deepseek.com")
+        self.worker._api_base_url = self.worker._adapter.profile.base_url
+        with patch("worker.get_api_key", return_value="secret"), \
+             patch("worker.urllib.request.urlopen", return_value=FakeResponse()):
+            self.worker._run_api_turn("hello", [])
+        self.assertIn(("delta", "chat"), self.drain())
 
     def test_api_history_is_included_in_next_request(self):
         self.worker._api_context.add_turn("remember CEDAR-91", "Stored.")

@@ -6,7 +6,8 @@ so anything may import it without a circular-import risk."""
 import os
 from pathlib import Path
 
-from provider_env import api_base_url as _provider_api_base_url, api_model as _provider_api_model
+from provider_env import (api_base_url as _provider_api_base_url, api_model as _provider_api_model,
+                          model_provider as _provider_model_provider)
 
 __version__ = "0.2.0"
 
@@ -56,6 +57,7 @@ MODELS = [("GPT-5.6 Sol", "gpt-5.6-sol"),
 CONNECTION_BACKEND = os.environ.get("DESKORB_AGENT_BACKEND", os.environ.get("CODEX_OVERLAY_BACKEND", "agent")).strip().lower()
 if CONNECTION_BACKEND not in ("auto", "codex", "api", "agent"):
     CONNECTION_BACKEND = "auto"
+MODEL_PROVIDER = _provider_model_provider("auto").strip().lower() or "auto"
 API_BASE_URL = (os.environ.get("OPENAI_BASE_URL", "").strip() or _provider_api_base_url()
                 or "https://api.openai.com/v1").rstrip("/")
 API_PROXY_URL = os.environ.get("DESKORB_AGENT_API_PROXY", os.environ.get("CODEX_OVERLAY_API_PROXY", "")).strip()
