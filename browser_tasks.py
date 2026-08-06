@@ -113,6 +113,19 @@ class BrowserTaskSpaces:
             return None
         return self._replace(space, state=BrowserSpaceState.BROKEN)
 
+    def reconnect(self, task_id: str | None, *, backend: str | None = None) -> BrowserTaskSpace | None:
+        """Create a fresh agent-owned space after the browser process is lost."""
+        space = self.for_task(task_id)
+        if space is None:
+            return self.create(str(task_id or ""), backend or "isolated-playwright")
+        if space.state in {BrowserSpaceState.COMPLETED, BrowserSpaceState.CANCELLED}:
+            return None
+        if space.state is not BrowserSpaceState.BROKEN:
+            return space
+        # ``create`` intentionally does not reuse BROKEN spaces, so the new
+        # space gets a new id and no stale page checkpoint or element refs.
+        return self.create(space.task_id, backend or space.backend)
+
     def _replace(self, space: BrowserTaskSpace, *, owner: BrowserOwner | None = None,
                  state: BrowserSpaceState | None = None, checkpoint: str | None = None,
                  last_observed_at: float | None = None) -> BrowserTaskSpace:

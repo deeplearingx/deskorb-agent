@@ -212,6 +212,9 @@ class Overlay:
         self._cli_update_shown = False    # show the "CLI is out of date" notice at most once/session
         self._cli_update_btn_ref = None   # the in-chat Update button, so its result can restyle it
         self._restarting = False          # guard: one self-restart (relaunch + quit) at a time
+        self._task_control_state = "idle"
+        self._task_control_id = None
+        self._task_control_card = None
         self._mapping = False             # re-entrancy guard for the <Map> taskbar re-assert
         self._fronting = False            # re-entrancy guard for _raise_to_front (focus churn)
         self._vscreen_sig = None          # last virtual-desktop bounding box (display-topology sig)
@@ -1076,6 +1079,13 @@ class Overlay:
         self._paint_screen_toggle()
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
+        self.task_pause_chip = self._chip(st, "暂停", self._pause_task)
+        self.task_handoff_chip = self._chip(st, "接管", self._handoff_task)
+        self.task_evidence_chip = self._chip(st, "证据", self._show_task_evidence)
+        self.task_cancel_chip = self._chip(st, "取消任务", self._cancel_paused_task)
+        for chip in (self.task_pause_chip, self.task_handoff_chip,
+                     self.task_evidence_chip, self.task_cancel_chip):
+            chip.pack_forget()
         # The Window-only / Shareable / Read-only toggles used to sit inline here, which
         # crowded the bar. They now live behind a single ⚙ settings menu (see _gear_menu).
         # The gear turns the accent color while Read-only is ON, so that safety state stays
@@ -3008,6 +3018,172 @@ class Overlay:
         self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
 
+    # ── task controls ───────────────────────────────────────────────────────
+    def _set_task_control_ui(self, state, task_id=None):
+        """Keep pause/continue/handoff/evidence controls in one compact rail."""
+        state = str(state or "idle")
+        if task_id:
+            self._task_control_id = str(task_id)
+        self._task_control_state = state
+        widgets = [getattr(self, name, None) for name in (
+            "task_pause_chip", "task_handoff_chip", "task_evidence_chip", "task_cancel_chip")]
+        for widget in widgets:
+            if widget is None:
+                continue
+            try:
+                widget.pack_forget()
+            except Exception:
+                pass
+        pause = getattr(self, "task_pause_chip", None)
+        handoff = getattr(self, "task_handoff_chip", None)
+        evidence = getattr(self, "task_evidence_chip", None)
+        cancel = getattr(self, "task_cancel_chip", None)
+        if state in {"active", "running", "pause_requested", "handoff_requested", "resuming"}:
+            if pause is not None:
+                pause.configure(text="暂停" if state not in {"pause_requested", "handoff_requested"} else "暂停中…")
+                pause.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
+            if handoff is not None and state in {"active", "running"}:
+                handoff.configure(text="接管")
+                handoff.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
+            if evidence is not None:
+                evidence.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
+        elif state in {"paused", "handoff"}:
+            if pause is not None:
+                pause.configure(text="继续")
+                pause.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
+            if cancel is not None:
+                cancel.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
+            if evidence is not None:
+                evidence.pack(side="left", padx=(self.px(3), self.px(4)), pady=self.px(4))
+
+    def _pause_task(self):
+        if self._task_control_state in {"paused", "handoff"}:
+            self._resume_task()
+            return
+        result = self.worker.pause_task()
+        if isinstance(result, dict) and not result.get("ok"):
+            self.add_err(result.get("error") or "当前没有可暂停的任务")
+            return
+        self._set_status("pausing…")
+        self._set_task_control_ui("pause_requested", self._task_control_id)
+
+    def _handoff_task(self):
+        result = self.worker.handoff_task()
+        if isinstance(result, dict) and not result.get("ok"):
+            self.add_err(result.get("error") or "当前没有可接管的任务")
+            return
+        self._set_status("handing off…")
+        self._set_task_control_ui("handoff_requested", self._task_control_id)
+
+    def _resume_task(self):
+        if self._task_control_state not in {"paused", "handoff"}:
+            return
+        self._set_task_control_ui("resuming", self._task_control_id)
+        self._set_busy(True)
+        self._set_status("resuming task…")
+        self.worker.resume_paused_task()
+
+    def _cancel_paused_task(self):
+        if self._task_control_state not in {"paused", "handoff"}:
+            return
+        self.worker.cancel_paused_task()
+        self._set_status("cancelling task…")
+
+    def _show_task_evidence(self):
+        self.worker.request_task_evidence(self._task_control_id)
+        self._set_status("loading evidence…")
+
+    def add_task_control(self, payload):
+        """Render a resumable control card when the Agent yields the task."""
+        info = payload if isinstance(payload, dict) else {}
+        state = str(info.get("state") or "")
+        task_id = info.get("task_id") or self._task_control_id
+        if task_id:
+            self._task_control_id = str(task_id)
+        if state in {"pause_requested", "handoff_requested", "resuming"}:
+            self._set_task_control_ui(state, task_id)
+            return
+        if state in {"cancelled", "idle", "unsupported"}:
+            self._set_task_control_ui("idle", task_id)
+            if info.get("error"):
+                self.add_err(info.get("error"))
+            return
+        if state not in {"paused", "handoff"}:
+            return
+        self._set_task_control_ui(state, task_id)
+        self._set_status("desktop task handed off to you" if state == "handoff" else "task paused")
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["accent"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(9))
+        title = tk.Label(card, text=("你已接管桌面任务" if state == "handoff" else "任务已暂停"),
+                         bg=T["field"], fg=T["accent"], font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        detail = tk.Label(card,
+                          text=("你可以在目标窗口中完成手动步骤；完成后点击继续。Agent 会先重新观察，再恢复任务。"
+                                if state == "handoff" else
+                                "任务上下文保留在当前进程，继续前会重新确认授权并重新观察环境。"),
+                          bg=T["field"], fg=T["text"], font=self.f_small, justify="left",
+                          anchor="w", wraplength=self.px(320))
+        detail.pack(fill="x", pady=(self.px(3), self.px(8)))
+        actions = tk.Frame(card, bg=T["field"])
+        actions.pack(fill="x")
+        resume = tk.Button(actions, text="继续任务", command=self._resume_task,
+                           bg=T["accent"], fg=T["on_accent"], activebackground=T["accent"],
+                           activeforeground=T["on_accent"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        resume.pack(side="left")
+        cancel = tk.Button(actions, text="取消任务", command=self._cancel_paused_task,
+                           bg=T["field"], fg=T["muted"], activebackground=T["hover"],
+                           activeforeground=T["text"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        cancel.pack(side="left", padx=(self.px(6), 0))
+        for child in (card, title, detail, actions, resume, cancel):
+            child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
+    def add_task_evidence(self, payload):
+        """Render a compact structural evidence trail, never raw task content."""
+        info = payload if isinstance(payload, dict) else {}
+        if not info.get("ok"):
+            self.add_err(info.get("error") or "任务证据不可用")
+            return
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["border"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(8))
+        title = tk.Label(card, text=f"任务证据 · {info.get('status', 'unknown')}",
+                         bg=T["field"], fg=T["accent"], font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        events = info.get("events") if isinstance(info.get("events"), list) else []
+        lines = []
+        for event in events[-16:]:
+            if not isinstance(event, dict):
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            bits = [str(event.get("kind") or "event")]
+            for key in ("tool", "status", "ok", "verified", "evidence", "evidence_schema", "failure_kind"):
+                if key in data:
+                    bits.append(f"{key}={data[key]}")
+            lines.append(" · ".join(bits))
+        body = tk.Label(card, text="\n".join(lines) if lines else "暂无结构化事件",
+                        bg=T["field"], fg=T["text"], font=self.f_small, justify="left",
+                        anchor="w", wraplength=self.px(340))
+        body.pack(fill="x", pady=(self.px(4), 0))
+        for child in (card, title, body):
+            child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
     # ── "your CLI is out of date" notice + one-click update (see cliupdate.py) ──────────
     def _show_cli_update_notice(self, info):
         """Render the 'CLI is behind' notice + a one-click Update button in the chat. Shown at
@@ -3246,6 +3422,13 @@ class Overlay:
 
     def _dispatch_turn(self, prompt, shots, images, ephemeral=False,
                        current_context_consent=False):
+        # The overlay takes foreground focus while the user types. Preserve
+        # the last external window so the Agent runtime can reactivate it for
+        # UIA, mouse, and keyboard actions instead of treating the overlay as
+        # the action target.
+        setter = getattr(self.worker, "set_desktop_target", None)
+        if callable(setter):
+            setter(self._last_ext_fg or 0, self._hwnd())
         paths = [] if ephemeral else [s["path"] for s in (shots or [])] + list(images or [])
         if ephemeral:
             if current_context_consent:
@@ -3993,7 +4176,8 @@ class Overlay:
         if self.busy:
             self.add_sys("⏳ Finish (or Stop) the current reply before switching connection.")
             return
-        if value == "api" and not has_api_key():
+        key_provider = self._model_provider if self._model_provider not in {"", "auto"} else None
+        if value == "api" and not has_api_key(key_provider):
             self.add_sys("🔑 API Key 尚未配置；请在 Connection settings 中保存密钥。")
             self._open_connection_settings()
             return
@@ -4020,8 +4204,12 @@ class Overlay:
         base_var = tk.StringVar(value=self._api_base_url or API_BASE_URL)
         proxy_var = tk.StringVar(value=self._api_proxy_url)
         key_var = tk.StringVar()
-        status_var = tk.StringVar(value=("API Key: saved in Windows Credential Manager"
-                                         if has_api_key() else "API Key: not configured"))
+        def key_provider(value: str | None = None) -> str | None:
+            normalized = str(value if value is not None else provider_var.get()).strip().lower()
+            return normalized if normalized not in {"", "auto"} else None
+
+        status_var = tk.StringVar(value=("API Key: saved for selected provider"
+                                         if has_api_key(key_provider()) else "API Key: not configured"))
 
         body = tk.Frame(win, bg=T["bg"], padx=18, pady=16)
         body.grid(row=0, column=0, sticky="nsew")
@@ -4043,6 +4231,9 @@ class Overlay:
                                 activeforeground=T["on_accent"], bd=0, highlightthickness=0, width=28)
         provider_menu["menu"].configure(bg=T["field"], fg=T["text"])
         provider_menu.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=5)
+        provider_var.trace_add("write", lambda *_: status_var.set(
+            "API Key: saved for selected provider" if has_api_key(key_provider())
+            else "API Key: not configured"))
 
         entries = []
         for row, variable, show in ((2, model_var, ""), (3, base_var, ""),
@@ -4065,7 +4256,7 @@ class Overlay:
 
         def clear_key():
             try:
-                delete_api_key()
+                delete_api_key(key_provider())
                 key_var.set("")
                 status_var.set("API Key: removed")
             except Exception as exc:
@@ -4095,8 +4286,8 @@ class Overlay:
                 return
             try:
                 if key_var.get().strip():
-                    set_api_key(key_var.get())
-                if backend in ("api", "agent") and not has_api_key():
+                    set_api_key(key_var.get(), key_provider(provider))
+                if backend in ("api", "agent") and not has_api_key(key_provider(provider)):
                     error_var.set("API and Agent modes require an API Key.")
                     return
                 self._backend = backend
@@ -4331,20 +4522,35 @@ class Overlay:
             if payload:
                 self._precaptured = (payload, time.monotonic())
         elif kind == "status":
-            self._set_status(str(payload))
+            if not (str(payload or "") == "" and self._task_control_state in {"paused", "handoff"}):
+                self._set_status(str(payload))
         elif kind == "task_progress":
             if isinstance(payload, dict):
-                if payload.get("waiting_human"):
+                control_state = payload.get("control_state")
+                if control_state:
+                    self._set_task_control_ui(control_state, payload.get("task_id"))
+                    if control_state == "human_verification":
+                        self._set_status("waiting for manual verification…")
+                elif payload.get("terminal"):
+                    self._set_task_control_ui("idle", payload.get("task_id"))
+                if payload.get("waiting_human") and not control_state:
                     self._set_status("waiting for manual verification…")
                 elif payload.get("terminal"):
                     state = "verified" if payload.get("verified") else "needs verification"
                     self._set_status(f"task finished · {state}")
-                else:
+                elif not control_state:
                     self._set_status(f"task step {payload.get('steps', 0)} · evidence {payload.get('evidence_steps', 0)}")
+        elif kind == "task_control":
+            self.add_task_control(payload)
+        elif kind == "task_evidence":
+            self.add_task_evidence(payload)
         elif kind == "model_health":
             if isinstance(payload, dict):
                 state = "available" if payload.get("ok") else "unavailable"
                 self.add_sys(f"Model {state} · {payload.get('provider', 'unknown')} · {payload.get('latency_ms', '?')} ms")
+        elif kind == "model_circuit":
+            if isinstance(payload, dict) and payload.get("state") == "open":
+                self.add_err("模型连接暂时熔断：连续网络失败，稍后会自动恢复；可检查代理或切换已授权备用模型。")
         elif kind == "model_fallback_available":
             self.add_model_fallback(payload)
         elif kind == "model_fallback_result":

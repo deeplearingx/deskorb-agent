@@ -40,6 +40,28 @@ class ModelRegistryTests(unittest.TestCase):
         self.assertEqual(summary["success_rate"], 0.5)
         self.assertEqual(summary["p95_latency_ms"], 100.0)
 
+    def test_health_history_exposes_safe_request_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ModelHealthStore(Path(directory) / "health.sqlite3", retention=20)
+            store.record(provider="fixture", model="fixture-1", ok=True, latency_ms=250,
+                         operation="model_turn", first_token_ms=80, status_code=200,
+                         retry_count=1, tool_rounds=3, verification_passed=True)
+            summary = store.summary("fixture", "fixture-1", operation="model_turn")
+        self.assertEqual(summary["samples"], 1)
+        self.assertEqual(summary["p50_first_token_ms"], 80.0)
+        self.assertEqual(summary["retry_rate"], 1.0)
+        self.assertEqual(summary["verification_rate"], 1.0)
+        self.assertEqual(summary["status_codes"], {"200": 1})
+
+    def test_health_history_is_bounded_per_provider_and_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ModelHealthStore(Path(directory) / "health.sqlite3", retention=20)
+            for index in range(25):
+                store.record(provider="fixture", model="fixture-1", ok=True, latency_ms=index)
+            summary = store.summary("fixture", "fixture-1", limit=100)
+        self.assertEqual(summary["samples"], 20)
+        self.assertEqual(summary["p50_latency_ms"], 15.0)
+
     def test_fallback_catalog_is_bounded_and_never_accepts_url_credentials(self):
         targets = parse_fallback_targets({"targets": [
             {"id": "deepseek", "provider": "deepseek", "model": "deepseek-chat",
@@ -62,6 +84,21 @@ class ModelRegistryTests(unittest.TestCase):
                                            "model": "fixture", "base_url": "http://127.0.0.1:8000/v1",
                                            "supports_tools": "false"}])
         self.assertFalse(targets[0].supports_tools)
+
+    def test_qwen_fallback_uses_chat_completions_profile(self):
+        targets = parse_fallback_targets([{
+            "id": "qwen", "provider": "qwen", "model": "qwen-plus",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        }])
+        self.assertEqual(targets[0].capabilities.provider, "qwen")
+        self.assertEqual(targets[0].capabilities.protocol, "chat_completions")
+
+    def test_gpt_alias_is_accepted_in_fallback_catalog(self):
+        targets = parse_fallback_targets([{
+            "id": "gpt-backup", "provider": "gpt", "model": "gpt-5",
+            "base_url": "https://api.openai.com/v1",
+        }])
+        self.assertEqual(targets[0].capabilities.provider, "openai")
 
     def test_per_model_capability_override_is_selected_before_provider_default(self):
         overrides = parse_capability_overrides({"models": [{

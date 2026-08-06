@@ -127,8 +127,9 @@ def parse_fallback_targets(raw: str | list[dict[str, Any]] | dict[str, Any] | No
         provider_raw = str(item.get("provider") or "auto").strip().lower()
         provider = normalize_provider(provider_raw)
         base_url = str(item.get("base_url") or item.get("url") or "").strip().rstrip("/")
-        if (provider_raw not in PROVIDERS and provider_raw not in {"compatible", "chat", "dashscope", "aliyun",
-                                                                    "openai-responses", "responses-compatible", "chat-completions"} or
+        if (provider_raw not in PROVIDERS and provider_raw not in {"gpt", "openai-compatible-gpt", "compatible",
+                                                                    "chat", "dashscope", "aliyun", "openai-responses",
+                                                                    "responses-compatible", "chat-completions"} or
                 not _TARGET_ID.fullmatch(target_id) or target_id in seen or not model or
                 not base_url or not _safe_base_url(base_url)):
             continue
@@ -246,8 +247,8 @@ def parse_capability_overrides(raw: str | list[dict[str, Any]] | dict[str, Any] 
         provider_raw = str(item.get("provider") or "auto").strip()
         provider = normalize_provider(provider_raw)
         if not model or (provider_raw.lower() not in PROVIDERS and provider_raw.lower() not in {
-                "compatible", "chat", "dashscope", "aliyun", "openai-responses", "responses-compatible",
-                "chat-completions"}):
+                "gpt", "openai-compatible-gpt", "compatible", "chat", "dashscope", "aliyun",
+                "openai-responses", "responses-compatible", "chat-completions"}):
             continue
         profile = provider_profile(provider, str(item.get("base_url") or ""))
         try:
@@ -269,31 +270,110 @@ def parse_capability_overrides(raw: str | list[dict[str, Any]] | dict[str, Any] 
 class ModelHealthStore:
     """Store provider health metadata only, never request or response content."""
 
-    def __init__(self, path: str | Path):
+    DEFAULT_RETENTION = 500
+
+    def __init__(self, path: str | Path, *, retention: int = DEFAULT_RETENTION):
         self.path = Path(path)
+        self.retention = max(20, min(10_000, int(retention)))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute("""CREATE TABLE IF NOT EXISTS model_health (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL,
-                model TEXT NOT NULL, ok INTEGER NOT NULL, latency_ms REAL,
+                model TEXT NOT NULL, operation TEXT NOT NULL DEFAULT 'health',
+                ok INTEGER NOT NULL, latency_ms REAL, first_token_ms REAL,
+                status_code INTEGER, retry_count INTEGER NOT NULL DEFAULT 0,
+                tool_rounds INTEGER, verification_passed INTEGER,
                 failure_kind TEXT, created_at REAL NOT NULL
             )""")
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(model_health)").fetchall()}
+            migrations = {
+                "operation": "ALTER TABLE model_health ADD COLUMN operation TEXT NOT NULL DEFAULT 'health'",
+                "first_token_ms": "ALTER TABLE model_health ADD COLUMN first_token_ms REAL",
+                "status_code": "ALTER TABLE model_health ADD COLUMN status_code INTEGER",
+                "retry_count": "ALTER TABLE model_health ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+                "tool_rounds": "ALTER TABLE model_health ADD COLUMN tool_rounds INTEGER",
+                "verification_passed": "ALTER TABLE model_health ADD COLUMN verification_passed INTEGER",
+            }
+            for name, statement in migrations.items():
+                if name not in columns:
+                    connection.execute(statement)
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_model_health_lookup "
+                               "ON model_health(provider, model, id DESC)")
 
     def record(self, *, provider: str, model: str, ok: bool, latency_ms: float,
-               failure_kind: str | None = None) -> None:
+               failure_kind: str | None = None, operation: str = "health",
+               first_token_ms: float | None = None, status_code: int | None = None,
+               retry_count: int = 0, tool_rounds: int | None = None,
+               verification_passed: bool | None = None) -> None:
+        try:
+            status = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            status = None
+        try:
+            retries = max(0, min(20, int(retry_count)))
+        except (TypeError, ValueError):
+            retries = 0
+        try:
+            rounds = max(0, min(100, int(tool_rounds))) if tool_rounds is not None else None
+        except (TypeError, ValueError):
+            rounds = None
         with closing(sqlite3.connect(self.path)) as connection, connection:
-            connection.execute("INSERT INTO model_health(provider, model, ok, latency_ms, failure_kind, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                               (str(provider)[:80], str(model)[:120], int(bool(ok)), float(latency_ms),
+            connection.execute("""INSERT INTO model_health(
+                provider, model, operation, ok, latency_ms, first_token_ms,
+                status_code, retry_count, tool_rounds, verification_passed,
+                failure_kind, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               (str(provider)[:80], str(model)[:120], str(operation or "health")[:40],
+                                int(bool(ok)), float(latency_ms),
+                                float(first_token_ms) if first_token_ms is not None else None,
+                                status, retries, rounds,
+                                int(bool(verification_passed)) if verification_passed is not None else None,
                                 str(failure_kind)[:80] if failure_kind else None, time.time()))
+            # Keep long-running overlays bounded while preserving the newest
+            # samples for each provider/model pair.
+            connection.execute("""DELETE FROM model_health
+                WHERE provider = ? AND model = ? AND id NOT IN (
+                    SELECT id FROM model_health WHERE provider = ? AND model = ?
+                    ORDER BY id DESC LIMIT ?
+                )""", (str(provider)[:80], str(model)[:120], str(provider)[:80],
+                       str(model)[:120], self.retention))
 
-    def summary(self, provider: str, model: str, *, limit: int = 100) -> dict[str, Any]:
+    def summary(self, provider: str, model: str, *, limit: int = 100,
+                operation: str | None = None) -> dict[str, Any]:
+        where = "provider=? AND model=?"
+        params: list[Any] = [str(provider), str(model)]
+        if operation:
+            where += " AND operation=?"
+            params.append(str(operation))
+        params.append(max(1, min(500, int(limit))))
         with closing(sqlite3.connect(self.path)) as connection:
-            rows = connection.execute("SELECT ok, latency_ms FROM model_health WHERE provider=? AND model=? ORDER BY id DESC LIMIT ?",
-                                      (str(provider), str(model), max(1, min(500, int(limit))))).fetchall()
+            rows = connection.execute(f"""SELECT ok, latency_ms, first_token_ms,
+                    retry_count, status_code, verification_passed, failure_kind
+                    FROM model_health WHERE {where} ORDER BY id DESC LIMIT ?""", params).fetchall()
         latencies = sorted(float(row[1]) for row in rows if row[1] is not None)
+        first_tokens = sorted(float(row[2]) for row in rows if row[2] is not None)
+        retry_rows = [row for row in rows if int(row[3] or 0) > 0]
+        verification_rows = [row for row in rows if row[5] is not None]
+        status_codes: dict[str, int] = {}
+        failure_kinds: dict[str, int] = {}
+        for row in rows:
+            if row[4] is not None:
+                key = str(int(row[4]))
+                status_codes[key] = status_codes.get(key, 0) + 1
+            if row[6]:
+                key = str(row[6])[:80]
+                failure_kinds[key] = failure_kinds.get(key, 0) + 1
         return {"provider": str(provider), "model": str(model), "samples": len(rows),
+                "operation": str(operation) if operation else "all",
                 "success_rate": round(sum(bool(row[0]) for row in rows) / len(rows), 4) if rows else None,
-                "p50_latency_ms": _percentile(latencies, 0.50), "p95_latency_ms": _percentile(latencies, 0.95)}
+                "p50_latency_ms": _percentile(latencies, 0.50),
+                "p95_latency_ms": _percentile(latencies, 0.95),
+                "p50_first_token_ms": _percentile(first_tokens, 0.50),
+                "p95_first_token_ms": _percentile(first_tokens, 0.95),
+                "retry_rate": round(len(retry_rows) / len(rows), 4) if rows else None,
+                "verification_rate": (round(sum(bool(row[5]) for row in verification_rows) /
+                                             len(verification_rows), 4) if verification_rows else None),
+                "status_codes": status_codes, "failure_kinds": failure_kinds}
 
 
 def _percentile(values: list[float], quantile: float) -> float | None:

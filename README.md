@@ -10,6 +10,9 @@ The original Tkinter UI is retained under its MIT license. The backend in
 OpenAI-compatible Responses API over HTTPS, and an optional persistent Codex
 app-server compatibility backend.
 
+可靠性改造的阶段计划、验收门槛、当前证据和未完成项记录在
+[`docs/reliable-complex-task-refactor-plan.md`](docs/reliable-complex-task-refactor-plan.md)。
+
 ## Run
 
 1. Configure an API key and compatible endpoint in the parent-folder `.env`,
@@ -111,6 +114,11 @@ When the active provider fails, the runtime only reports available targets. A us
 confirm the target, and must separately consent before existing conversation context is
 shared with another provider. Targets without declared tool support are rejected.
 
+Connection settings stores OpenAI, DeepSeek, Qwen/DashScope, and OpenAI-compatible
+keys in separate Windows Credential Manager entries. An explicit DeepSeek/Qwen selection
+never reuses the generic OpenAI credential; headless deployments can use the matching
+`DEEPSEEK_API_KEY`, `QWEN_API_KEY`, or `DASHSCOPE_API_KEY` environment variable instead.
+
 If a gateway does not support image input or tool calls, declare that explicitly:
 
 ```text
@@ -180,6 +188,27 @@ natural-language answer is not enough to mark the task complete. Successful brow
 observations update a short hash checkpoint, so a resumed task re-observes the page before
 acting again.
 
+Before diagnosing a browser task failure, run the privacy-safe readiness probe:
+
+```powershell
+& .venv\Scripts\python.exe tests/mcp_readiness_probe.py
+```
+
+It reports only configured server/tool metadata. A successful result should list the
+Playwright task-safe tools and an empty diagnostics list; it does not prove that a
+real site is logged in or that a side effect is authorized.
+
+For a real local-MCP browser reliability matrix, run the opt-in probe with a configured
+provider key:
+
+```powershell
+& .venv\Scripts\python.exe tests/e2e_local_browser_probe.py --repetitions 20
+```
+
+Each repetition starts a fresh AgentRuntime and browser task space. Matrix output keeps
+only structured verification metadata (not page answers); a run counts only when the
+task reaches `completed` with `verified=true`.
+
 For automatic routing of a custom integration, add the optional DeskOrb-only metadata
 (other MCP clients safely ignore it):
 
@@ -203,16 +232,34 @@ or toggle topmost. This avoids guessing window titles or stale screen coordinate
 When `pywinauto` is installed, DeskOrb first inspects the foreground application's
 Windows UI Automation tree. It can invoke a named control or set an editable control's
 value using a short-lived `control_id`. This is the preferred route for buttons, menus,
-and text fields. The existing screenshot-guarded coordinate controls remain the fallback
-for applications that do not expose usable accessibility information.
+and text fields. Each observed control advertises its supported semantic actions. An
+invoke is counted as verified only when a toggle/selection/focus state changes or the
+control is dismissed; otherwise the runtime requests a fresh UIA observation. The
+existing screenshot-guarded coordinate controls remain the fallback for applications
+that do not expose usable accessibility information.
+
+The overlay remembers the external window that was active before the composer received
+focus and passes that target to the Agent runtime. It may safely return focus to that
+window before a mouse, keyboard, or UIA action; if you switch to another application,
+the stale snapshot is rejected and the agent must observe again. Run the service inside
+the signed-in interactive Windows desktop session—non-interactive services or restricted
+shells can be rejected by Windows with Win32 error 5 even when the code is configured
+correctly.
 
 One task confirmation creates a ten-minute local authorization lease. It covers only the
 approved desktop controls and MCP servers, not every tool in the process. Closing a window
 always needs a fresh confirmation. Reading clipboard text also needs a fresh confirmation
 because clipboard contents can contain passwords, private text, or tokens. After
 coordinate/keyboard/window actions, DeskOrb captures a fresh desktop observation before
-continuing. A privacy-aware local task journal records task state, tool outcome and failure
+continuing. Each input result also keeps a short-lived `baseline_snapshot_id` so the subsequent verification compares against the state immediately before the action. A privacy-aware local task journal records task state, tool outcome and failure
 category, but redacts free-form typed text, clipboard data, credentials, and tokens.
+
+During a long Agent task the status rail exposes **暂停**, **接管**, and **证据**. Pausing
+revokes the current lease without cancelling the in-memory continuation; **继续** requires a
+user click and a fresh observation. **接管** hands the browser task space to the user, and the
+evidence view shows only redacted structural events. Known applications (Notepad, File
+Explorer, QQ, Calculator) receive bounded UIA action recommendations; browser page content
+continues to use Playwright MCP.
 
 If a request explicitly asks to inspect the current desktop, active window, visible state, or
 local DeskOrb logs, the overlay shows a clickable one-turn privacy card before capturing or
@@ -224,8 +271,15 @@ not change that standing toggle. The same one-turn grant is checked again in the
 AgentRuntime, so a caller cannot bypass the overlay by submitting a diagnostic directly.
 
 The runtime exposes a minimal model health check that sends only `health check` and expects
-`OK`. It records provider, protocol, success rate, and latency percentiles locally. Health
-metadata never includes screenshots, conversation history, page text, or API keys.
+`OK`. It records provider, protocol, request/first-token latency percentiles, retry rate,
+HTTP status categories, task tool rounds, and verification rate locally with bounded
+retention. Health metadata never includes screenshots, conversation history, page text, or
+API keys. `tests/provider_longrun_probe.py` can repeat the check across configured targets; pass `--history-path .deskorb-agent/provider-health.sqlite3` to retain the privacy-safe aggregate history between runs. For a protocol/tool compatibility check, run `python tests/provider_capability_probe.py --repetitions 3`; it uses a no-op `echo_probe` with stateless continuation. Fallbacks are checked only with their explicit vendor key; use `--require-provider deepseek --require-provider qwen` in a release image that promises both vendors. For a real, isolated Windows desktop smoke test, run `.venv\Scripts\python.exe tests/e2e_desktop_local_probe.py`；it uses a temporary Tk window and never touches an existing document or account.
+
+For a read-only QQ profile check, run `.venv\Scripts\python.exe tests/e2e_qq_app_probe.py`.
+It never focuses, clicks, types, or reads message content. Add `--require-running` only on a
+self-hosted VM image that intentionally includes a running QQ session; the probe then fails
+closed when QQ is unavailable and reports only control/recommendation counts.
 
 ### One-time Word attachment in Chat
 
@@ -248,6 +302,34 @@ configured endpoint, whether PowerShell 7 (`pwsh`) is available, and the local
 working folder. This is a local configuration check only; the actual API
 connection is verified on the first message. Network failures are reported as
 `API network connection failed`, while API responses retain their HTTP status.
+
+The GitHub workflow's normal desktop job is advisory because hosted runners do
+not guarantee an interactive Windows session. A real release gate is available
+through **Run workflow** with `run_desktop_vm_hard_gate=true` on a self-hosted
+runner labeled `self-hosted, windows, deskorb-desktop`; it fails closed when any
+desktop, UIA, Notepad, File Explorer, read-only QQ profile, restart-recovery, or unit test
+probe fails. All desktop probes must run serially in one signed-in interactive session;
+parallel probes compete for the cursor and foreground window. The hosted readiness job
+remains advisory and skips absent desktop applications.
+The hard gate starts with `tests/desktop_vm_preflight.py`, which rejects a locked/service
+session, missing PowerShell 7, missing UIA provider, or a desktop with no visible window
+before any input probe runs.
+It then runs `tests/connected_browser_readiness_probe.py --require-connected
+--require-authenticated`; the self-hosted image must expose the explicitly connected
+Playwright extension and a manually authenticated tab. Login, QR, or CAPTCHA markers
+fail the gate and require human handoff; no credentials are entered by the probe.
+
+The same workflow has an opt-in `run_provider_capability_matrix=true` job. Configure
+`DESKORB_OPENAI_API_KEY`, `DESKORB_DEEPSEEK_API_KEY`, `DESKORB_QWEN_API_KEY`, and
+`DESKORB_AGENT_MODEL_FALLBACKS` as repository secrets before enabling it. The job runs
+twenty no-op tool-call/continuation checks per configured provider and fails closed when
+a required provider key or target is missing. This is an opt-in quota-consuming release
+matrix, not the normal pull-request test.
+
+`run_browser_agent_matrix=true` enables a separate 20-repetition local-fixture browser
+job. It requires the primary provider secrets and starts a fresh AgentRuntime for each
+attempt; it is the repeatable real-MCP gate for read-only browser tasks, not a test of
+third-party login or purchase flows.
 
 ## Known difference
 

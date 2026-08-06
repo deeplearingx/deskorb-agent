@@ -55,6 +55,18 @@ class BrowserTaskSpaceTests(unittest.TestCase):
         recovered = spaces.take_over("T001", user_confirmed=True)
         self.assertEqual(recovered.state, BrowserSpaceState.ACTIVE)
 
+    def test_reconnect_replaces_broken_space_and_clears_checkpoint(self):
+        spaces = BrowserTaskSpaces()
+        original = spaces.create("T001", backend="isolated-playwright")
+        spaces.save_checkpoint("T001", "old-page")
+        spaces.mark_broken("T001")
+        replacement = spaces.reconnect("T001")
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(original.space_id, replacement.space_id)
+        self.assertEqual(replacement.state, BrowserSpaceState.ACTIVE)
+        self.assertIsNone(replacement.checkpoint)
+        self.assertFalse(spaces.checkpoint_matches("T001", "old-page"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,16 @@ class ProviderEnvTests(unittest.TestCase):
              patch.dict(provider_env.os.environ, {}, clear=True):
             self.assertEqual(provider_env.api_key("deepseek"), "deep")
 
+    def test_explicit_provider_key_does_not_use_generic_primary_key(self):
+        with patch.object(provider_env, "_VALUES", {"api-key": "generic"}), \
+             patch.dict(provider_env.os.environ, {}, clear=True):
+            self.assertEqual(provider_env.explicit_api_key("deepseek"), "")
+
+    def test_explicit_qwen_key_uses_dashscope_alias(self):
+        with patch.object(provider_env, "_VALUES", {"dashscope_api_key": "qwen-key"}), \
+             patch.dict(provider_env.os.environ, {}, clear=True):
+            self.assertEqual(provider_env.explicit_api_key("qwen"), "qwen-key")
+
     def test_dotenv_is_reloaded_after_process_start(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"

@@ -6,6 +6,7 @@ from responses_tool_protocol import function_call_output
 
 class ModelAdapterTests(unittest.TestCase):
     def test_auto_detects_official_vendor_protocols(self):
+        self.assertEqual(provider_profile("gpt", "https://api.openai.com/v1").name, "openai")
         self.assertEqual(provider_profile("auto", "https://api.deepseek.com").protocol, "chat_completions")
         self.assertEqual(provider_profile("auto", "https://dashscope.aliyuncs.com/compatible-mode/v1").protocol,
                          "chat_completions")

@@ -98,6 +98,7 @@ def main() -> int:
             "parallel_tool_calls": False,
             "stream": False,
         })
+        report["continuation_strategy"] = "stateless_output_only"
         text = str(second.get("output_text") or "").strip()
         if not text:
             text = "".join(
@@ -106,6 +107,29 @@ def main() -> int:
                 for part in item.get("content") or [] if isinstance(part, dict)
                 and part.get("type") in ("output_text", "text")
             ).strip()
+        if not text and not function_calls(second):
+            # A few Responses-compatible gateways return an empty completed
+            # message when function_call_output is the last stateless input.
+            # Retry once with an explicit continuation prompt; this does not
+            # replay the no-op tool and mirrors AgentRuntime's compatibility
+            # path.
+            transcript.append({"role": "user", "content": "Continue and reply exactly TOOL_OK."})
+            second = _post(endpoint, api_key, {
+                "model": model,
+                "input": transcript,
+                "tools": tools,
+                "parallel_tool_calls": False,
+                "stream": False,
+            })
+            report["continuation_strategy"] = "explicit_prompt_after_empty_message"
+            text = str(second.get("output_text") or "").strip()
+            if not text:
+                text = "".join(
+                    str(part.get("text") or "")
+                    for item in second.get("output") or [] if isinstance(item, dict)
+                    for part in item.get("content") or [] if isinstance(part, dict)
+                    and part.get("type") in ("output_text", "text")
+                ).strip()
         report["continuation"] = text == "TOOL_OK"
         report["ok"] = report["continuation"]
         report["total_s"] = round(time.perf_counter() - started, 3)

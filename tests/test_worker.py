@@ -55,6 +55,12 @@ class CodexWorkerTests(unittest.TestCase):
         with patch("worker.get_api_key", return_value="secret"):
             self.assertEqual(self.worker._resolved_backend(), "agent")
 
+    def test_auto_provider_uses_detected_vendor_key(self):
+        self.worker._adapter = self.worker._adapter.__class__("auto", "https://api.deepseek.com")
+        with patch("worker.get_api_key", return_value="deep-key") as resolver:
+            self.assertEqual(self.worker._active_api_key(), "deep-key")
+        resolver.assert_called_once_with("deepseek")
+
     def test_agent_backend_routes_to_independent_runtime(self):
         self.worker._backend = "agent"
         with patch.object(self.worker._agent, "run_turn") as run_turn:
@@ -73,6 +79,23 @@ class CodexWorkerTests(unittest.TestCase):
             self.worker.req.get_nowait(),
             ("ask_ephemeral", ("private Word contents", [])),
         )
+
+    def test_desktop_target_queue_carries_overlay_and_external_windows(self):
+        self.worker.set_desktop_target(101, 202)
+        self.assertEqual(self.worker.req.get_nowait(),
+                         ("desktop_target", {"target_hwnd": 101, "overlay_hwnd": 202}))
+
+    def test_resume_and_evidence_controls_are_queued(self):
+        self.worker.resume_paused_task()
+        self.assertEqual(self.worker.req.get_nowait(), ("resume_paused", {"user_confirmed": True}))
+        self.worker.request_task_evidence("TABC")
+        self.assertEqual(self.worker.req.get_nowait(), ("task_evidence", "TABC"))
+
+    def test_pause_is_rejected_for_non_agent_backend(self):
+        self.worker._backend = "api"
+        result = self.worker.pause_task()
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.events.get_nowait()[0], "task_control")
 
     def test_current_context_consent_is_carried_with_a_turn_request(self):
         self.worker.ask("分析当前桌面", [], current_context_consent=True)

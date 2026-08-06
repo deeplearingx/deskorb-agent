@@ -21,8 +21,10 @@ from typing import Any
 
 
 TASK_STATUS_ACTIVE = "active"
+TASK_STATUS_PAUSED = "paused"
 TASK_STATUS_WAITING_APPROVAL = "waiting_approval"
 TASK_STATUS_WAITING_HUMAN = "waiting_human"
+TASK_STATUS_WAITING_VERIFICATION = "waiting_verification"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_CANCELLED = "cancelled"
 TASK_STATUS_FAILED = "failed"
@@ -54,15 +56,21 @@ def new_task_id() -> str:
 def classify_failure(value: Any) -> str:
     """Return a stable recovery category without exposing raw upstream text."""
     text = str(value or "").lower()
+    if any(marker in text for marker in ("api circuit open", "circuit open", "熔断")):
+        return "provider_circuit_open"
+    if any(marker in text for marker in ("duplicate side effect", "duplicate_prevented", "重复副作用")):
+        return "duplicate_prevented"
     if any(marker in text for marker in ("captcha", "验证码", "人机验证", "快速验证身份", "我是人类")):
         return "human_verification"
     if any(marker in text for marker in ("login", "sign in", "登录", "账户", "账号")):
         return "login_required"
-    if any(marker in text for marker in ("timed out", "timeout", "网络", "connection", "http 408", "http 429", "http 502", "http 503", "http 504")):
+    if any(marker in text for marker in ("timed out", "timeout", "网络", "connection", "bad gateway",
+                                         "service unavailable", "temporarily unavailable", "try again",
+                                         "http 408", "http 425", "http 429", "http 500", "http 502", "http 503", "http 504")):
         return "transient_network"
     if any(marker in text for marker in ("permission", "access denied", "权限", "unauthorized", "forbidden")):
         return "permission_denied"
-    if any(marker in text for marker in ("verify", "verification", "not found", "验收", "postcondition")):
+    if any(marker in text for marker in ("verify", "verification", "not found", "验收", "postcondition", "not verified", "待验证")):
         return "verification_failed"
     if any(marker in text for marker in ("mcp", "tool", "function call")):
         return "tool_failure"
@@ -76,6 +84,13 @@ def safe_event_data(value: Any) -> Any:
     if isinstance(value, list):
         return [_safe_value("", item) for item in value[:32]]
     return _safe_value("", value)
+
+
+def effect_fingerprint(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+    """Build a stable, redacted identifier for a potentially side-effecting call."""
+    safe = safe_event_data({"tool": str(tool_name), "arguments": arguments or {}})
+    encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
 
 
 def _safe_value(key: str, value: Any) -> Any:
@@ -116,7 +131,8 @@ class TaskJournal:
                 updated_at REAL NOT NULL,
                 failure_kind TEXT,
                 capability_json TEXT NOT NULL DEFAULT '[]',
-                checkpoint_json TEXT NOT NULL DEFAULT '{}'
+                checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                contract_json TEXT NOT NULL DEFAULT '{}'
             )""")
             connection.execute("""CREATE TABLE IF NOT EXISTS task_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +147,8 @@ class TaskJournal:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)").fetchall()}
             if "checkpoint_json" not in columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN checkpoint_json TEXT NOT NULL DEFAULT '{}' ")
+            if "contract_json" not in columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN contract_json TEXT NOT NULL DEFAULT '{}' ")
 
     def start(self, goal: str) -> str:
         task_id = new_task_id()
@@ -175,34 +193,133 @@ class TaskJournal:
                                (json.dumps(safe, ensure_ascii=False, separators=(",", ":")), time.time(), task_id))
             self._event(connection, task_id, "checkpoint", safe)
 
+    def set_contract(self, task_id: str | None, contract: dict[str, Any] | None = None) -> None:
+        """Persist only the structural task contract, never model prompt text."""
+        if not task_id:
+            return
+        safe = safe_event_data(contract or {})
+        if not isinstance(safe, dict):
+            safe = {}
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute("UPDATE tasks SET contract_json = ?, updated_at = ? WHERE task_id = ?",
+                               (json.dumps(safe, ensure_ascii=False, separators=(",", ":")), time.time(), task_id))
+            self._event(connection, task_id, "task_contract", safe)
+
+    def record_effect(self, task_id: str | None, tool_name: str, arguments: dict[str, Any] | None = None) -> str | None:
+        """Record a successful side-effect fingerprint for resume-time deduplication."""
+        if not task_id:
+            return None
+        fingerprint = effect_fingerprint(tool_name, arguments)
+        self.event(task_id, "effect_recorded", {"tool": str(tool_name), "fingerprint": fingerprint})
+        return fingerprint
+
+    def effect_seen(self, task_id: str | None, tool_name: str, arguments: dict[str, Any] | None = None) -> bool:
+        if not task_id:
+            return False
+        fingerprint = effect_fingerprint(tool_name, arguments)
+        with self._lock, closing(self._connect()) as connection:
+            rows = connection.execute("SELECT data_json FROM task_events WHERE task_id = ? AND kind = 'effect_recorded'",
+                                      (task_id,)).fetchall()
+        for (raw,) in rows:
+            try:
+                if json.loads(raw).get("fingerprint") == fingerprint:
+                    return True
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return False
+
     def recoverable(self, *, max_age_seconds: float = 3600.0) -> list[dict[str, Any]]:
         """Return active checkpoints; authorization is intentionally not restored."""
         cutoff = time.time() - max(60.0, float(max_age_seconds))
         with self._lock, closing(self._connect()) as connection:
-            rows = connection.execute("""SELECT task_id, goal, status, updated_at, capability_json, checkpoint_json
-                                        FROM tasks WHERE status IN (?, ?) AND updated_at >= ?
+            rows = connection.execute("""SELECT task_id, goal, status, updated_at, capability_json, checkpoint_json, contract_json
+                                        FROM tasks WHERE status IN (?, ?, ?, ?, ?) AND updated_at >= ?
                                         ORDER BY updated_at DESC""",
-                                      (TASK_STATUS_ACTIVE, TASK_STATUS_WAITING_APPROVAL, cutoff)).fetchall()
+                                      (TASK_STATUS_ACTIVE, TASK_STATUS_PAUSED, TASK_STATUS_WAITING_APPROVAL,
+                                       TASK_STATUS_WAITING_HUMAN, TASK_STATUS_WAITING_VERIFICATION, cutoff)).fetchall()
         result = []
         for row in rows:
             try:
                 capabilities = json.loads(row[4] or "[]")
                 checkpoint = json.loads(row[5] or "{}")
+                contract = json.loads(row[6] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
-                capabilities, checkpoint = [], {}
+                capabilities, checkpoint, contract = [], {}, {}
             result.append({"task_id": row[0], "goal": row[1], "status": row[2],
                            "updated_at": row[3], "capabilities": capabilities,
-                           "checkpoint": checkpoint, "requires_reauthorization": True})
+                           "checkpoint": checkpoint, "contract": contract,
+                           "requires_reauthorization": True})
         return result
+
+    def evidence_snapshot(self, task_id: str | None, *, limit: int = 40) -> dict[str, Any]:
+        """Return bounded structural evidence for a task without private payloads.
+
+        Task events are already redacted at write time, but this method applies a
+        second structural projection before exposing them to the overlay.  It is
+        intentionally useful for a user-facing audit trail, not a transcript
+        viewer: tool arguments, page text, messages, screenshots, and secrets
+        remain redacted or omitted.
+        """
+        wanted = str(task_id or "").strip()
+        if not wanted:
+            return {"ok": False, "error": "No task is active."}
+        try:
+            count = max(1, min(int(limit or 40), 80))
+        except (TypeError, ValueError):
+            count = 40
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT task_id, goal, status, updated_at, failure_kind FROM tasks WHERE task_id = ?",
+                (wanted,),
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "error": "Task was not found."}
+            events = connection.execute(
+                "SELECT created_at, kind, data_json FROM task_events WHERE task_id = ? "
+                "ORDER BY event_id DESC LIMIT ?", (wanted, count),
+            ).fetchall()
+        projected: list[dict[str, Any]] = []
+        allowed = {
+            "task_started", "status", "authorization_granted", "workflow_node",
+            "tool_result", "checkpoint", "browser_checkpoint", "browser_space_created",
+            "browser_space_closed", "browser_space_broken", "browser_space_reconnected",
+            "task_paused", "task_resumed", "human_handoff", "browser_control_resumed",
+            "workflow_finished", "effect_recorded", "approval_requested",
+        }
+        for created_at, kind, raw in reversed(events):
+            if str(kind) not in allowed:
+                continue
+            try:
+                value = json.loads(raw or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                value = {}
+            if not isinstance(value, dict):
+                value = {}
+            safe = safe_event_data(value)
+            if not isinstance(safe, dict):
+                safe = {}
+            # Keep only fields that help explain state and verification.  The
+            # redacted event remains available for diagnostics but never shows
+            # free-form command/message/page content in the overlay.
+            compact = {key: safe[key] for key in (
+                "status", "failure_kind", "tool", "ok", "verified", "evidence",
+                "evidence_schema", "terminal", "steps", "space_id", "marker",
+                "last_tool", "last_status", "duplicate_prevented", "recovery_reason",
+            ) if key in safe}
+            projected.append({"at": float(created_at), "kind": str(kind), "data": compact})
+        return {"ok": True, "task_id": row[0], "goal": str(row[1])[:240],
+                "status": str(row[2]), "updated_at": float(row[3]),
+                "failure_kind": row[4], "events": projected}
 
     def task(self, task_id: str) -> dict[str, Any] | None:
         with self._lock, closing(self._connect()) as connection:
-            row = connection.execute("SELECT task_id, goal, status, created_at, updated_at, failure_kind, capability_json FROM tasks WHERE task_id = ?",
+            row = connection.execute("SELECT task_id, goal, status, created_at, updated_at, failure_kind, capability_json, contract_json FROM tasks WHERE task_id = ?",
                                      (task_id,)).fetchone()
         if row is None:
             return None
         return {"task_id": row[0], "goal": row[1], "status": row[2], "created_at": row[3], "updated_at": row[4],
-                "failure_kind": row[5], "capabilities": json.loads(row[6] or "[]")}
+                "failure_kind": row[5], "capabilities": json.loads(row[6] or "[]"),
+                "contract": json.loads(row[7] or "{}")}
 
     @staticmethod
     def _event(connection: sqlite3.Connection, task_id: str, kind: str, data: Any) -> None:

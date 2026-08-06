@@ -12,6 +12,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -90,6 +91,45 @@ class CodexWorker(threading.Thread):
             payload = (*payload, True)
         self.req.put(("ask_ephemeral", payload))
 
+    def set_desktop_target(self, hwnd: int | None, overlay_hwnd: int | None = None) -> None:
+        """Pass the last external foreground window to the Agent runtime."""
+        try:
+            value = max(0, int(hwnd or 0))
+        except (TypeError, ValueError):
+            value = 0
+        try:
+            overlay = max(0, int(overlay_hwnd or 0))
+        except (TypeError, ValueError):
+            overlay = 0
+        self.req.put(("desktop_target", {"target_hwnd": value, "overlay_hwnd": overlay}))
+
+    def pause_task(self) -> dict[str, Any]:
+        """Request a cooperative pause immediately, even while the worker is in HTTP."""
+        if self._resolved_backend() != "agent":
+            result = {"ok": False, "state": "unsupported",
+                      "error": "Pause/continue controls are available for the independent Agent backend."}
+            self.ui.put(("task_control", result))
+            return result
+        return self._agent.pause_task()
+
+    def handoff_task(self) -> dict[str, Any]:
+        """Pause and put the current browser/desktop task under explicit user control."""
+        if self._resolved_backend() != "agent":
+            result = {"ok": False, "state": "unsupported",
+                      "error": "Desktop handoff controls are available for the independent Agent backend."}
+            self.ui.put(("task_control", result))
+            return result
+        return self._agent.pause_task(handoff=True)
+
+    def resume_paused_task(self) -> None:
+        self.req.put(("resume_paused", {"user_confirmed": True}))
+
+    def cancel_paused_task(self) -> None:
+        self.req.put(("cancel_paused", None))
+
+    def request_task_evidence(self, task_id: str | None = None) -> None:
+        self.req.put(("task_evidence", task_id))
+
     def reset(self):
         self.req.put(("reset", None))
 
@@ -163,7 +203,23 @@ class CodexWorker(threading.Thread):
             if kind == "stop":
                 break
             try:
-                if kind == "ask":
+                if kind == "desktop_target":
+                    value = payload if isinstance(payload, dict) else {"target_hwnd": payload}
+                    self._agent.set_desktop_target_window(value.get("target_hwnd"), value.get("overlay_hwnd"))
+                elif kind == "resume_paused":
+                    value = payload if isinstance(payload, dict) else {}
+                    result = self._agent.resume_paused_task(user_confirmed=bool(value.get("user_confirmed")))
+                    if not result.get("ok"):
+                        self.ui.put(("task_control", result))
+                    self.ui.put(("turn_done", None))
+                elif kind == "cancel_paused":
+                    result = self._agent.cancel_paused_task()
+                    if not result.get("ok"):
+                        self.ui.put(("task_control", result))
+                elif kind == "task_evidence":
+                    result = self._agent.task_evidence(payload)
+                    self.ui.put(("task_evidence", result))
+                elif kind == "ask":
                     self._run_turn(*payload)
                 elif kind == "ask_ephemeral":
                     self._run_turn(*payload, ephemeral=True)
@@ -252,9 +308,18 @@ class CodexWorker(threading.Thread):
             return ""
         return value if value.startswith(("http://", "https://")) else ""
 
+    def _active_api_key(self) -> str:
+        """Resolve credentials from the adapter's detected provider.
+
+        ``provider=auto`` may resolve a DeepSeek/Qwen URL to a chat provider;
+        using the raw ``auto`` setting here could otherwise select an unrelated
+        OpenAI key simply because it appears first in the environment.
+        """
+        return get_api_key(self._adapter.provider)
+
     def _resolved_backend(self) -> str:
         if self._backend == "auto":
-            return "agent" if get_api_key() else "codex"
+            return "agent" if self._active_api_key() else "codex"
         return self._backend
 
     def _backend_status(self) -> str:
@@ -266,7 +331,7 @@ class CodexWorker(threading.Thread):
         active = self._resolved_backend()
         messages: list[str] = []
         if active in {"api", "agent"}:
-            if get_api_key():
+            if self._active_api_key():
                 messages.append("✓ API key configured. Connection will be checked on the first message.")
             else:
                 messages.append("⚠ API key is not configured. Open Gear → Connection settings to add one.")
@@ -473,7 +538,7 @@ class CodexWorker(threading.Thread):
                 raise
 
     def _run_api_turn(self, text: str, image_paths: list[str], ephemeral: bool = False):
-        api_key = get_api_key()
+        api_key = self._active_api_key()
         if not api_key:
             raise RuntimeError("API Key 未配置；点击底部状态栏打开 Connection settings")
         self.ui.put(("status", "API connecting…"))
@@ -495,13 +560,17 @@ class CodexWorker(threading.Thread):
             "input": [{"role": "user", "content": content}],
             "stream": True,
         }
-        response = self._open_api_response_with_key_refresh(payload, api_key, "text/event-stream")
-        with self._api_lock:
-            self._api_response = response
+        request_started = time.monotonic()
+        response = None
         completed = False
         saw_delta = False
+        first_token_at = None
+        metric_error: BaseException | None = None
         answer_parts: list[str] = []
         try:
+            response = self._open_api_response_with_key_refresh(payload, api_key, "text/event-stream")
+            with self._api_lock:
+                self._api_response = response
             for raw_line in response:
                 if self._interrupted:
                     break
@@ -561,10 +630,33 @@ class CodexWorker(threading.Thread):
                     if text_out:
                         answer_parts.append(text_out)
                         self.ui.put(("delta", text_out))
+                if answer_parts and first_token_at is None:
+                    first_token_at = time.monotonic()
+        except BaseException as exc:
+            metric_error = exc
+            raise
         finally:
             try:
-                response.close()
+                if response is not None:
+                    response.close()
             except Exception:
+                pass
+            try:
+                status_code = None
+                if metric_error is not None:
+                    match = re.search(r"\bHTTP\s+(\d{3})\b", str(metric_error), re.IGNORECASE)
+                    status_code = int(match.group(1)) if match else None
+                self._agent.model_health_store.record(
+                    provider=self._adapter.provider, model=self._model,
+                    operation="stream_chat", ok=bool(completed and metric_error is None and not self._interrupted),
+                    latency_ms=(time.monotonic() - request_started) * 1000,
+                    first_token_ms=((first_token_at - request_started) * 1000
+                                    if first_token_at is not None else None),
+                    status_code=status_code,
+                    failure_kind=(type(metric_error).__name__ if metric_error else None),
+                )
+            except Exception:
+                # Health telemetry must not change the transport result.
                 pass
         if self._interrupted:
             self.ui.put(("system", "⏹ stopped."))
@@ -627,7 +719,7 @@ class CodexWorker(threading.Thread):
         except RuntimeError as exc:
             if "API HTTP 401" not in str(exc):
                 raise
-            refreshed_key = get_api_key()
+            refreshed_key = self._active_api_key()
             if not refreshed_key or refreshed_key == api_key:
                 raise
             return self._open_api_response(payload, refreshed_key, accept)
@@ -760,7 +852,7 @@ class CodexWorker(threading.Thread):
             return
         if self._resolved_backend() == "api":
             try:
-                api_key = get_api_key()
+                api_key = self._active_api_key()
                 if not api_key:
                     raise RuntimeError("API Key is not configured")
                 meta = self._compact_api_context(api_key, force=True)

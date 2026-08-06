@@ -48,6 +48,18 @@ _ENV_MTIME_NS = _file_mtime_ns()
 _VALUES_LOCK = threading.RLock()
 
 
+def _explicit_key_names(provider: str | None) -> tuple[str, ...]:
+    name = str(provider or "").strip().lower().replace("_", "-")
+    return {
+        "openai": ("OPENAI_API_KEY", "openai_api_key"),
+        "responses": ("OPENAI_API_KEY", "openai_api_key"),
+        "deepseek": ("DEEPSEEK_API_KEY", "deepseek_api_key"),
+        "qwen": ("QWEN_API_KEY", "qwen_api_key", "DASHSCOPE_API_KEY", "dashscope_api_key"),
+        "dashscope": ("DASHSCOPE_API_KEY", "dashscope_api_key", "QWEN_API_KEY", "qwen_api_key"),
+        "openai-compatible": ("OPENAI_API_KEY", "openai_api_key"),
+    }.get(name, ())
+
+
 def _values() -> dict[str, str]:
     """Return current file settings, refreshing after an in-place .env edit.
 
@@ -86,6 +98,12 @@ def api_key(provider: str | None = None) -> str:
             value = os.environ.get(key, "").strip() if key.isupper() else values.get(key, "")
             if value:
                 return value
+        # A provider explicitly selected by the user must never inherit the
+        # generic OpenAI/.env key.  Cross-vendor fallback targets use
+        # explicit_api_key(), while ``api_key()`` without a provider retains
+        # the legacy generic behavior for the primary connection.
+        if name in {"deepseek", "qwen", "dashscope"}:
+            return ""
     candidates = (
         os.environ.get("OPENAI_API_KEY", "").strip(),
         os.environ.get("DEEPSEEK_API_KEY", "").strip(),
@@ -96,6 +114,20 @@ def api_key(provider: str | None = None) -> str:
         values.get("qwen_api_key", ""),
     )
     return next((value for value in candidates if value), "")
+
+
+def explicit_api_key(provider: str | None = None) -> str:
+    """Return only a key explicitly assigned to the requested provider.
+
+    This is used by multi-provider acceptance probes so a generic primary key
+    cannot be sent accidentally to a DeepSeek/Qwen fallback endpoint.
+    """
+    values = _values()
+    for key in _explicit_key_names(provider):
+        value = os.environ.get(key, "").strip() if key.isupper() else values.get(key, "")
+        if value:
+            return value
+    return ""
 
 
 def model_fallbacks_raw() -> str:

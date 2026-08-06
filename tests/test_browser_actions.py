@@ -19,6 +19,18 @@ class BrowserActionTests(unittest.TestCase):
         _actions, error = validate_browser_action_batch([{"action": "snapshot", "arguments": {}}] * 9)
         self.assertIn("1-8", error)
 
+    def test_validates_tab_switch_and_structured_extract_contract(self):
+        actions, error = validate_browser_action_batch([
+            {"action": "switch_tab", "arguments": {"index": 1}},
+            {"action": "extract", "arguments": {"ref": "e17", "fields": ["title", "price"]}},
+        ])
+        self.assertIsNone(error)
+        self.assertEqual([item.action for item in actions], ["switch_tab", "extract"])
+        _actions, error = validate_browser_action_batch([{"action": "switch_tab", "arguments": {"index": -1}}])
+        self.assertIn("non-negative", error)
+        _actions, error = validate_browser_action_batch([{"action": "extract", "arguments": {"ref": "e17", "fields": [""]}}])
+        self.assertIn("non-empty", error)
+
 
 if __name__ == "__main__":
     unittest.main()

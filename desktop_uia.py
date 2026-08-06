@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import secrets
 import time
+import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any
+
+from desktop_adapters import DesktopApplicationRegistry
+from win32utils import window_process_name
 
 try:  # Optional until the next setup/install; importing DeskOrb must still work.
     from pywinauto import Desktop
@@ -26,11 +31,22 @@ class CachedControl:
 
 class DesktopUIA:
     TTL_SECONDS = 12
+    # These are delivery-state labels, not message content.  A QQ send action
+    # is considered delivered only after a fresh UIA tree contains one of
+    # these markers and differs from the pre-send observation.
+    MESSAGE_DELIVERY_MARKERS = (
+        "已发送", "发送成功", "消息已发出", "已送达", "message sent", "sent", "delivered",
+    )
 
-    def __init__(self, desktop_factory=None, clock=time.monotonic):
+    def __init__(self, desktop_factory=None, clock=time.monotonic,
+                 application_registry: DesktopApplicationRegistry | None = None):
         self._desktop_factory = desktop_factory or Desktop
         self._clock = clock
         self._controls: dict[str, CachedControl] = {}
+        self._high_risk_controls: dict[str, float] = {}
+        self._observation_fingerprints: dict[int, tuple[str, float]] = {}
+        self._pending_message_verification: dict[int, tuple[float, str | None]] = {}
+        self._application_registry = application_registry or DesktopApplicationRegistry()
 
     @property
     def available(self) -> bool:
@@ -46,6 +62,8 @@ class DesktopUIA:
             descendants = window.descendants()
         except Exception as exc:
             return {"ok": False, "error": f"Could not inspect the active window with UI Automation: {exc}"}
+        process_name = window_process_name(hwnd)
+        application = self._application_registry.match(process_name)
         self._prune()
         controls: list[dict[str, Any]] = []
         for wrapper in descendants:
@@ -56,14 +74,37 @@ class DesktopUIA:
                 controls.append(item)
         dialogs = [item for item in controls if str(item.get("control_type", "")).lower() in {"dialog", "window"}]
         disabled = sum(not bool(item.get("enabled", True)) for item in controls)
-        return {"ok": True, "window_handle": hwnd, "controls": controls,
+        recommended_actions = self._application_registry.recommended_actions(process_name, controls)
+        for recommendation in recommended_actions:
+            if (isinstance(recommendation, dict)
+                    and str(recommendation.get("risk_level") or "").lower() == "high"):
+                control_id = str(recommendation.get("control_id") or "")
+                if control_id:
+                    self._high_risk_controls[control_id] = self._clock() + self.TTL_SECONDS
+        fingerprint = self._fingerprint(controls)
+        self._observation_fingerprints[int(hwnd)] = (fingerprint, self._clock())
+        verification = self._message_delivery_verification(application.app_id, controls, fingerprint, int(hwnd))
+        result = {"ok": True, "window_handle": hwnd, "process_name": process_name[:80],
+                "application": application.safe_dict(), "controls": controls,
+                "recommended_actions": recommended_actions,
                 "dialogs": dialogs[:8], "disabled_control_count": disabled,
                 "requires_user_attention": bool(dialogs), "expires_in_seconds": self.TTL_SECONDS}
+        if verification is not None:
+            result["verification"] = verification
+        return result
+
+    def is_high_risk(self, control_id: str) -> bool:
+        """Return the risk declared by the most recent bounded observation."""
+        self._prune()
+        return str(control_id or "") in self._high_risk_controls
 
     def invoke(self, control_id: str, hwnd: int) -> dict[str, Any]:
         wrapper, error = self._valid(control_id, hwnd)
         if error:
             return {"ok": False, "error": error}
+        before = self._action_state(wrapper)
+        message_action = self._is_message_send_control(wrapper, hwnd)
+        message_baseline = self._observation_fingerprints.get(int(hwnd), (None, 0.0))[0] if message_action else None
         try:
             invoke = getattr(wrapper, "invoke", None)
             if callable(invoke):
@@ -76,7 +117,26 @@ class DesktopUIA:
                     return {"ok": False, "error": "The selected control does not support a semantic invoke action."}
         except Exception as exc:
             return {"ok": False, "error": f"UI Automation invoke failed: {exc}"}
-        return {"ok": True, "control_id": control_id, "action": "invoke"}
+        after = self._action_state(wrapper)
+        changed = self._meaningful_state_change(before, after)
+        dismissed = before.get("visible") is True and after.get("visible") is False
+        verified = bool(changed or dismissed)
+        if message_action:
+            # Dispatch is not delivery.  The next fresh observation must show
+            # a state change and a delivery marker before the task contract can
+            # be completed.
+            self._pending_message_verification[int(hwnd)] = (
+                self._clock() + self.TTL_SECONDS, message_baseline)
+        if dismissed:
+            kind = "uia_control_dismissed"
+        elif changed:
+            kind = "uia_state_change"
+        else:
+            kind = "uia_invoke_dispatch"
+        return {"ok": True, "control_id": control_id, "action": "invoke",
+                "verified": verified,
+                "verification": {"passed": verified, "kind": kind,
+                                  "requires_reobserve": not verified}}
 
     def set_value(self, control_id: str, hwnd: int, value: str) -> dict[str, Any]:
         wrapper, error = self._valid(control_id, hwnd)
@@ -93,7 +153,63 @@ class DesktopUIA:
                 set_value(value)
         except Exception as exc:
             return {"ok": False, "error": f"UI Automation set value failed: {exc}"}
-        return {"ok": True, "control_id": control_id, "action": "set_value", "characters": len(value)}
+        observed = self._read_value(wrapper)
+        verified = observed is not None and observed == value
+        return {"ok": True, "control_id": control_id, "action": "set_value", "characters": len(value),
+                "verified": verified,
+                "verification": {"passed": verified, "kind": "uia_value_readback"}}
+
+    @staticmethod
+    def _read_value(wrapper: Any) -> str | None:
+        """Read a control value without retaining the value in diagnostics."""
+        for method_name in ("get_value", "window_text"):
+            method = getattr(wrapper, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            if value is not None:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _action_state(wrapper: Any) -> dict[str, Any]:
+        """Read non-sensitive control state for post-action verification.
+
+        UIA wrappers expose different methods depending on the application and
+        control provider.  Keep this probe deliberately small and never retain
+        text/value content; the task verifier only needs observable state
+        transitions such as a checkbox toggling or a dialog disappearing.
+        """
+        state: dict[str, Any] = {}
+        for key, method_names in {
+            "visible": ("is_visible",),
+            "enabled": ("is_enabled",),
+            "focused": ("has_focus", "is_focused"),
+            "selected": ("is_selected",),
+            "expanded": ("is_expanded",),
+            "checked": ("is_checked",),
+            "toggle_state": ("get_toggle_state",),
+        }.items():
+            for method_name in method_names:
+                method = getattr(wrapper, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    value = method()
+                except Exception:
+                    continue
+                if isinstance(value, (bool, int, float, str)) or value is None:
+                    state[key] = value
+                break
+        return state
+
+    @staticmethod
+    def _meaningful_state_change(before: dict[str, Any], after: dict[str, Any]) -> bool:
+        keys = ("selected", "expanded", "checked", "toggle_state", "focused")
+        return any(key in before and key in after and before[key] != after[key] for key in keys)
 
     def _describe(self, wrapper: Any, hwnd: int) -> dict[str, Any] | None:
         try:
@@ -110,9 +226,76 @@ class DesktopUIA:
             self._controls[control_id] = CachedControl(wrapper, hwnd, self._clock())
             return {"control_id": control_id, "name": name[:160], "automation_id": automation_id[:160],
                     "control_type": control_type[:80], "enabled": self._enabled(wrapper),
+                    "actions": self._actions(wrapper),
                     "rect": {"left": int(rect.left), "top": int(rect.top), "right": int(rect.right), "bottom": int(rect.bottom)}}
         except Exception:
             return None
+
+    @classmethod
+    def _fingerprint(cls, controls: list[dict[str, Any]]) -> str:
+        """Hash non-secret control metadata for before/after correlation."""
+        parts = []
+        for item in controls if isinstance(controls, list) else []:
+            if not isinstance(item, dict):
+                continue
+            parts.append("|".join(str(item.get(key) or "")[:160]
+                                  for key in ("name", "automation_id", "control_type", "enabled", "actions")))
+        return hashlib.sha256("\n".join(parts).encode("utf-8", "replace")).hexdigest()
+
+    @classmethod
+    def _delivery_marker_count(cls, controls: list[dict[str, Any]]) -> int:
+        names = " ".join(str(item.get("name") or "") for item in controls
+                         if isinstance(item, dict)).lower()
+        count = 0
+        for marker in cls.MESSAGE_DELIVERY_MARKERS:
+            lowered = marker.lower()
+            matched = (re.search(r"\b" + re.escape(lowered) + r"\b", names)
+                       if lowered.isascii() else lowered in names)
+            count += bool(matched)
+        return count
+
+    def _message_delivery_verification(self, application_id: str, controls: list[dict[str, Any]],
+                                       fingerprint: str, hwnd: int) -> dict[str, Any] | None:
+        if str(application_id).lower() != "qq":
+            return None
+        pending = self._pending_message_verification.get(int(hwnd))
+        # The active window handle is the only correlation key; never infer a
+        # target from message text, window titles, or another QQ window.
+        marker_count = self._delivery_marker_count(controls)
+        baseline = pending[1] if pending else None
+        changed = bool(baseline and baseline != fingerprint)
+        passed = bool(pending and marker_count and changed)
+        if passed:
+            for hwnd, item in list(self._pending_message_verification.items()):
+                if item is pending:
+                    self._pending_message_verification.pop(hwnd, None)
+                    break
+        return {"passed": passed, "kind": "message_delivery",
+                "marker_count": marker_count, "state_changed": changed,
+                "requires_reobserve": not passed}
+
+    @classmethod
+    def _is_message_send_control(cls, wrapper: Any, hwnd: int) -> bool:
+        if window_process_name(hwnd).lower() not in {"qq.exe", "qqnt.exe"}:
+            return False
+        try:
+            info = wrapper.element_info
+            name = str(getattr(info, "name", "") or wrapper.window_text() or "").lower()
+            control_type = str(getattr(info, "control_type", "") or "").lower()
+            return control_type in {"button", "menuitem", "listitem"} and any(
+                marker in name for marker in ("发送", "send", "提交", "publish"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _actions(wrapper: Any) -> list[str]:
+        """Expose semantic operations supported by this exact control."""
+        actions: list[str] = []
+        if callable(getattr(wrapper, "invoke", None)) or callable(getattr(wrapper, "select", None)):
+            actions.append("invoke")
+        if callable(getattr(wrapper, "set_edit_text", None)) or callable(getattr(wrapper, "set_value", None)):
+            actions.append("set_value")
+        return actions
 
     @staticmethod
     def _enabled(wrapper: Any) -> bool:
@@ -141,3 +324,9 @@ class DesktopUIA:
     def _prune(self) -> None:
         now = self._clock()
         self._controls = {key: item for key, item in self._controls.items() if now - item.created_at <= self.TTL_SECONDS}
+        self._high_risk_controls = {key: expires for key, expires in self._high_risk_controls.items()
+                                    if expires > now}
+        self._observation_fingerprints = {key: item for key, item in self._observation_fingerprints.items()
+                                          if now - item[1] <= self.TTL_SECONDS}
+        self._pending_message_verification = {key: item for key, item in self._pending_message_verification.items()
+                                              if item[0] > now}

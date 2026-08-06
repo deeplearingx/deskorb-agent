@@ -30,6 +30,7 @@ class ProviderProfile:
 def normalize_provider(value: str | None) -> str:
     name = str(value or "auto").strip().lower().replace("_", "-")
     aliases = {
+        "gpt": "openai", "openai-compatible-gpt": "openai",
         "openai-compatible": "openai-compatible", "compatible": "openai-compatible",
         "chat-completions": "openai-compatible", "chat": "openai-compatible",
         "openai-responses": "responses", "responses-compatible": "responses",

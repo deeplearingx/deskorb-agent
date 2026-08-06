@@ -116,6 +116,24 @@ class MCPClientTests(unittest.TestCase):
         self.assertTrue(schemas)
         self.assertEqual(playwright.list_calls, 1)
         self.assertEqual(powertoys.list_calls, 0)
+
+    def test_task_schema_view_filters_nonessential_playwright_tools(self):
+        class BroadClient(FakeClient):
+            def list_tools(self):
+                return [
+                    {"name": "browser_snapshot", "inputSchema": {"type": "object"}},
+                    {"name": "browser_click", "inputSchema": {"type": "object"}},
+                    {"name": "browser_take_screenshot", "inputSchema": {"type": "object"}},
+                    {"name": "browser_network_requests", "inputSchema": {"type": "object"}},
+                ]
+
+        bridge = MCPToolBridge(None, enable_playwright=True)
+        bridge.clients["playwright"] = BroadClient()
+        schemas = bridge.schemas_for_task(("playwright",))
+        names = [item["name"] for item in schemas]
+        self.assertTrue(any(name.endswith("browser_snapshot") for name in names))
+        self.assertFalse(any(name.endswith("browser_take_screenshot") for name in names))
+        self.assertFalse(any(name.endswith("browser_network_requests") for name in names))
         self.assertTrue(all(item["name"].startswith("mcp_playwright_") for item in schemas))
 
     def test_failed_server_discovery_is_not_repeated_in_one_runtime(self):
@@ -183,6 +201,32 @@ class MCPClientTests(unittest.TestCase):
         result = bridge.call(name, {"url": "https://other.test/private"})
         self.assertFalse(result["ok"])
         self.assertIn("allowed_domains", result["error"])
+
+    def test_mcp_failure_resets_stdio_client_without_replaying_call(self):
+        class FailingClient:
+            def __init__(self):
+                self.restarted = 0
+
+            def list_tools(self):
+                return [{"name": "browser_snapshot", "inputSchema": {"type": "object"}}]
+
+            def call_tool(self, _name, _arguments):
+                from mcp_client import MCPError
+                raise MCPError("MCP server stopped while sending tools/call")
+
+            def restart(self):
+                self.restarted += 1
+
+            def close(self):
+                return None
+
+        bridge = MCPToolBridge(None, enable_playwright=True)
+        client = FailingClient()
+        bridge.clients = {"playwright": client}
+        name = bridge.schemas(["playwright"])[0]["name"]
+        result = bridge.call(name, {})
+        self.assertFalse(result["ok"])
+        self.assertEqual(client.restarted, 1)
 
 
 if __name__ == "__main__":

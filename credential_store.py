@@ -6,10 +6,24 @@ import ctypes.wintypes as wt
 import os
 
 from provider_env import api_key as _provider_api_key
+from provider_env import explicit_api_key as _explicit_provider_api_key
 
 
 TARGET = "DeskOrbAgent/OpenAIAPIKey"
 LEGACY_TARGET = "CodexOverlay/OpenAIAPIKey"
+PROVIDER_TARGETS = {
+    "openai": TARGET,
+    "responses": TARGET,
+    "openai-compatible": "DeskOrbAgent/OpenAICompatibleAPIKey",
+    "deepseek": "DeskOrbAgent/DeepSeekAPIKey",
+    "qwen": "DeskOrbAgent/QwenAPIKey",
+    "dashscope": "DeskOrbAgent/QwenAPIKey",
+}
+
+
+def _credential_target(provider: str | None = None) -> str:
+    name = str(provider or "").strip().lower().replace("_", "-")
+    return PROVIDER_TARGETS.get(name, TARGET)
 
 
 def _environment_api_key(provider: str | None = None) -> str:
@@ -18,9 +32,9 @@ def _environment_api_key(provider: str | None = None) -> str:
     provider_keys = {
         "openai": ("OPENAI_API_KEY",),
         "responses": ("OPENAI_API_KEY",),
-        "deepseek": ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"),
-        "qwen": ("QWEN_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY"),
-        "dashscope": ("DASHSCOPE_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"),
+        "deepseek": ("DEEPSEEK_API_KEY",),
+        "qwen": ("QWEN_API_KEY", "DASHSCOPE_API_KEY"),
+        "dashscope": ("DASHSCOPE_API_KEY", "QWEN_API_KEY"),
     }
     keys = provider_keys.get(name, (
         "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY",
@@ -63,9 +77,16 @@ def get_api_key(provider: str | None = None) -> str:
     if os.name != "nt":
         return _provider_api_key(provider_name or None)
     pointer = ctypes.POINTER(CREDENTIALW)()
-    if not _advapi32.CredReadW(TARGET, 1, 0, ctypes.byref(pointer)):
-        if not _advapi32.CredReadW(LEGACY_TARGET, 1, 0, ctypes.byref(pointer)):
-            return _provider_api_key(provider_name or None)
+    target = _credential_target(provider_name or None)
+    found = bool(_advapi32.CredReadW(target, 1, 0, ctypes.byref(pointer)))
+    # A provider-specific selection must not silently reuse the generic OpenAI
+    # credential for DeepSeek/Qwen.  The generic target remains a compatibility
+    # fallback only for the legacy/auto/OpenAI paths.
+    if not found and provider_name not in {"deepseek", "qwen", "dashscope"}:
+        found = bool(_advapi32.CredReadW(LEGACY_TARGET if target == TARGET else TARGET,
+                                         1, 0, ctypes.byref(pointer)))
+    if not found:
+        return _provider_api_key(provider_name or None)
     try:
         cred = pointer.contents
         if not cred.CredentialBlob or not cred.CredentialBlobSize:
@@ -76,7 +97,32 @@ def get_api_key(provider: str | None = None) -> str:
         _advapi32.CredFree(pointer)
 
 
-def set_api_key(value: str) -> None:
+def get_explicit_provider_api_key(provider: str | None = None) -> str:
+    """Return only the provider-specific environment/.env key.
+
+    Unlike get_api_key(), this deliberately does not fall back to the generic
+    Windows Credential Manager value.  It is for multi-provider probes and
+    fallback selection, where sending a primary provider key to another vendor
+    would create a misleading connectivity result.
+    """
+    value = _explicit_provider_api_key(provider)
+    if value or os.name != "nt":
+        return value
+    target = _credential_target(provider)
+    pointer = ctypes.POINTER(CREDENTIALW)()
+    if not _advapi32.CredReadW(target, 1, 0, ctypes.byref(pointer)):
+        return ""
+    try:
+        cred = pointer.contents
+        if not cred.CredentialBlob or not cred.CredentialBlobSize:
+            return ""
+        raw = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
+        return raw.decode("utf-16-le").strip("\x00").strip()
+    finally:
+        _advapi32.CredFree(pointer)
+
+
+def set_api_key(value: str, provider: str | None = None) -> None:
     value = str(value or "").strip()
     if not value:
         delete_api_key()
@@ -87,7 +133,7 @@ def set_api_key(value: str) -> None:
     blob = (ctypes.c_byte * len(raw)).from_buffer_copy(raw)
     cred = CREDENTIALW()
     cred.Type = 1                    # CRED_TYPE_GENERIC
-    cred.TargetName = TARGET
+    cred.TargetName = _credential_target(provider)
     cred.CredentialBlobSize = len(raw)
     cred.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_byte))
     cred.Persist = 2                 # CRED_PERSIST_LOCAL_MACHINE
@@ -96,14 +142,21 @@ def set_api_key(value: str) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def delete_api_key() -> None:
+def delete_api_key(provider: str | None = None) -> None:
     if os.name != "nt":
         return
-    if not _advapi32.CredDeleteW(TARGET, 1, 0):
+    target = _credential_target(provider)
+    if not _advapi32.CredDeleteW(target, 1, 0):
         error = ctypes.get_last_error()
         if error != 1168:            # ERROR_NOT_FOUND
             raise ctypes.WinError(error)
+    # Removing the generic key also removes the legacy alias so an old
+    # installation cannot unexpectedly resurrect a deleted credential.
+    if target == TARGET and not _advapi32.CredDeleteW(LEGACY_TARGET, 1, 0):
+        error = ctypes.get_last_error()
+        if error != 1168:
+            raise ctypes.WinError(error)
 
 
-def has_api_key() -> bool:
-    return bool(get_api_key())
+def has_api_key(provider: str | None = None) -> bool:
+    return bool(get_api_key(provider))

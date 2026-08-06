@@ -75,17 +75,73 @@ class DesktopTools:
 
     def __init__(self):
         self.snapshot: DesktopSnapshot | None = None
+        # Keep a tiny, in-memory history so a post-action verification can
+        # compare the fresh screen with the snapshot captured immediately
+        # before the action.  History is bounded and never persisted.
+        self._snapshot_history: dict[str, DesktopSnapshot] = {}
+        self.preferred_hwnd = 0
+        self.overlay_hwnd = 0
         self._window_snapshot: dict[int, WindowSnapshot] = {}
         self._window_snapshot_at = 0.0
-        self.user32 = ctypes.windll.user32 if os.name == "nt" else None
-        self.kernel32 = ctypes.windll.kernel32 if os.name == "nt" else None
+        if os.name == "nt":
+            self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+            self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            self._configure_win32_signatures()
+        else:
+            self.user32 = None
+            self.kernel32 = None
 
-    def capture_state(self) -> dict:
+    def _configure_win32_signatures(self) -> None:
+        """Declare pointer-sized Win32 signatures before sending input."""
+        try:
+            self.user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+            self.user32.SetCursorPos.restype = ctypes.wintypes.BOOL
+            self.user32.SetForegroundWindow.argtypes = [ctypes.wintypes.HWND]
+            self.user32.SetForegroundWindow.restype = ctypes.wintypes.BOOL
+            self.user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+            self.user32.SendInput.restype = ctypes.c_uint
+            self.user32.mouse_event.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_uint, ULONG_PTR]
+            self.user32.keybd_event.argtypes = [ctypes.wintypes.BYTE, ctypes.wintypes.BYTE,
+                                                ctypes.c_uint, ULONG_PTR]
+        except (AttributeError, TypeError):
+            # Test doubles and restricted Win32 wrappers need no ctypes metadata.
+            return
+
+    @staticmethod
+    def _win32_error(prefix: str) -> str:
+        try:
+            code = int(ctypes.get_last_error() or 0)
+            detail = ctypes.FormatError(code).strip() if code else "unknown error"
+            return f"{prefix} (Win32 error {code}: {detail})."
+        except Exception:
+            return prefix + "."
+
+    def set_preferred_window(self, hwnd: int | None) -> None:
+        """Remember the external window that was active before the overlay took focus."""
+        try:
+            self.preferred_hwnd = max(0, int(hwnd or 0))
+        except (TypeError, ValueError):
+            self.preferred_hwnd = 0
+
+    def set_overlay_window(self, hwnd: int | None) -> None:
+        """Identify the overlay HWND allowed to hand focus back to the target."""
+        try:
+            self.overlay_hwnd = max(0, int(hwnd or 0))
+        except (TypeError, ValueError):
+            self.overlay_hwnd = 0
+
+    def resolve_target_window(self, hwnd: int | None = None) -> int:
+        """Resolve a preferred external target, falling back to the live foreground window."""
+        preferred = hwnd if hwnd is not None else self.preferred_hwnd
+        return self._usable_window(preferred) or int(foreground_capture_window() or 0)
+
+    def capture_state(self, target_hwnd: int | None = None) -> dict:
         if not self.user32:
             return {"ok": False, "error": "Desktop controls require Windows."}
         point = ctypes.wintypes.POINT()
         self.user32.GetCursorPos(ctypes.byref(point))
-        hwnd = foreground_capture_window()
+        hwnd = self.resolve_target_window(target_hwnd)
         digest = ""
         try:
             image = ImageGrab.grab()
@@ -93,11 +149,48 @@ class DesktopTools:
             digest = hashlib.sha256(image.tobytes()).hexdigest()[:16]
         except Exception:
             pass
+        previous = self.snapshot
         state = DesktopSnapshot(secrets.token_hex(4).upper(), time.monotonic(), point.x, point.y,
                                 int(hwnd or 0), window_title(hwnd) if hwnd else "", digest)
+        if previous is not None:
+            self._snapshot_history[previous.snapshot_id] = previous
+        self._snapshot_history[state.snapshot_id] = state
+        cutoff = state.created_at - self.TTL_SECONDS
+        self._snapshot_history = {
+            key: value for key, value in self._snapshot_history.items()
+            if value.created_at >= cutoff
+        }
+        if len(self._snapshot_history) > 32:
+            newest = sorted(self._snapshot_history.values(),
+                            key=lambda item: item.created_at, reverse=True)[:32]
+            self._snapshot_history = {item.snapshot_id: item for item in newest}
         self.snapshot = state
         return {"ok": True, "snapshot_id": state.snapshot_id, "cursor": {"x": point.x, "y": point.y},
-                "active_window": state.active_title, "screen_digest": state.screen_digest}
+                "active_window": state.active_title, "screen_digest": state.screen_digest,
+                "input_available": bool(state.active_hwnd),
+                "input_error": None if state.active_hwnd else
+                "No interactive foreground window is available; run DeskOrb in the signed-in user session."}
+
+    def focus_target(self, hwnd: int | None) -> dict:
+        """Activate a previously observed external window before input/UIA actions."""
+        target = self._usable_window(hwnd)
+        if not target:
+            return {"ok": False, "error": "The target window is no longer available or visible; observe again."}
+        try:
+            current = int(self.user32.GetForegroundWindow() or 0)
+            if current != target:
+                if not self.overlay_hwnd or current != self.overlay_hwnd:
+                    return {"ok": False,
+                            "error": "Active window changed since the snapshot; focus the intended application and observe again."}
+                if not bool(self.user32.SetForegroundWindow(target)):
+                    return {"ok": False, "error": self._win32_error("Windows rejected the target window focus")}
+                time.sleep(0.03)
+            verified = int(self.user32.GetForegroundWindow() or 0) == target
+            if not verified:
+                return {"ok": False, "error": "Windows did not activate the target window; retry after focusing it manually."}
+            return {"ok": True, "window_handle": target, "verified": True}
+        except Exception as exc:
+            return {"ok": False, "error": f"Could not activate the target window: {exc}"}
 
     @staticmethod
     def capture_image_data_url() -> str | None:
@@ -129,14 +222,15 @@ class DesktopTools:
         if not self._in_virtual_screen(x, y):
             return {"ok": False, "error": "Click coordinates are outside the virtual desktop."}
         if not self.user32.SetCursorPos(x, y):
-            return {"ok": False, "error": "Windows rejected the cursor move."}
+            return {"ok": False, "error": self._win32_error("Windows rejected the cursor move")}
         flags = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010),
                  "middle": (0x0020, 0x0040)}
         down, up = flags[button]
         for _ in range(clicks):
             self.user32.mouse_event(down, 0, 0, 0, 0)
             self.user32.mouse_event(up, 0, 0, 0, 0)
-        return {"ok": True, "clicked": {"x": x, "y": y, "button": button, "count": clicks}}
+        return {"ok": True, "baseline_snapshot_id": snapshot_id,
+                "clicked": {"x": x, "y": y, "button": button, "count": clicks}}
 
     def type_text(self, snapshot_id: str, text: str) -> dict:
         error = self._valid(snapshot_id, require_same_target=True)
@@ -159,8 +253,9 @@ class DesktopTools:
             sent_total += max(0, sent)
             if sent != len(chunk):
                 return {"ok": False, "characters": len(text), "events_sent": sent_total,
-                        "error": "Windows accepted only part of the keyboard input."}
-        return {"ok": True, "characters": len(text), "events_sent": sent_total}
+                        "error": self._win32_error("Windows accepted only part of the keyboard input")}
+        return {"ok": True, "baseline_snapshot_id": snapshot_id,
+                "characters": len(text), "events_sent": sent_total}
 
     def hotkey(self, snapshot_id: str, keys: list[str]) -> dict:
         error = self._valid(snapshot_id, require_same_target=True)
@@ -189,7 +284,7 @@ class DesktopTools:
         finally:
             for vk in reversed(pressed):
                 self.user32.keybd_event(vk, 0, 0x0002, 0)
-        return {"ok": True, "keys": normalized}
+        return {"ok": True, "baseline_snapshot_id": snapshot_id, "keys": normalized}
 
     def scroll(self, snapshot_id: str, delta: int, axis: str = "vertical") -> dict:
         error = self._valid(snapshot_id, require_same_target=True)
@@ -206,7 +301,8 @@ class DesktopTools:
             return {"ok": False, "error": "Scroll axis must be vertical or horizontal."}
         flag = 0x0800 if axis == "vertical" else 0x1000
         self.user32.mouse_event(flag, 0, 0, ctypes.c_ulong(amount * 120).value, 0)
-        return {"ok": True, "delta": amount, "axis": axis}
+        return {"ok": True, "baseline_snapshot_id": snapshot_id,
+                "delta": amount, "axis": axis}
 
     def focus_window(self, title: str) -> dict:
         if not self.user32:
@@ -219,7 +315,9 @@ class DesktopTools:
             return {"ok": False, "error": "Exact window title was not found."}
         self.user32.ShowWindow(hwnd, 9)
         self.user32.SetForegroundWindow(hwnd)
-        return {"ok": self.user32.GetForegroundWindow() == hwnd, "title": title}
+        verified = self.user32.GetForegroundWindow() == hwnd
+        return {"ok": verified, "verified": verified, "title": title,
+                "verification": {"passed": verified, "kind": "foreground_window"}}
 
     def list_windows(self) -> dict:
         """Return a short-lived inventory of normal visible top-level windows."""
@@ -276,6 +374,7 @@ class DesktopTools:
         assert item is not None
         action = str(action or "").strip().lower()
         hwnd = item.window_id
+        before_topmost = self._is_topmost(hwnd)
         try:
             if action == "focus":
                 self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
@@ -288,7 +387,9 @@ class DesktopTools:
                 self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
             elif action == "close":
                 self.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
-                return {"ok": True, "window_id": hwnd, "action": action, "title": item.title}
+                verified = not bool(self.user32.IsWindow(hwnd))
+                return {"ok": True, "verified": verified, "window_id": hwnd, "action": action,
+                        "title": item.title, "verification": {"passed": verified, "kind": "window_closed"}}
             elif action == "toggle_topmost":
                 exstyle = int(self.user32.GetWindowLongW(hwnd, -20))  # GWL_EXSTYLE
                 topmost = not bool(exstyle & 0x00000008)               # WS_EX_TOPMOST
@@ -312,8 +413,14 @@ class DesktopTools:
                 return {"ok": False, "error": "Unsupported window action."}
         except (TypeError, ValueError, OSError) as exc:
             return {"ok": False, "error": f"Window action failed: {exc}"}
-        return {"ok": True, "window_id": hwnd, "action": action, "title": item.title,
-                "after": self._window_bounds(hwnd)}
+        after = self._window_bounds(hwnd)
+        after_topmost = self._is_topmost(hwnd)
+        verified = self._verify_window_action(hwnd, action, item.bounds, after,
+                                               before_topmost=before_topmost,
+                                               after_topmost=after_topmost,
+                                               x=x, y=y, width=width, height=height)
+        return {"ok": True, "verified": verified, "window_id": hwnd, "action": action, "title": item.title,
+                "after": after, "verification": {"passed": verified, "kind": "window_state"}}
 
     def clipboard_text(self) -> dict:
         """Read Unicode clipboard text only after the runtime's explicit confirmation gate."""
@@ -341,13 +448,18 @@ class DesktopTools:
             self.user32.CloseClipboard()
 
     def verify_state(self, snapshot_id: str) -> dict:
-        state = self.snapshot
-        if not state or state.snapshot_id != snapshot_id:
+        state = self._snapshot_history.get(str(snapshot_id))
+        if state is None and self.snapshot and self.snapshot.snapshot_id == str(snapshot_id):
+            state = self.snapshot
+        if not state:
             return {"ok": False, "error": "Unknown desktop snapshot."}
-        current = self.capture_state()
+        if time.monotonic() - state.created_at > self.TTL_SECONDS:
+            return {"ok": False, "error": "Desktop snapshot expired; capture fresh state first."}
+        current = self.capture_state(self.preferred_hwnd)
         if not current.get("ok"):
             return current
-        return {"ok": True, "active_window_changed": current["active_window"] != state.active_title,
+        return {"ok": True, "baseline_snapshot_id": state.snapshot_id,
+                "active_window_changed": current["active_window"] != state.active_title,
                 "screen_changed": bool(state.screen_digest and current["screen_digest"] and current["screen_digest"] != state.screen_digest),
                 "after": current}
 
@@ -362,8 +474,28 @@ class DesktopTools:
         if require_same_target and state.active_hwnd:
             current = int(self.user32.GetForegroundWindow() or 0)
             if current != state.active_hwnd:
-                return "Active window changed since the snapshot; capture fresh state first."
+                focused = self.focus_target(state.active_hwnd)
+                if not focused.get("ok"):
+                    return "Active window changed since the snapshot and could not be reactivated; capture fresh state first."
         return None
+
+    def _usable_window(self, hwnd: int | None) -> int:
+        try:
+            value = int(hwnd or 0)
+        except (TypeError, ValueError):
+            return 0
+        if not value:
+            return 0
+        try:
+            if hasattr(self.user32, "IsWindow") and not self.user32.IsWindow(value):
+                return 0
+            if hasattr(self.user32, "IsWindowVisible") and not self.user32.IsWindowVisible(value):
+                return 0
+            if hasattr(self.user32, "IsIconic") and self.user32.IsIconic(value):
+                return 0
+        except Exception:
+            return 0
+        return value
 
     def _valid_window(self, window_id: int) -> tuple[WindowSnapshot | None, str | None]:
         if not self.user32:
@@ -390,6 +522,40 @@ class DesktopTools:
         except Exception:
             pass
         return None
+
+    def _verify_window_action(self, hwnd: int, action: str, before: dict[str, int],
+                              after: dict[str, int] | None, *, before_topmost: bool | None = None,
+                              after_topmost: bool | None = None, x: int | None = None,
+                              y: int | None = None, width: int | None = None,
+                              height: int | None = None) -> bool:
+        """Read back the state changed by a window action whenever Win32 exposes it."""
+        try:
+            if action == "focus":
+                return int(self.user32.GetForegroundWindow() or 0) == hwnd
+            if action == "minimize":
+                return bool(self.user32.IsIconic(hwnd))
+            if action == "maximize":
+                return bool(self.user32.IsZoomed(hwnd))
+            if action == "restore":
+                return not bool(self.user32.IsIconic(hwnd)) and not bool(self.user32.IsZoomed(hwnd))
+            if action == "toggle_topmost":
+                if before_topmost is not None and after_topmost is not None:
+                    return after_topmost is not before_topmost
+                return after_topmost is True
+            if action == "move_resize" and after is not None:
+                return after == {"x": int(x), "y": int(y), "width": int(width), "height": int(height)}
+            if action in {"snap_left", "snap_right"}:
+                return bool(after and (after["width"] != before.get("width") or after["x"] != before.get("x")))
+        except (AttributeError, TypeError, ValueError, OSError):
+            return False
+        return bool(after)
+
+    def _is_topmost(self, hwnd: int) -> bool | None:
+        try:
+            exstyle = int(self.user32.GetWindowLongW(hwnd, -20))
+            return bool(exstyle & 0x00000008)
+        except (AttributeError, TypeError, ValueError, OSError):
+            return None
 
     def _work_area(self, hwnd: int) -> dict[str, int]:
         class MONITORINFO(ctypes.Structure):

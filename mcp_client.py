@@ -188,6 +188,10 @@ class StdioMCPClient:
                 except Exception:
                     pass
 
+    def restart(self) -> None:
+        """Drop a failed stdio process so the next call starts a clean session."""
+        self.close()
+
     def _read_stdout(self) -> None:
         process = self._process
         if not process or not process.stdout:
@@ -248,6 +252,11 @@ class MCPToolBridge:
                      "execute", "file_write", "filesystem", "download")
     HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore", "submit", "send",
                        "purchase", "delete", "permission", "login")
+    PLAYWRIGHT_TASK_TOOLS = frozenset({
+        "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+        "browser_fill_form", "browser_press_key", "browser_select_option",
+        "browser_wait_for", "browser_tabs",
+    })
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
                  timeout_seconds: int = 30, playwright_mode: str = "isolated-playwright"):
@@ -292,6 +301,26 @@ class MCPToolBridge:
                             "description": self._description(server, original, action),
                             "parameters": parameters})
         return schemas
+
+    def schemas_for_task(self, server_names: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Return a small task-safe subset for context-sensitive runtimes.
+
+        Playwright exposes additional diagnostics, drag/drop, dialog and
+        network tools.  They remain locally configured and callable by an
+        explicit integration, but are not injected into every browser task's
+        model context.  This reduces prompt size and the chance of unsafe or
+        unsupported tool selection.
+        """
+        selected = set(str(name) for name in (server_names or self.clients))
+        all_schemas = self.schemas(selected)
+        safe: list[dict[str, Any]] = []
+        for schema in all_schemas:
+            name = str(schema.get("name") or "")
+            item = self._tools.get(name)
+            if item and item[0] == "playwright" and item[1] not in self.PLAYWRIGHT_TASK_TOOLS:
+                continue
+            safe.append(schema)
+        return safe
 
     def server_catalog(self) -> list[dict[str, Any]]:
         """Safe, process-free capability hints for intent routing.
@@ -340,6 +369,13 @@ class MCPToolBridge:
         try:
             result = self.clients[server].call_tool(original, clean)
         except MCPError as exc:
+            # A broken pipe, exited process, or timed-out JSON-RPC request can
+            # leave a live-looking Popen object with unusable stdio.  Do not
+            # replay the failed action here; reset the client so the next
+            # explicit observation starts a fresh MCP session.
+            restart = getattr(self.clients[server], "restart", None)
+            if callable(restart):
+                restart()
             return {"ok": False, "error": str(exc)}
         content = result.get("content", result)
         rendered = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
