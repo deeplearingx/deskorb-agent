@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
-                    MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, PLAYWRIGHT_MCP_ENABLED,
+                    MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_BINARY, OFFICECLI_ENABLED,
+                    PLAYWRIGHT_MCP_ENABLED,
                     SYSTEM_APPEND, WORKING_DIR)
 from agent_policy import ApprovalManager, Risk, ToolPolicy
 from desktop_tools import DesktopTools
@@ -343,6 +344,8 @@ class AgentRuntime:
         self.desktop = DesktopTools()
         try:
             self.mcp = MCPToolBridge(MCP_CONFIG_PATH, enable_playwright=PLAYWRIGHT_MCP_ENABLED,
+                                     enable_officecli=OFFICECLI_ENABLED,
+                                     officecli_binary=OFFICECLI_BINARY,
                                      timeout_seconds=MCP_TIMEOUT_SECONDS)
             self._mcp_configuration_error = ""
         except MCPError as exc:
@@ -578,7 +581,7 @@ class AgentRuntime:
                     self.ui.put(("tool", (self._tool_label(call.name), arguments)))
                     high_risk = self._high_risk_call(call.name, arguments)
                     decision = self.policy.decide(
-                        self._policy_name(call.name),
+                        self._policy_name(call.name, arguments),
                         execution_requested=self._execution_requested(original_text),
                         full_access=self.full_access,
                         task_authorized=self._task_authorized(),
@@ -588,7 +591,7 @@ class AgentRuntime:
                         result = {"ok": False, "error": decision.reason}
                     elif decision.kind.value == "confirm":
                         summary = self._summary(call.name, arguments)
-                        if self._is_task_scoped(call.name) and not high_risk and not self._task_authorized():
+                        if self._is_task_scoped(call.name, arguments) and not high_risk and not self._task_authorized():
                             summary = "Authorize task: " + original_text[:180]
                         request = self.request_approval(call.name, arguments, decision.risk, summary)
                         self._pending_execution = (call, continue_input(transcript, response, []), original_text)
@@ -672,7 +675,16 @@ class AgentRuntime:
         if name == "window_control" and str(arguments.get("action", "")).lower() == "close":
             return True
         if self.mcp and self.mcp.owns(name):
-            return (self.mcp.is_high_risk(name) or (self.mcp.is_action(name)
+            classifier = getattr(self.mcp, "is_read_only_call", None)
+            if classifier and classifier(name, arguments):
+                return False
+            try:
+                mcp_risk = self.mcp.is_high_risk(name, arguments)
+            except TypeError:
+                # Keep compatibility with lightweight test/adaptor bridges that
+                # still implement the older one-argument interface.
+                mcp_risk = self.mcp.is_high_risk(name)
+            return (mcp_risk or (self.mcp.is_action(name)
                     and str(arguments.get("_deskorb_risk_level", "normal")).lower() == "high"))
         return (name in {"desktop_click", "desktop_type", "desktop_hotkey", "desktop_clipboard_read_text"}
                 and str(arguments.get("risk_level", "normal")).lower() == "high")
@@ -753,15 +765,22 @@ class AgentRuntime:
         """Compatibility helper for callers that only need a yes/no answer."""
         return bool(self._mcp_servers_for_task(text))
 
-    def _policy_name(self, name: str) -> str:
+    def _policy_name(self, name: str, arguments: dict[str, Any] | None = None) -> str:
         if name == "mcp_enable_server":
             return name
         if self.mcp and self.mcp.owns(name):
+            classifier = getattr(self.mcp, "is_read_only_call", None)
+            read_only = classifier(name, arguments or {}) if classifier else not self.mcp.is_action(name)
+            if read_only:
+                return "mcp_read_only"
             return "application_launch" if self.mcp.is_action(name) else "desktop_capture_state"
         return name
 
-    def _is_task_scoped(self, name: str) -> bool:
-        return name in self.policy.TASK_SCOPED_TOOLS or bool(self.mcp and self.mcp.owns(name) and self.mcp.is_action(name))
+    def _is_task_scoped(self, name: str, arguments: dict[str, Any] | None = None) -> bool:
+        return name in self.policy.TASK_SCOPED_TOOLS or bool(
+            self.mcp and self.mcp.owns(name) and self.mcp.is_action(name)
+            and not (getattr(self.mcp, "is_read_only_call", lambda _name, _arguments: False)(
+                name, arguments or {})))
 
     def _append_desktop_observation(self, transcript: list[dict[str, Any]], tool_name: str):
         """Give the model a fresh visual/state observation after every desktop step."""
@@ -886,11 +905,13 @@ class AgentRuntime:
                        if isinstance(item, dict) for part in item.get("content") or []
                        if isinstance(part, dict) and part.get("type") in {"output_text", "text"})
 
-    @staticmethod
-    def _tool_label(name: str) -> str:
+    def _tool_label(self, name: str) -> str:
         if name == "mcp_enable_server":
             return "Select MCP integration"
         if name.startswith("mcp_"):
+            server_name = getattr(self.mcp, "server_name", lambda _name: None) if self.mcp else None
+            if server_name and server_name(name) == "officecli":
+                return "MCP Office tool"
             return "MCP browser tool"
         return {"desktop_get_active_window": "Active window", "filesystem_list": "List files",
                 "filesystem_read_text": "Read file", "filesystem_search_text": "Search files"}.get(name, name)
@@ -950,8 +971,9 @@ class AgentRuntime:
                                                    "write", "create", "fix", "run", "save", "clipboard", "window", "minimize", "maximize", "close",
                                                    "open", "launch", "start", "click", "type", "press", "hotkey"))
 
-    @staticmethod
-    def _summary(name: str, arguments: dict[str, Any]) -> str:
+    def _summary(self, name: str, arguments: dict[str, Any]) -> str:
+        if self.mcp and self.mcp.owns(name) and hasattr(self.mcp, "command_summary"):
+            return self.mcp.command_summary(name, arguments)
         if name == "shell_run":
             return "Run command: " + str(arguments.get("command", ""))[:180]
         if name == "application_launch":

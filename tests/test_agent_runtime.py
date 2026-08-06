@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from agent_policy import Risk
 from agent_runtime import AgentRuntime, ControlledTools, ReadOnlyTools
+from mcp_client import MCPToolBridge
 
 
 class ReadOnlyToolsTests(unittest.TestCase):
@@ -146,6 +147,35 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertTrue(runtime._task_authorized())
         runtime.set_permission_mode("plan")
         self.assertFalse(runtime._task_authorized())
+
+    def test_officecli_reads_are_observations_and_mutations_are_fresh_confirmations(self):
+        class OfficeClient:
+            def list_tools(self):
+                return [{"name": "officecli", "inputSchema": {
+                    "type": "object", "properties": {"command": {}}, "required": ["command"]}}]
+
+            def close(self):
+                return None
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        runtime.mcp.clients = {"officecli": OfficeClient()}
+        name = runtime.mcp.schemas(["officecli"])[0]["name"]
+        read = {"command": ["view", "report.docx", "text"], "_deskorb_risk_level": "high"}
+        write = {"command": ["set", "report.docx", "/body/p[1]", "--prop", "text=Updated"]}
+
+        self.assertEqual(runtime._policy_name(name, read), "mcp_read_only")
+        self.assertFalse(runtime._is_task_scoped(name, read))
+        self.assertFalse(runtime._high_risk_call(name, read))
+        self.assertEqual(runtime._tool_label(name), "MCP Office tool")
+
+        runtime._task_authorized_until = __import__("time").monotonic() + 10
+        self.assertTrue(runtime._high_risk_call(name, write))
+        decision = runtime.policy.decide(runtime._policy_name(name, write), execution_requested=True,
+                                         full_access=True, task_authorized=True,
+                                         high_risk=runtime._high_risk_call(name, write))
+        self.assertEqual(decision.kind.value, "confirm")
+        self.assertIn("OfficeCLI file operation: set report.docx", runtime._summary(name, write))
 
     def test_window_control_schema_is_non_strict_for_optional_bounds(self):
         schema = next(item for item in ControlledTools.schemas() if item["name"] == "window_control")

@@ -16,6 +16,11 @@ class ToolPolicyTests(unittest.TestCase):
         decision = self.policy.decide("desktop_list_windows", execution_requested=False, full_access=False)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
+    def test_mcp_read_only_is_allowed_in_read_only_mode(self):
+        decision = self.policy.decide("mcp_read_only", execution_requested=False, full_access=False)
+        self.assertEqual(decision.kind, DecisionKind.ALLOW)
+        self.assertEqual(decision.risk, Risk.OBSERVE)
+
     def test_write_requires_explicit_execution_intent(self):
         decision = self.policy.decide("filesystem_write", execution_requested=False, full_access=True)
         self.assertEqual(decision.kind, DecisionKind.DENY)

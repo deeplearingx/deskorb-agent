@@ -53,7 +53,7 @@ class ToolPolicy:
     OBSERVE_TOOLS = {
         "desktop_get_active_window", "desktop_screenshot", "filesystem_list",
         "filesystem_read_text", "filesystem_search_text", "process_list", "window_list", "desktop_list_windows", "desktop_capture_state", "desktop_verify_state",
-        "mcp_enable_server",
+        "mcp_enable_server", "mcp_read_only",
     }
     REVERSIBLE_TOOLS = {"filesystem_write", "filesystem_patch", "filesystem_copy"}
     DESTRUCTIVE_TOOLS = {"filesystem_move", "filesystem_delete", "process_stop", "shell_run"}
