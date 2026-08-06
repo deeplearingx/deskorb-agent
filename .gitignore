@@ -25,6 +25,9 @@ claude_overlay_shots/
 deskorb_agent_shots/
 .playwright-mcp/
 
+# OfficeCLI self-contained release output (package separately)
+/tools/officecli/
+
 # Local launch / marketing / progress notes (keep out of the public repo)
 LAUNCH_KIT.md
 PROGRESS.md
