@@ -84,7 +84,7 @@ settings window take precedence over this file.
 API mode provides chat and image/screenshot understanding. Use **agent** mode for
 local shell/file tools and Windows mouse/keyboard control; Codex mode is optional.
 
-### Local MCP: browser and PowerToys
+### Local MCP: browser, PowerToys, and OfficeCLI
 
 Agent mode includes two local MCP servers on demand: Microsoft's Playwright MCP for
 browser/web/search tasks, and DeskOrb's `powertoys_mcp.py` for supported PowerToys
@@ -111,6 +111,32 @@ ID can be used by the separately confirmed restore action while the MCP session 
 open. Keyboard Manager, Hosts, Environment Variables, Registry Preview, and global App
 settings remain read-only until explicitly reviewed and added to the allowlist.
 
+OfficeCLI is an optional third local MCP server for disk-backed `.docx`, `.xlsx`, and
+`.pptx` files. Build its self-contained Windows binary once with:
+
+```powershell
+.\build_officecli.ps1
+```
+
+The build requires the .NET 10 SDK; the published runtime does not require .NET on the
+machine where DeskOrb runs. If the binary is in a non-default location, set
+`DESKORB_AGENT_OFFICECLI_BINARY=C:\path\to\officecli.exe`. Set
+`DESKORB_AGENT_OFFICECLI=0` to disable automatic discovery. Ordinary desktop tasks do
+not start OfficeCLI; a matching Office file request loads it lazily. OfficeCLI write
+commands always require a fresh confirmation showing the requested path.
+
+OfficeCLI operates on files saved to disk. The existing Word/Excel attachment and COM
+workflow remains the right path for active documents with unsaved edits. Do not ask
+OfficeCLI to edit a file currently held by Word or Excel; save and close that document
+first. If OfficeCLI reports a lock or sharing violation, follow that save/close step and
+retry.
+
+For layout-sensitive output, the initial delivery gate is `validate`, `view issues`
+where applicable, and a PowerPoint screenshot via `view <file> screenshot --page N`.
+The MCP screenshot result is returned as an image block.
+Release packages should ship the binary alongside the retained
+`OfficeCLI-main/LICENSE`, `NOTICE`, and `THIRD-PARTY-NOTICES.txt` files.
+
 To use another trusted local MCP server, copy
 [`mcp.servers.example.json`](mcp.servers.example.json), edit it, and set:
 
@@ -120,7 +146,8 @@ DESKORB_AGENT_MCP_CONFIG=C:\path\to\mcp.servers.json
 
 The file uses the standard `mcpServers` JSON shape (`command`, `args`, optional
 `env`, `cwd`, and `enabled`). A custom file replaces the defaults, so keep the
-`powertoys` entry if you want that integration. Set `DESKORB_AGENT_PLAYWRIGHT_MCP=0`
+`powertoys` and `officecli` entries if you want those integrations. Set
+`DESKORB_AGENT_PLAYWRIGHT_MCP=0`
 to disable the default Playwright server. Chrome DevTools MCP can be configured this
 way when you explicitly want to attach to a Chrome instance started with remote
 debugging; Playwright MCP is the default because it runs in a separate local browser

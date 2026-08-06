@@ -8,6 +8,30 @@
       "command": ".venv\\Scripts\\python.exe",
       "args": ["powertoys_mcp.py"],
       "cwd": "."
+    },
+    "officecli": {
+      "command": "tools\\officecli\\officecli.exe",
+      "args": ["mcp"],
+      "cwd": ".",
+      "env": {
+        "OFFICECLI_SKIP_UPDATE": "1",
+        "OFFICECLI_NO_AUTO_RESIDENT": "1"
+      },
+      "deskorb": {
+        "description": "Create, read, modify, validate, and render Word, Excel, and PowerPoint files",
+        "keywords": [
+          "officecli",
+          "docx",
+          "xlsx",
+          "pptx",
+          "Word",
+          "Excel",
+          "PowerPoint",
+          "\u6587\u6863\u751f\u6210",
+          "\u6f14\u793a\u6587\u7a3f",
+          "\u5de5\u4f5c\u7c3f"
+        ]
+      }
     }
   }
 }
