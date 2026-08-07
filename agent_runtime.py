@@ -19,6 +19,7 @@ from typing import Any
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
                     MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
                     OFFICECLI_ENABLED,
+                    API_MAX_TOOL_ROUNDS,
                     MODEL_PROVIDER,
                     PLAYWRIGHT_MCP_ENABLED,
                     SYSTEM_APPEND, WORKING_DIR)
@@ -318,7 +319,7 @@ class ControlledTools(ReadOnlyTools):
 class AgentRuntime:
     """One local task loop using a Responses-compatible HTTPS provider."""
 
-    MAX_TOOL_ROUNDS = 20
+    MAX_TOOL_ROUNDS = API_MAX_TOOL_ROUNDS
     REQUEST_TIMEOUT = 45
     TASK_AUTHORIZATION_SECONDS = 600
     TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
