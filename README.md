@@ -29,6 +29,8 @@ Configuration overrides:
 - `DESKORB_AGENT_PROVIDER`: `auto`, `openai`, `responses`, `openai-compatible`,
   `deepseek`, or `qwen` (defaults to `auto`; `auto` detects the configured base URL)
 - `DESKORB_AGENT_API_MODEL`: startup API model
+- `DESKORB_AGENT_MAX_TOOL_ROUNDS`: maximum Agent/MCP tool rounds per task
+  (defaults to `100`, allowed range `20`–`500`)
 - `OPENAI_BASE_URL`: API base URL (Responses for OpenAI, Chat Completions for compatible providers)
 - `DESKORB_AGENT_API_PROXY`: optional HTTP/HTTPS proxy URL
 - `DESKORB_AGENT_CONTEXT_TOKENS`: API context budget (defaults to `24000`)

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from agent_policy import Risk
 from agent_runtime import AgentRuntime, ControlledTools, ReadOnlyTools
+from config import API_MAX_TOOL_ROUNDS
 from mcp_client import MCPToolBridge
 
 
@@ -69,6 +70,9 @@ class ReadOnlyToolsTests(unittest.TestCase):
     def test_open_and_launch_are_execution_requests(self):
         self.assertTrue(AgentRuntime._execution_requested("打开 Google Chrome"))
         self.assertTrue(AgentRuntime._execution_requested("launch Edge"))
+
+    def test_agent_runtime_uses_configured_tool_round_limit(self):
+        self.assertEqual(AgentRuntime.MAX_TOOL_ROUNDS, API_MAX_TOOL_ROUNDS)
 
     def test_mcp_router_activates_only_relevant_default_server(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
