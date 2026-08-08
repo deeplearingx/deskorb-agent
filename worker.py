@@ -60,6 +60,10 @@ class CodexWorker(threading.Thread):
             token_budget=API_CONTEXT_TOKEN_BUDGET,
             recent_turns=API_CONTEXT_RECENT_TURNS,
         )
+        # API chat and the local Agent Runtime keep separate transcripts.  Keep
+        # a bounded route hint so short follow-ups such as "继续" stay with the
+        # Agent Runtime that owns the preceding OfficeCLI task.
+        self._officecli_session_active = False
         self._api_response = None
         self._api_lock = threading.Lock()
         self._permission_mode = permission_mode or PERMISSION_MODE
@@ -175,6 +179,7 @@ class CodexWorker(threading.Thread):
                     self._session_id = None
                     self._api_context.clear()
                     self._agent.reset()
+                    self._officecli_session_active = False
                     self._tool_items_seen.clear()
                     self.ui.put(("reset_done", None))
                 elif kind == "compact":
@@ -183,6 +188,7 @@ class CodexWorker(threading.Thread):
                     self._model = self._normalize_model(payload)
                     self._session_id = None
                     self._api_context.clear()
+                    self._officecli_session_active = False
                     self._agent.configure(self._model, self._api_base_url, self._api_proxy_url,
                                           model_provider=self._model_provider)
                     self.ui.put(("model", self._model))
@@ -199,6 +205,7 @@ class CodexWorker(threading.Thread):
                     self._api_proxy_url = self._normalize_proxy(payload.get("api_proxy_url"))
                     self._session_id = None
                     self._api_context.clear()
+                    self._officecli_session_active = False
                     self._agent.configure(self._model, self._api_base_url, self._api_proxy_url,
                                           model_provider=self._model_provider)
                     self.ui.put(("model", self._model))
@@ -449,19 +456,52 @@ class CodexWorker(threading.Thread):
             dbg("officecli_route_error", {"error": self._short_status(str(exc))})
             return False
 
+    @staticmethod
+    def _officecli_follow_up_requested(text: str) -> bool:
+        """Recognize short continuations without hijacking unrelated API chat."""
+        normalized = " ".join(str(text or "").strip().lower().split())
+        if not normalized or len(normalized) > 96:
+            return False
+        return any(marker in normalized for marker in (
+            "继续", "接着", "重试", "再试", "恢复刚才", "继续上次", "完成刚才", "修复刚才",
+            "continue", "retry", "try again", "resume",
+        ))
+
+    @staticmethod
+    def _officecli_continuation_prompt(text: str) -> str:
+        return (
+            "Continue the previous OfficeCLI task from its last tool result. "
+            "Reuse the existing task context, keep using the OfficeCLI MCP integration, "
+            "inspect the last error, and continue until the requested file operation is verified. "
+            "Do not ask the user to restate the original task.\n"
+            "User follow-up: " + str(text or "").strip()
+        )
+
     def _run_api_or_officecli_turn(self, text: str, image_paths: list[str],
                                    ephemeral: bool = False, office_plan: bool = False,
                                    office_context: bool = False,
                                    office_generation: int | None = None):
         """Use the MCP-capable runtime for OfficeCLI while retaining plain API chat."""
         pending_agent_action = getattr(self._agent.approvals, "pending", None) is not None
-        if not office_plan and (pending_agent_action or self._officecli_task_requested(text)):
-            dbg("backend_route", {"from": "api", "to": "agent", "reason": "officecli"})
+        officecli_task = self._officecli_task_requested(text)
+        officecli_follow_up = (
+            self._officecli_session_active and self._officecli_follow_up_requested(text)
+        )
+        if not office_plan and (pending_agent_action or officecli_task or officecli_follow_up):
+            continuation = officecli_follow_up and not officecli_task and not pending_agent_action
+            routed_text = self._officecli_continuation_prompt(text) if continuation else text
+            if officecli_task or officecli_follow_up:
+                self._officecli_session_active = True
+            dbg("backend_route", {
+                "from": "api", "to": "agent",
+                "reason": "officecli_continuation" if continuation else "officecli",
+            })
             self.ui.put(("diagnostic", "OfficeCLI 请求已切换到本地 MCP Agent Runtime。"))
             return self._run_agent_turn(
-                text, image_paths, ephemeral=ephemeral, office_plan=office_plan,
+                routed_text, image_paths, ephemeral=ephemeral, office_plan=office_plan,
                 office_context=office_context, office_generation=office_generation,
             )
+        self._officecli_session_active = False
         return self._run_api_turn(
             text, image_paths, ephemeral=ephemeral, office_plan=office_plan,
             office_generation=office_generation,

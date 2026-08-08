@@ -65,7 +65,12 @@ class ReadOnlyToolsTests(unittest.TestCase):
         result = tools.run_shell({"command": "Write-Output SHELL_OK; $PSVersionTable.PSEdition", "timeout_seconds": 5})
         self.assertTrue(result["ok"])
         self.assertIn("SHELL_OK", result["stdout"])
-        self.assertIn("Core", result["stdout"])
+        self.assertRegex(result["stdout"], r"(?:Core|Desktop)")
+
+    def test_shell_runner_falls_back_to_windows_powershell_when_pwsh_is_missing(self):
+        with patch.dict("agent_runtime.os.environ", {}, clear=True), \
+             patch("agent_runtime.shutil.which", side_effect=lambda name: "powershell.exe" if name == "powershell.exe" else None):
+            self.assertEqual(ControlledTools._powershell_7_executable(), "powershell.exe")
 
     def test_open_and_launch_are_execution_requests(self):
         self.assertTrue(AgentRuntime._execution_requested("打开 Google Chrome"))
@@ -73,6 +78,12 @@ class ReadOnlyToolsTests(unittest.TestCase):
 
     def test_agent_runtime_uses_configured_tool_round_limit(self):
         self.assertEqual(AgentRuntime.MAX_TOOL_ROUNDS, API_MAX_TOOL_ROUNDS)
+
+    def test_officecli_tasks_get_a_larger_tool_round_budget(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        with patch.object(runtime, "_mcp_servers_for_task", return_value=("officecli",)), \
+             patch("agent_runtime.OFFICECLI_MAX_TOOL_ROUNDS", 300):
+            self.assertEqual(runtime._tool_round_limit("create a ppt"), 300)
 
     def test_mcp_router_activates_only_relevant_default_server(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
@@ -152,15 +163,46 @@ class ReadOnlyToolsTests(unittest.TestCase):
     def test_high_risk_marker_and_task_authorization(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
         self.assertFalse(runtime._high_risk_call("desktop_type", {"risk_level": "normal"}))
-        self.assertTrue(runtime._high_risk_call("desktop_type", {"risk_level": "high"}))
-        self.assertTrue(runtime._high_risk_call("desktop_clipboard_read_text", {}))
-        self.assertTrue(runtime._high_risk_call("window_control", {"action": "close"}))
+        self.assertFalse(runtime._high_risk_call("desktop_type", {"risk_level": "high"}))
+        self.assertFalse(runtime._high_risk_call("desktop_clipboard_read_text", {}))
+        self.assertFalse(runtime._high_risk_call("window_control", {"action": "close"}))
         runtime._task_authorized_until = __import__("time").monotonic() + 10
         self.assertTrue(runtime._task_authorized())
         runtime.set_permission_mode("plan")
         self.assertFalse(runtime._task_authorized())
 
-    def test_officecli_reads_are_observations_and_mutations_are_fresh_confirmations(self):
+    def test_only_file_deletion_shell_commands_are_high_risk(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        delete_commands = (
+            "Remove-Item -LiteralPath 'report.docx'",
+            "del report.docx",
+            "cmd /c erase report.docx",
+            "[System.IO.File]::Delete('report.docx')",
+            "git clean -fd",
+        )
+        for command in delete_commands:
+            with self.subTest(command=command):
+                self.assertTrue(runtime._high_risk_call("shell_run", {"command": command}))
+        self.assertFalse(runtime._high_risk_call("shell_run", {"command": "Write-Output done"}))
+        self.assertFalse(runtime._high_risk_call("shell_run", {"command": "New-Item report.docx"}))
+
+    def test_shell_file_deletion_requests_confirmation(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
+        runtime._request = Mock(return_value={
+            "output": [{"type": "function_call", "call_id": "delete-1", "name": "shell_run",
+                        "arguments": '{"command":"Remove-Item report.docx","timeout_seconds":5}'}],
+        })
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_turn("run Remove-Item report.docx", [])
+        event_list = []
+        while not events.empty():
+            event_list.append(events.get_nowait())
+        approvals = [payload for kind, payload in event_list if kind == "approval"]
+        self.assertEqual(len(approvals), 1)
+        self.assertIn("Delete file command: Remove-Item report.docx", approvals[0])
+
+    def test_officecli_reads_are_observations_and_mutations_are_automatic(self):
         class OfficeClient:
             def list_tools(self):
                 return [{"name": "officecli", "inputSchema": {
@@ -182,12 +224,16 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(runtime._tool_label(name), "MCP Office tool")
 
         runtime._task_authorized_until = __import__("time").monotonic() + 10
-        self.assertTrue(runtime._high_risk_call(name, write))
+        self.assertFalse(runtime._high_risk_call(name, write))
         decision = runtime.policy.decide(runtime._policy_name(name, write), execution_requested=True,
                                          full_access=True, task_authorized=True,
                                          high_risk=runtime._high_risk_call(name, write))
-        self.assertEqual(decision.kind.value, "confirm")
+        self.assertEqual(decision.kind.value, "allow")
         self.assertIn("OfficeCLI file operation: set report.docx", runtime._summary(name, write))
+
+        delete = {"command": ["delete", "report.docx"]}
+        self.assertTrue(runtime._high_risk_call(name, delete))
+        self.assertEqual(runtime._policy_name(name, delete), "filesystem_delete")
 
     def test_officecli_auto_approval_executes_generation_without_confirmation(self):
         class OfficeClient:
@@ -233,7 +279,7 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(transcript[-1]["content"][-1]["type"], "input_image")
         self.assertIn("NEXT", transcript[-1]["content"][0]["text"])
 
-    def test_one_confirmation_covers_multiple_normal_desktop_steps(self):
+    def test_normal_desktop_steps_need_no_confirmation(self):
         events = Queue()
         runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
         responses = iter([
@@ -249,6 +295,11 @@ class ReadOnlyToolsTests(unittest.TestCase):
              patch.object(runtime, "_run_local_tool", return_value={"ok": True}), \
              patch.object(runtime, "_append_desktop_observation", side_effect=lambda transcript, name: transcript):
             runtime.run_turn("打开 Edge 并聚焦地址栏", [])
+            current_events = list(events.queue)
+            self.assertFalse(any(kind == "approval" for kind, _ in current_events))
+            self.assertTrue(any(kind == "delta" and payload == "TASK_DONE" for kind, payload in current_events))
+            self.assertFalse(runtime._task_authorized())
+            return
             first_events = []
             while not events.empty():
                 first_events.append(events.get_nowait())
@@ -381,7 +432,8 @@ class ReadOnlyToolsTests(unittest.TestCase):
             def close(self):
                 return None
 
-        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root,
+                               model_provider="responses")
         transient = urllib.error.HTTPError("https://example.test/v1/responses", 502, "Bad Gateway", {},
                                             io.BytesIO(b'{"error":"temporary"}'))
         with patch("agent_runtime.urllib.request.urlopen", side_effect=[transient, Response()]) as open_call, \
@@ -390,6 +442,19 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(response["output_text"], "RECOVERED")
         self.assertEqual(open_call.call_count, 2)
         sleep.assert_called_once()
+
+    def test_coding_plan_authentication_error_has_actionable_hint(self):
+        runtime = AgentRuntime(
+            Queue(), "test", "https://ark.cn-beijing.volces.com/api/coding/v3",
+            working_dir=self.root, model_provider="openai-compatible",
+        )
+        unauthorized = urllib.error.HTTPError(
+            "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+            401, "Unauthorized", {}, io.BytesIO(b'{"error":{"message":"API key format is incorrect."}}'),
+        )
+        with patch("agent_runtime.urllib.request.urlopen", side_effect=unauthorized):
+            with self.assertRaisesRegex(RuntimeError, "Coding Plan.*API Key.*model ID"):
+                runtime._request({"model": "test"}, "invalid-key")
 
     def test_request_uses_provider_chat_protocol_and_normalizes_response(self):
         class Response:

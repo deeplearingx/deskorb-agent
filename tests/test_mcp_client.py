@@ -77,6 +77,15 @@ class MCPClientTests(unittest.TestCase):
         self.assertEqual(officecli.env["OFFICECLI_SKIP_UPDATE"], "1")
         self.assertIn("docx", officecli.intent_keywords)
 
+    def test_officecli_uses_a_longer_operation_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "officecli.exe"
+            binary.write_bytes(b"stub")
+            bridge = MCPToolBridge(None, enable_playwright=False, officecli_binary=binary,
+                                   timeout_seconds=30, officecli_timeout_seconds=180)
+        self.assertEqual(bridge.clients["officecli"].timeout_seconds, 180)
+        bridge.close()
+
     def test_officecli_can_be_disabled(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "officecli.exe"
@@ -133,6 +142,40 @@ class MCPClientTests(unittest.TestCase):
         summary = bridge.command_summary(name, {"command": ["set", "report.docx", "/body/p[1]"]})
         self.assertIn("OfficeCLI file operation:", summary)
         self.assertIn("report.docx", summary)
+
+    def test_officecli_batch_string_is_forwarded_as_quote_safe_argv(self):
+        captured = {}
+
+        class OfficeClient:
+            def list_tools(self):
+                return [{"name": "officecli", "inputSchema": {
+                    "type": "object", "properties": {"command": {}}, "required": ["command"]}}]
+
+            def call_tool(self, name, arguments):
+                captured.update(arguments)
+                return {"content": [{"type": "text", "text": "ok"}]}
+
+            def close(self):
+                return None
+
+        bridge = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        bridge.clients = {"officecli": OfficeClient()}
+        name = bridge.schemas(["officecli"])[0]["name"]
+        command = (
+            'batch "C:\\Reports\\Warhammer 40K.docx" --commands '
+            '[{"command":"add","parent":"/body","type":"paragraph",'
+            '"props":{"text":"A long paragraph"}}] --json'
+        )
+
+        result = bridge.call(name, {"command": command})
+
+        self.assertTrue(result["ok"])
+        self.assertIsInstance(captured["command"], list)
+        self.assertEqual(captured["command"][0:3], [
+            "batch", "C:\\Reports\\Warhammer 40K.docx", "--commands",
+        ])
+        self.assertEqual(json.loads(captured["command"][3])[0]["props"]["text"], "A long paragraph")
+        self.assertEqual(captured["command"][-1], "--json")
 
     def test_officecli_lock_errors_explain_save_and_close(self):
         class LockedClient:

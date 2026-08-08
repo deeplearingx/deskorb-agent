@@ -11,7 +11,22 @@ import threading
 from pathlib import Path
 
 
-_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_PARENT_ENV_PATH = _PROJECT_ROOT.parent / ".env"
+
+
+def _resolve_env_path() -> Path:
+    """Resolve the local provider file without exposing its contents."""
+    explicit = os.environ.get("DESKORB_AGENT_ENV_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    for candidate in (_PROJECT_ROOT / "volcengine.env", _PROJECT_ROOT / ".env", _PARENT_ENV_PATH):
+        if candidate.is_file():
+            return candidate.resolve()
+    return _PARENT_ENV_PATH
+
+
+_ENV_PATH = _resolve_env_path()
 
 
 def _file_mtime_ns() -> int | None:
@@ -87,6 +102,18 @@ def api_key(provider: str | None = None) -> str:
                 return value
         if name in {"deepseek", "qwen", "dashscope"}:
             return ""
+    if name == "openai-compatible":
+        # An OpenAI-compatible endpoint must not silently inherit a vendor
+        # key such as DEEPSEEK_API_KEY.  This matters for Ark and other
+        # compatible gateways, where the wrong vendor key is rejected as an
+        # invalid key even though a valid gateway key exists in the project
+        # env file.
+        candidates = (
+            os.environ.get("OPENAI_API_KEY", "").strip(),
+            values.get("openai_api_key", ""),
+            values.get("api-key", ""),
+        )
+        return next((value for value in candidates if value), "")
     candidates = (
         os.environ.get("OPENAI_API_KEY", "").strip(),
         os.environ.get("DEEPSEEK_API_KEY", "").strip(),

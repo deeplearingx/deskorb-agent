@@ -7,8 +7,19 @@ venv/
 .worktrees/
 .pytest_cache/
 .env
+*.env
 .env.*
 !.env.example
+!*.env.example
+
+# Project-local provider template and generated Office outputs
+/volcengine.env.example
+/*.doc
+/*.docx
+/*.ppt
+/*.pptx
+/~$*.doc*
+/~$*.ppt*
 
 # Machine-specific launchers / shortcuts (recreate locally)
 *.lnk

@@ -18,7 +18,7 @@ from typing import Any
 
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
                     MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
-                    OFFICECLI_ENABLED,
+                    OFFICECLI_ENABLED, OFFICECLI_MAX_TOOL_ROUNDS, OFFICECLI_TIMEOUT_SECONDS,
                     API_MAX_TOOL_ROUNDS,
                     MODEL_PROVIDER,
                     PLAYWRIGHT_MCP_ENABLED,
@@ -171,7 +171,7 @@ class ControlledTools(ReadOnlyTools):
              "description": "Write UTF-8 text to a file below the configured working directory.",
              "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}, "overwrite": {"type": "boolean"}}, "required": ["path", "text", "overwrite"], "additionalProperties": False}},
             {"type": "function", "name": "shell_run", "strict": True,
-             "description": "Run a PowerShell 7 command in the configured working directory. Always requires user confirmation.",
+             "description": "Run a PowerShell 7 command in the configured working directory. Confirmation is required only when the command deletes files.",
              "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout_seconds": {"type": "integer"}}, "required": ["command", "timeout_seconds"], "additionalProperties": False}},
             {"type": "function", "name": "application_launch", "strict": True,
              "description": "Launch an installed desktop application by its common name. Use this for requests such as opening Chrome, Edge, or QQ; never tell the user to click an icon when this tool can launch it.",
@@ -183,25 +183,25 @@ class ControlledTools(ReadOnlyTools):
              "description": "List visible top-level Windows windows and return short-lived window IDs for safe window control.",
              "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
             {"type": "function", "name": "window_control", "strict": False,
-             "description": "Control a window selected from a fresh desktop_list_windows result. Use close only when the user explicitly asks to close that window; it requires a fresh high-risk confirmation.",
+             "description": "Control a window selected from a fresh desktop_list_windows result. Execute the requested window action automatically.",
              "parameters": {"type": "object", "properties": {"window_id": {"type": "integer"}, "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "restore", "snap_left", "snap_right", "move_resize", "toggle_topmost", "close"]}, "x": {"type": "integer"}, "y": {"type": "integer"}, "width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["window_id", "action"], "additionalProperties": False}},
             {"type": "function", "name": "desktop_clipboard_read_text", "strict": True,
-             "description": "Read Unicode text currently in the Windows clipboard. This may contain sensitive data and always requires a fresh confirmation.",
+             "description": "Read Unicode text currently in the Windows clipboard when requested.",
              "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
             {"type": "function", "name": "desktop_click", "strict": True,
-             "description": "Click screen coordinates from a fresh desktop snapshot. Use count=2 only for an intentional double-click. Set risk_level=high for purchases, sending, deletion, permission changes, or other consequential effects.",
+             "description": "Click screen coordinates from a fresh desktop snapshot. Use count=2 only for an intentional double-click.",
              "parameters": {"type": "object", "properties": {"snapshot_id": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string", "enum": ["left", "right", "middle"]}, "count": {"type": "integer", "enum": [1, 2]}, "risk_level": {"type": "string", "enum": ["normal", "high"]}, "risk_reason": {"type": "string"}}, "required": ["snapshot_id", "x", "y", "button", "count", "risk_level", "risk_reason"], "additionalProperties": False}},
             {"type": "function", "name": "desktop_type", "strict": True,
-             "description": "Type Unicode text into the current target. Set risk_level=high for secrets, personal data, messages, forms, or consequential submissions.",
+             "description": "Type Unicode text into the current target.",
              "parameters": {"type": "object", "properties": {"snapshot_id": {"type": "string"}, "text": {"type": "string"}, "risk_level": {"type": "string", "enum": ["normal", "high"]}, "risk_reason": {"type": "string"}}, "required": ["snapshot_id", "text", "risk_level", "risk_reason"], "additionalProperties": False}},
             {"type": "function", "name": "desktop_hotkey", "strict": True,
-             "description": "Press an allowlisted keyboard shortcut. Set risk_level=high when it submits, sends, deletes, purchases, or changes permissions.",
+             "description": "Press an allowlisted keyboard shortcut.",
              "parameters": {"type": "object", "properties": {"snapshot_id": {"type": "string"}, "keys": {"type": "array", "items": {"type": "string"}}, "risk_level": {"type": "string", "enum": ["normal", "high"]}, "risk_reason": {"type": "string"}}, "required": ["snapshot_id", "keys", "risk_level", "risk_reason"], "additionalProperties": False}},
             {"type": "function", "name": "desktop_scroll", "strict": True,
-             "description": "Scroll from a fresh snapshot. Positive is up/right; negative is down/left. Always requires confirmation.",
+             "description": "Scroll from a fresh snapshot. Positive is up/right; negative is down/left.",
              "parameters": {"type": "object", "properties": {"snapshot_id": {"type": "string"}, "delta": {"type": "integer"}, "axis": {"type": "string", "enum": ["vertical", "horizontal"]}}, "required": ["snapshot_id", "delta", "axis"], "additionalProperties": False}},
             {"type": "function", "name": "window_focus", "strict": True,
-             "description": "Focus a window by its exact title. Always requires confirmation.",
+             "description": "Focus a window by its exact title.",
              "parameters": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": False}},
             {"type": "function", "name": "desktop_verify_state", "strict": True,
              "description": "Compare the current desktop state against a prior snapshot after an action.",
@@ -309,7 +309,8 @@ class ControlledTools(ReadOnlyTools):
     @staticmethod
     def _powershell_7_executable() -> str | None:
         configured = os.environ.get("DESKORB_AGENT_PWSH", "").strip()
-        candidates = [configured, shutil.which("pwsh"), shutil.which("pwsh.exe")]
+        candidates = [configured, shutil.which("pwsh"), shutil.which("pwsh.exe"),
+                      shutil.which("powershell"), shutil.which("powershell.exe")]
         for candidate in candidates:
             if candidate:
                 return candidate
@@ -320,7 +321,10 @@ class AgentRuntime:
     """One local task loop using a Responses-compatible HTTPS provider."""
 
     MAX_TOOL_ROUNDS = API_MAX_TOOL_ROUNDS
-    REQUEST_TIMEOUT = 45
+    # Long OfficeCLI tasks can spend several minutes in a single model turn
+    # while the runtime prepares and verifies a document. Keep this aligned
+    # with the configurable API timeout instead of aborting after 45 seconds.
+    REQUEST_TIMEOUT = 180
     TASK_AUTHORIZATION_SECONDS = 600
     TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
     HUMAN_VERIFICATION_TIMEOUT_SECONDS = 900
@@ -353,7 +357,8 @@ class AgentRuntime:
             self.mcp = MCPToolBridge(MCP_CONFIG_PATH, enable_playwright=PLAYWRIGHT_MCP_ENABLED,
                                      enable_officecli=OFFICECLI_ENABLED,
                                      officecli_binary=OFFICECLI_BINARY,
-                                     timeout_seconds=MCP_TIMEOUT_SECONDS)
+                                     timeout_seconds=MCP_TIMEOUT_SECONDS,
+                                     officecli_timeout_seconds=OFFICECLI_TIMEOUT_SECONDS)
             self._mcp_configuration_error = ""
         except MCPError as exc:
             self.mcp = None
@@ -563,8 +568,9 @@ class AgentRuntime:
             "When Full access is enabled and the user explicitly asks for a local change, filesystem_write may be used and its result is verified by rereading the file. "
             "When the user asks to open or launch Chrome, Edge, Firefox, QQ, Explorer, Notepad, or Calculator, call application_launch immediately with the matching application name. Never substitute a different application, claim you cannot open it, or tell the user to click its desktop icon. When the user explicitly asks to run a shell command, call shell_run immediately; never ask for confirmation in prose, because the runtime itself handles confirmation. To manage windows, first call desktop_list_windows and then use window_control with the returned short-lived window_id; prefer this over guessing coordinates. Before the first coordinate or keyboard action, call desktop_capture_state and use its snapshot ID. After every desktop action, the runtime automatically supplies a fresh screenshot and snapshot ID so you can inspect the result and continue the whole task. "
             "When local MCP browser tools are available, use their structured page snapshots and actions instead of screen coordinates for web tasks. If mcp_enable_server is available and the request matches a listed integration, call it before attempting that integration; it only enables schemas for one trusted local server and does not perform the user's action. A single task authorization covers normal application launch, clicking, typing, hotkeys, scrolling, window focus, and normal MCP browser actions for that task. Mark desktop_click, desktop_type, desktop_hotkey, and action MCP tools with risk_level=high only when the specific step sends or publishes content, purchases or transfers value, exposes secrets or personal data, deletes data, changes permissions/security, uploads private data, or accepts an irreversible prompt; give a concise risk_reason. High-risk steps and every shell command require a fresh confirmation. Use risk_level=normal with a short reason for ordinary navigation and search. If an MCP page snapshot or result shows a CAPTCHA, ‘快速验证身份’, ‘我是人类’, or similar human-verification screen, do not solve, bypass, or repeatedly retry it. The runtime will pause and request a manual handoff. Continue autonomously until the requested outcome is verified, then answer concisely with what you completed."
+            "In Full access, execute requested actions automatically. Ask for confirmation only before deleting files; the runtime detects common deletion commands inside shell_run. Do not ask for confirmation in prose. "
         )
-        for _ in range(self.MAX_TOOL_ROUNDS):
+        for _ in range(self._tool_round_limit(original_text)):
             if self._cancelled.is_set():
                 self._task_authorized_until = 0.0
                 self.ui.put(("system", "stopped."))
@@ -627,6 +633,12 @@ class AgentRuntime:
         self._task_authorized_until = 0.0
         raise RuntimeError("Agent exceeded the tool round limit")
 
+    def _tool_round_limit(self, task_text: str) -> int:
+        """Give OfficeCLI document tasks enough turns for batch edits and validation."""
+        if "officecli" in self._mcp_servers_for_task(task_text):
+            return max(self.MAX_TOOL_ROUNDS, OFFICECLI_MAX_TOOL_ROUNDS)
+        return self.MAX_TOOL_ROUNDS
+
     def _resolve_human_verification(self, text: str) -> tuple[str, dict[str, Any] | None]:
         pending = self._pending_human_verification
         if not pending:
@@ -682,7 +694,7 @@ class AgentRuntime:
         return " ".join(cleaned.split()) or "Desktop task"
 
     def _officecli_auto_approval(self, name: str, arguments: dict[str, Any]) -> bool:
-        """Allow only configured OfficeCLI generation/update verbs to skip confirmation."""
+        """Fast-path known non-delete OfficeCLI operations without policy work."""
         if not (OFFICECLI_AUTO_APPROVE and self.full_access and self.mcp):
             return False
         checker = getattr(self.mcp, "is_auto_approvable", None)
@@ -690,25 +702,39 @@ class AgentRuntime:
 
     def _high_risk_call(self, name: str, arguments: dict[str, Any]) -> bool:
         if name == "shell_run":
-            return True
-        if name == "desktop_clipboard_read_text":
-            return True
-        if name == "window_control" and str(arguments.get("action", "")).lower() == "close":
+            return self._shell_deletes_file(arguments.get("command"))
+        if name == "filesystem_delete":
             return True
         if self.mcp and self.mcp.owns(name):
-            classifier = getattr(self.mcp, "is_read_only_call", None)
-            if classifier and classifier(name, arguments):
-                return False
-            try:
-                mcp_risk = self.mcp.is_high_risk(name, arguments)
-            except TypeError:
-                # Keep compatibility with lightweight test/adaptor bridges that
-                # still implement the older one-argument interface.
-                mcp_risk = self.mcp.is_high_risk(name)
-            return (mcp_risk or (self.mcp.is_action(name)
-                    and str(arguments.get("_deskorb_risk_level", "normal")).lower() == "high"))
-        return (name in {"desktop_click", "desktop_type", "desktop_hotkey", "desktop_clipboard_read_text"}
-                and str(arguments.get("risk_level", "normal")).lower() == "high")
+            server_name = getattr(self.mcp, "server_name", lambda _name: None)(name)
+            return server_name == "officecli" and self._officecli_deletes_file(arguments.get("command"))
+        return False
+
+    @staticmethod
+    def _shell_deletes_file(command: Any) -> bool:
+        """Detect common file-deletion commands before allowing shell execution."""
+        text = str(command or "").strip()
+        if not text:
+            return False
+        patterns = (
+            r"(?i)(?:^|[;&|]\s*|&\s*)(?:remove-item|ri|rm|del|erase|rmdir|rd)\b",
+            r"(?i)\b(?:cmd(?:\.exe)?\s+/c\s+)(?:del|erase|rmdir|rd)\b",
+            r"(?i)\b(?:file|directory)\.delete\s*\(",
+            r"(?i)\[(?:system\.)?io\.(?:file|directory)\]::delete\s*\(",
+            r"(?i)\b(?:os\.(?:remove|unlink)|shutil\.rmtree)\s*\(",
+            r"(?i)\bgit\s+clean\b",
+        )
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    @staticmethod
+    def _officecli_deletes_file(command: Any) -> bool:
+        """Recognize explicit OfficeCLI file-delete verbs without treating remove as content editing."""
+        if isinstance(command, (list, tuple)):
+            verb = str(command[0]).strip() if command else ""
+        else:
+            match = re.match(r"\s*(?:\"([^\"]+)\"|'([^']+)'|(\S+))", str(command or ""))
+            verb = next((value for value in match.groups() if value is not None), "") if match else ""
+        return verb.lower().removesuffix(".exe") in {"delete", "delete-file", "remove-file"}
 
     def _available_schemas(self, task_text: str) -> list[dict[str, Any]]:
         schemas = self.tools.schemas()
@@ -790,6 +816,8 @@ class AgentRuntime:
         if name == "mcp_enable_server":
             return name
         if self.mcp and self.mcp.owns(name):
+            if self._high_risk_call(name, arguments or {}):
+                return "filesystem_delete"
             classifier = getattr(self.mcp, "is_read_only_call", None)
             read_only = classifier(name, arguments or {}) if classifier else not self.mcp.is_action(name)
             if read_only:
@@ -908,6 +936,11 @@ class AgentRuntime:
                         retry_after = 0.0
                     time.sleep(max(0.5 * (attempt + 1), min(10.0, retry_after)))
                     continue
+                if exc.code == 401 and "/api/coding/v3" in self.api_base_url.lower():
+                    detail += (
+                        " Coding Plan requires a valid Ark Coding Plan API Key and a Coding Plan model ID; "
+                        "check the api-key, url, and model_name entries in volcengine.env."
+                    )
                 raise RuntimeError(f"API HTTP {exc.code}: {detail}") from exc
             except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
                 transient_error = exc
@@ -996,7 +1029,8 @@ class AgentRuntime:
         if self.mcp and self.mcp.owns(name) and hasattr(self.mcp, "command_summary"):
             return self.mcp.command_summary(name, arguments)
         if name == "shell_run":
-            return "Run command: " + str(arguments.get("command", ""))[:180]
+            prefix = "Delete file command: " if self._shell_deletes_file(arguments.get("command")) else "Run command: "
+            return prefix + str(arguments.get("command", ""))[:180]
         if name == "application_launch":
             return "Launch application: " + str(arguments.get("application", ""))[:80]
         if name == "desktop_click":

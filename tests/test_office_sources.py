@@ -3,6 +3,40 @@ from unittest.mock import Mock, patch
 
 
 class OfficeSourceTests(unittest.TestCase):
+    def test_word_snapshot_uses_expected_window_when_active_window_is_unavailable(self):
+        from office_sources import read_active_office_snapshot
+
+        document = Mock()
+        document.Name = "Background.docx"
+        document.FullName = "C:/docs/Background.docx"
+        document.ReadOnly = False
+        document.ProtectionType = -1
+        document.Saved = True
+        body = Mock()
+        body.Range.Text = "Readable Word content\r"
+        body.Range.Tables.Count = 0
+        document.Paragraphs = [body]
+        document.Tables = []
+
+        class Application:
+            ActiveDocument = document
+
+            @property
+            def ActiveWindow(self):
+                raise RuntimeError("ActiveWindow is temporarily unavailable")
+
+        pythoncom = Mock()
+        client = Mock()
+        client.GetActiveObject.return_value = Application()
+
+        with patch("office_sources.is_word_window", return_value=True), \
+                patch("office_sources.root_window", side_effect=lambda hwnd: hwnd), \
+                patch("office_sources._load_com_modules", return_value=(pythoncom, client)):
+            snapshot = read_active_office_snapshot("word", 101)
+
+        self.assertEqual(snapshot.name, "Background.docx")
+        self.assertEqual(snapshot.targets[0].value, "Readable Word content")
+
     def _word_application(self):
         body = Mock()
         body.Range.Text = "Project title\r"

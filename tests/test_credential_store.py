@@ -34,6 +34,10 @@ class ProviderCredentialTests(unittest.TestCase):
              patch.object(provider_env, "_VALUES", {}):
             self.assertEqual(provider_env.explicit_api_key("deepseek"), "deep-key")
 
+    def test_openai_compatible_environment_does_not_use_vendor_key(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "deep-key"}, clear=True):
+            self.assertEqual(credential_store._environment_api_key("openai-compatible"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

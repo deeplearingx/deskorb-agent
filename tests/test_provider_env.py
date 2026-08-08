@@ -10,6 +10,25 @@ from provider_env import _parse_lines
 
 
 class ProviderEnvTests(unittest.TestCase):
+    def test_project_volcengine_env_is_preferred_over_parent_env(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            project.mkdir()
+            (project / "volcengine.env").write_text("provider: openai-compatible\n", encoding="utf-8")
+            parent = project.parent / ".env"
+            parent.write_text("provider: deepseek\n", encoding="utf-8")
+            with patch.object(provider_env, "_PROJECT_ROOT", project), \
+                 patch.object(provider_env, "_PARENT_ENV_PATH", parent), \
+                 patch.dict(provider_env.os.environ, {}, clear=True):
+                self.assertEqual(provider_env._resolve_env_path(), (project / "volcengine.env").resolve())
+
+    def test_explicit_env_file_overrides_default_locations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custom.env"
+            path.write_text("provider: openai-compatible\n", encoding="utf-8")
+            with patch.dict(provider_env.os.environ, {"DESKORB_AGENT_ENV_FILE": str(path)}, clear=True):
+                self.assertEqual(provider_env._resolve_env_path(), path.resolve())
+
     def test_colon_value_can_contain_equals(self):
         values = _parse_lines(["api-key: token=with=equals", "url: https://example.test/v1"])
         self.assertEqual(values["api-key"], "token=with=equals")
@@ -32,6 +51,11 @@ class ProviderEnvTests(unittest.TestCase):
         with patch.object(provider_env, "_VALUES", {"openai_api_key": "generic", "deepseek_api_key": "deep"}), \
              patch.dict(provider_env.os.environ, {}, clear=True):
             self.assertEqual(provider_env.api_key("deepseek"), "deep")
+
+    def test_openai_compatible_does_not_reuse_another_vendor_key(self):
+        with patch.object(provider_env, "_VALUES", {"api-key": "ark-key"}), \
+             patch.dict(provider_env.os.environ, {"DEEPSEEK_API_KEY": "deep-key"}, clear=True):
+            self.assertEqual(provider_env.api_key("openai-compatible"), "ark-key")
 
     def test_explicit_provider_key_does_not_use_generic_primary_key(self):
         with patch.object(provider_env, "_VALUES", {"api-key": "generic"}), \

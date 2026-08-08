@@ -15,6 +15,7 @@ from typing import Any
 
 from config import OFFICE_MAX_NONEMPTY_CELLS, OFFICE_MAX_RENDERED_CHARS
 from win32utils import root_window, window_process_name
+from word_sources import resolve_word_application_for_window
 
 
 class OfficeSourceError(ValueError):
@@ -71,9 +72,12 @@ def read_active_office_snapshot(kind: str, expected_hwnd: int) -> OfficeSnapshot
         pythoncom.CoInitialize()
         initialized = True
         prog_id = "Word.Application" if kind == "word" else "Excel.Application"
-        application = client.GetActiveObject(prog_id)
         if kind == "word":
+            application = resolve_word_application_for_window(pythoncom, client, expected_hwnd)
+            if application is None:
+                application = client.GetActiveObject(prog_id)
             return _read_word_snapshot(application, expected_hwnd)
+        application = client.GetActiveObject(prog_id)
         return _read_excel_snapshot(application, expected_hwnd)
     except OfficeSourceError:
         raise
@@ -103,9 +107,9 @@ def _load_com_modules() -> tuple[Any, Any]:
 
 
 def _read_word_snapshot(application: Any, expected_hwnd: int) -> OfficeSnapshot:
-    expected_root = _verify_active_root(application, expected_hwnd, "Word")
+    document = application.ActiveDocument
+    expected_root = _verify_active_root(application, expected_hwnd, "Word", document)
     try:
-        document = application.ActiveDocument
         _ensure_word_editable(document)
         targets = _word_targets(document)
         paragraph_count = len(_iter_collection(document.Paragraphs))
@@ -135,12 +139,17 @@ def _read_excel_snapshot(application: Any, expected_hwnd: int) -> OfficeSnapshot
     return _build_snapshot("excel", expected_root, identity, name, targets, changed)
 
 
-def _verify_active_root(application: Any, expected_hwnd: int, product: str) -> int:
-    try:
-        active_hwnd = _normalize_hwnd(application.ActiveWindow.Hwnd)
-    except Exception as exc:
-        raise OfficeSourceError(f"{product} has no readable active document window.") from exc
+def _verify_active_root(application: Any, expected_hwnd: int, product: str,
+                        active_document: Any = None) -> int:
+    active_hwnd = _try_active_window_hwnd(application, active_document)
     expected_root = _normalize_hwnd(root_window(expected_hwnd))
+    if not active_hwnd:
+        if product == "Word" and active_document is not None and expected_root:
+            # Word can expose ActiveDocument while temporarily rejecting both
+            # ActiveWindow.Hwnd calls (for example during SDI focus changes).
+            # The caller already verified that expected_hwnd belongs to Word.
+            return expected_root
+        raise OfficeSourceError(f"{product} has no readable active document window.")
     active_root = _normalize_hwnd(root_window(active_hwnd))
     if not expected_root or active_root != expected_root:
         raise OfficeSourceError(
@@ -148,6 +157,20 @@ def _verify_active_root(application: Any, expected_hwnd: int, product: str) -> i
             "DeskOrb Agent from. Focus that document and try again."
         )
     return expected_root
+
+
+def _try_active_window_hwnd(application: Any, active_document: Any = None) -> int:
+    """Return a COM window handle when available; tolerate transient Word failures."""
+    for owner in (application, active_document):
+        if owner is None:
+            continue
+        try:
+            hwnd = _normalize_hwnd(owner.ActiveWindow.Hwnd)
+        except Exception:
+            continue
+        if hwnd:
+            return hwnd
+    return 0
 
 
 def _ensure_word_editable(document: Any) -> None:

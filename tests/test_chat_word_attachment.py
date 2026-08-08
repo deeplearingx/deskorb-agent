@@ -19,6 +19,9 @@ class ChatWordAttachmentTests(unittest.TestCase):
         overlay._refresh_chat_word_attachment = Mock()
         overlay._refresh_send = Mock()
         overlay.busy_lbl = Mock()
+        overlay._word_attachment_history = []
+        overlay._active_word_attachment_question = None
+        overlay._active_word_attachment_document_id = None
         return overlay
 
     def test_word_attachment_is_sent_once_without_images_or_chat_display_leak(self):
@@ -40,6 +43,36 @@ class ChatWordAttachmentTests(unittest.TestCase):
         display = overlay.add_user.call_args.args[0]
         self.assertIn("Project brief.docx", display)
         self.assertNotIn("Secret full document.", display)
+
+    def test_word_attachment_prompt_includes_recent_same_document_context(self):
+        overlay = self._overlay()
+        overlay._word_attachment_history = [
+            ("word-window:101", "Summarize the document.", "The document establishes three main duties."),
+        ]
+        overlay.chat_word_attachment = WordMaterial(
+            document_id="word-window:101", name="Project brief.docx", text="Current document.",
+            character_count=17, has_unsaved_changes=True, window_title="Project brief.docx",
+        )
+
+        overlay._send_chat_word_attachment("Append that summary to the document.")
+
+        prompt = overlay._dispatch_turn.call_args.args[0]
+        self.assertIn("Previous Word attachment context", prompt)
+        self.assertIn("The document establishes three main duties.", prompt)
+        self.assertIn("Append that summary to the document.", prompt)
+
+    def test_word_attachment_remembers_only_the_completed_response(self):
+        overlay = self._overlay()
+        overlay._active_word_attachment_question = "Summarize the document."
+        overlay._active_word_attachment_document_id = "word-window:101"
+        overlay._turn_raw = "A concise summary."
+
+        overlay._remember_word_attachment_turn()
+
+        self.assertEqual(overlay._word_attachment_history, [
+            ("word-window:101", "Summarize the document.", "A concise summary."),
+        ])
+        self.assertIsNone(overlay._active_word_attachment_question)
 
     def test_chat_word_read_ignores_a_late_result(self):
         overlay = self._overlay()

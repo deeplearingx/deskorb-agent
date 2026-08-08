@@ -15,6 +15,8 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         overlay._pending_office_plan = None
         overlay._office_apply_active = False
         overlay.office_edit_history = []
+        overlay._office_attachment_history = []
+        overlay._active_office_question = None
         overlay._office_generation = 0
         overlay._office_operation_sequence = 0
         overlay._chat_word_read_sequence = 0
@@ -27,6 +29,7 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         overlay._set_busy = Mock()
         overlay._refresh_chat_word_attachment = Mock()
         overlay.worker = Mock()
+        overlay._apply_pending_office_plan = Mock()
         return overlay
 
     def test_office_attachment_uses_ephemeral_plan_without_chat_content_leak(self):
@@ -57,6 +60,38 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         display = overlay.add_user.call_args.args[0]
         self.assertIn("Plan.xlsx", display)
         self.assertNotIn("Budget!C3", display)
+
+    def test_add_request_is_not_treated_as_undo(self):
+        self.assertFalse(Overlay._is_office_undo_request("将该总结内容添加到word文档尾部"))
+        self.assertFalse(Overlay._is_office_undo_request("在文章末尾添加总结"))
+
+    def test_persistent_office_prompt_includes_same_document_answer_context(self):
+        overlay = self._overlay()
+        snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='Old'", fingerprint="fingerprint",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "Old"),),
+            has_unsaved_changes=True, paragraph_count=1,
+        )
+        overlay._office_attachment_history = [
+            (snapshot.identity, "总结这份文档", "主要内容是地质环境保护责任和法律责任。"),
+        ]
+
+        prompt = overlay._build_persistent_office_prompt(snapshot, [], "将该总结内容添加到文档尾部")
+
+        self.assertIn("Previous request and answer context", prompt)
+        self.assertIn("主要内容是地质环境保护责任和法律责任。", prompt)
+
+    def test_remembers_completed_persistent_office_answer(self):
+        overlay = self._overlay()
+        overlay._active_office_question = "总结这份文档"
+
+        overlay._remember_office_attachment_turn("word:101:Draft.docx", "文档总结内容")
+
+        self.assertEqual(overlay._office_attachment_history, [
+            ("word:101:Draft.docx", "总结这份文档", "文档总结内容"),
+        ])
+        self.assertIsNone(overlay._active_office_question)
 
     def test_persistent_prompt_includes_word_edit_history_without_displaying_it(self):
         overlay = self._overlay()
@@ -153,6 +188,50 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         self.assertIs(overlay.chat_office_snapshot, snapshot)
         self.assertIsNone(overlay._pending_office_plan)
 
+    def test_office_plan_is_auto_applied_without_manual_confirmation(self):
+        from office_edits import OfficeEditPlan, WordTextEdit
+
+        overlay = self._overlay()
+        snapshot = OfficeSnapshot(
+            kind="word", expected_root=101, identity="word:101:Draft.docx", name="Draft.docx",
+            rendered_text="[paragraph:1] value='Old'", fingerprint="fingerprint",
+            targets=(OfficeTarget("paragraph:1", "paragraph:1", "Old"),), has_unsaved_changes=True,
+        )
+        plan = OfficeEditPlan("word", snapshot.fingerprint,
+                              (WordTextEdit("paragraph:1", "Old", "New"),))
+        overlay.chat_office_snapshot = snapshot
+        overlay._office_plan_active = True
+        overlay._office_plan_raw = ["response"]
+        overlay._md_finalize = Mock()
+        overlay._finish_turn_copy = Mock()
+        overlay._add_office_plan_actions = Mock()
+
+        with patch("deskorb_agent.parse_office_plan", return_value=("Prepared", plan)):
+            overlay._finish_office_plan()
+
+        self.assertIs(overlay._pending_office_plan, plan)
+        overlay._apply_pending_office_plan.assert_called_once_with()
+        overlay._add_office_plan_actions.assert_not_called()
+
+    def test_api_error_cancels_office_plan_without_parsing_empty_response(self):
+        overlay = self._overlay()
+        snapshot = Mock()
+        overlay.chat_office_snapshot = snapshot
+        overlay._office_plan_active = True
+        overlay._office_plan_raw = ['{"partial":']
+        overlay._pending_office_plan = Mock()
+        overlay._office_generation = 3
+
+        overlay._handle("error", "Could not run API: HTTP 401")
+        overlay._handle("office_plan_done", 3)
+
+        self.assertFalse(overlay._office_plan_active)
+        self.assertEqual(overlay._office_plan_raw, [])
+        self.assertIsNone(overlay._pending_office_plan)
+        self.assertIs(overlay.chat_office_snapshot, snapshot)
+        self.assertEqual(overlay._office_generation, 4)
+        overlay.add_err.assert_called_once_with("Could not run API: HTTP 401")
+
     def test_clear_cancels_pending_read_and_invalidates_late_read(self):
         overlay = self._overlay()
         overlay.root = Mock()
@@ -224,7 +303,8 @@ class ChatOfficeAttachmentTests(unittest.TestCase):
         overlay.worker.ask_office_context.assert_not_called()
         self.assertEqual(overlay._pending_office_plan.edits,
                          (WordTextEdit("paragraph:1", "New", "Old"),))
-        overlay._add_office_plan_actions.assert_called_once_with(overlay._pending_office_plan)
+        overlay._apply_pending_office_plan.assert_called_once_with()
+        overlay._add_office_plan_actions.assert_not_called()
 
     def test_undo_without_agent_history_recommends_native_office_undo(self):
         overlay = self._overlay()

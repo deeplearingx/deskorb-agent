@@ -277,12 +277,21 @@ class MCPToolBridge:
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
                  enable_officecli: bool = True, officecli_binary: str | Path | None = None,
-                 timeout_seconds: int = 30):
+                 timeout_seconds: int = 30, officecli_timeout_seconds: int | None = None):
         self.specs = load_mcp_servers(config_path, enable_playwright=enable_playwright,
                                       enable_officecli=enable_officecli,
                                       officecli_binary=officecli_binary)
         self.timeout_seconds = timeout_seconds
-        self.clients = {spec.name: StdioMCPClient(spec, timeout_seconds=timeout_seconds) for spec in self.specs}
+        self.officecli_timeout_seconds = max(
+            int(officecli_timeout_seconds or timeout_seconds), int(timeout_seconds))
+        self.clients = {
+            spec.name: StdioMCPClient(
+                spec,
+                timeout_seconds=(self.officecli_timeout_seconds
+                                 if spec.name == "officecli" else self.timeout_seconds),
+            )
+            for spec in self.specs
+        }
         self._tools: dict[str, tuple[str, str, dict[str, Any], bool]] = {}
         self.diagnostics: list[str] = []
         # Discovery starts a process, so it must be per server rather than an
@@ -368,6 +377,8 @@ class MCPToolBridge:
             return {"ok": False, "error": "Unknown MCP tool."}
         server, original, _schema, _action = item
         clean = {key: value for key, value in arguments.items() if not key.startswith("_deskorb_")}
+        if server == "officecli" and "command" in clean:
+            clean["command"] = _normalize_officecli_command(clean["command"])
         try:
             result = self.clients[server].call_tool(original, clean)
         except MCPError as exc:
@@ -456,7 +467,12 @@ class MCPToolBridge:
     def _description(server: str, original: str, action: bool) -> str:
         if server == "officecli":
             prefix = "Office file action" if action else "Read-only Office file operation"
-            return f"{prefix} from trusted local MCP server {server}: {original}."
+            guidance = (
+                " Use command as an array when a path contains spaces; prefer one batch command for multiple edits; "
+                "for batch, pass the --commands JSON as one array element rather than embedding shell-escaped quotes; "
+                "after creating or modifying a file, run validate and a targeted view/read before reporting success."
+            )
+            return f"{prefix} from trusted local MCP server {server}: {original}." + guidance
         prefix = "Browser/local MCP action" if action else "Read-only browser/local MCP observation"
         suffix = (" Supply _deskorb_risk_level=high only for a consequential action such as submitting, "
                   "sending, purchasing, deleting, uploading private data, or changing permissions." if action else "")
@@ -469,7 +485,7 @@ OFFICECLI_READ_ONLY_VERBS = frozenset({
 
 OFFICECLI_AUTO_APPROVE_VERBS = frozenset({
     "create", "set", "add", "swap", "batch", "merge", "import", "raw-set",
-    "add-part", "save", "refresh",
+    "add-part", "save", "refresh", "remove", "move", "close",
 })
 
 
@@ -509,6 +525,102 @@ def _split_command(command: str) -> list[str]:
     if current:
         tokens.append("".join(current))
     return tokens
+
+
+def _normalize_officecli_command(command: Any) -> Any:
+    """Make OfficeCLI batch commands safe when a model returned shell-like text."""
+    if isinstance(command, (list, tuple)):
+        return _normalize_batch_argv([str(item) for item in command])
+    if not isinstance(command, str):
+        return command
+
+    tokens = _split_command(command)
+    verb_index = 0
+    while verb_index < len(tokens) and tokens[verb_index].lower() in {"officecli", "officecli.exe"}:
+        verb_index += 1
+    if verb_index >= len(tokens) or tokens[verb_index].lower() != "batch":
+        return command
+
+    marker = re.search(r"(?<!\S)--commands(?!\S)", command)
+    if not marker:
+        return tokens
+    prefix = _split_command(command[:marker.start()])
+    raw_payload, suffix = _extract_json_array(command[marker.end():])
+    if raw_payload is None:
+        return tokens
+    compact = _compact_batch_json(raw_payload)
+    if compact is None:
+        return tokens
+    return _normalize_batch_argv(prefix + ["--commands", compact] + _split_command(suffix))
+
+
+def _normalize_batch_argv(tokens: list[str]) -> list[str]:
+    """Compact a valid --commands JSON argument without changing invalid input."""
+    verb_index = 0
+    while verb_index < len(tokens) and tokens[verb_index].lower() in {"officecli", "officecli.exe"}:
+        verb_index += 1
+    if verb_index >= len(tokens) or tokens[verb_index].lower() != "batch":
+        return tokens
+    try:
+        marker_index = next(index for index, token in enumerate(tokens) if token == "--commands")
+    except StopIteration:
+        return tokens
+    if marker_index + 1 >= len(tokens):
+        return tokens
+    compact = _compact_batch_json(tokens[marker_index + 1])
+    if compact is None:
+        return tokens
+    return tokens[:marker_index + 1] + [compact] + tokens[marker_index + 2:]
+
+
+def _compact_batch_json(value: Any) -> str | None:
+    if isinstance(value, (list, tuple, dict)):
+        decoded = value
+    elif isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    else:
+        return None
+    if not isinstance(decoded, list):
+        return None
+    return json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+
+
+def _extract_json_array(value: str) -> tuple[str | None, str]:
+    """Extract one balanced JSON array while respecting escaped JSON quotes."""
+    remainder = value.lstrip()
+    if not remainder.startswith("["):
+        if remainder.startswith("'"):
+            remainder = remainder[1:]
+        else:
+            return None, value
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, char in enumerate(remainder):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                suffix = remainder[end:]
+                if suffix.startswith("'"):
+                    suffix = suffix[1:]
+                return remainder[:end], suffix
+    return None, value
 
 
 def _exposed_tool_name(server: str, original: str, existing: dict[str, Any]) -> str:

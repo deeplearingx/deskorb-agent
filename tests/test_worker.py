@@ -78,6 +78,23 @@ class CodexWorkerTests(unittest.TestCase):
         )
         run_api.assert_not_called()
 
+    def test_api_backend_keeps_short_officecli_follow_up_in_agent_runtime(self):
+        self.worker._backend = "api"
+        with patch.object(
+            self.worker._agent,
+            "_mcp_servers_for_task",
+            side_effect=[("officecli",), ()],
+        ), patch.object(self.worker, "_run_agent_turn") as run_agent, \
+                patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn("请使用 OfficeCLI 创建战锤40K.docx", [])
+            self.worker._run_turn("继续", [])
+
+        self.assertEqual(run_agent.call_count, 2)
+        continuation_text = run_agent.call_args_list[1].args[0]
+        self.assertIn("OfficeCLI", continuation_text)
+        self.assertIn("继续", continuation_text)
+        run_api.assert_not_called()
+
     def test_api_backend_routes_pending_agent_confirmation_to_mcp_runtime(self):
         self.worker._backend = "api"
         self.worker._agent.approvals.pending = object()
@@ -213,6 +230,8 @@ class CodexWorkerTests(unittest.TestCase):
 
         self.worker._model = "test-model"
         self.worker._api_base_url = "https://example.test/v1"
+        self.worker._model_provider = "responses"
+        self.worker._adapter = ModelAdapter("responses", self.worker._api_base_url)
         with patch("worker.get_api_key", return_value="secret"), \
              patch("worker.urllib.request.urlopen", return_value=FakeResponse()):
             self.worker._run_api_turn("hello", [])

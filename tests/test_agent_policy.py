@@ -25,31 +25,41 @@ class ToolPolicyTests(unittest.TestCase):
         decision = self.policy.decide("filesystem_write", execution_requested=False, full_access=True)
         self.assertEqual(decision.kind, DecisionKind.DENY)
 
-    def test_shell_requires_confirmation_even_in_full_access(self):
+    def test_shell_is_allowed_in_full_access_when_not_deleting_files(self):
         decision = self.policy.decide("shell_run", execution_requested=True, full_access=True)
+        self.assertEqual(decision.kind, DecisionKind.ALLOW)
+
+    def test_file_deletion_requires_confirmation(self):
+        decision = self.policy.decide("filesystem_delete", execution_requested=True, full_access=True,
+                                      high_risk=True)
         self.assertEqual(decision.kind, DecisionKind.CONFIRM)
         self.assertEqual(decision.risk, Risk.DESTRUCTIVE_LOCAL)
 
-    def test_desktop_click_requires_confirmation(self):
-        decision = self.policy.decide("desktop_click", execution_requested=True, full_access=True)
+    def test_shell_file_deletion_requires_confirmation(self):
+        decision = self.policy.decide("shell_run", execution_requested=True, full_access=True,
+                                      high_risk=True)
         self.assertEqual(decision.kind, DecisionKind.CONFIRM)
-        self.assertEqual(decision.risk, Risk.EXTERNAL_OR_ELEVATED)
+        self.assertEqual(decision.risk, Risk.DESTRUCTIVE_LOCAL)
 
-    def test_keyboard_actions_require_confirmation(self):
+    def test_desktop_click_is_allowed_in_full_access(self):
+        decision = self.policy.decide("desktop_click", execution_requested=True, full_access=True)
+        self.assertEqual(decision.kind, DecisionKind.ALLOW)
+
+    def test_keyboard_actions_are_allowed_in_full_access(self):
         for tool in ("desktop_type", "desktop_hotkey"):
             with self.subTest(tool=tool):
                 decision = self.policy.decide(tool, execution_requested=True, full_access=True)
-                self.assertEqual(decision.kind, DecisionKind.CONFIRM)
+                self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
-    def test_scroll_and_focus_require_confirmation(self):
+    def test_scroll_and_focus_are_allowed_in_full_access(self):
         for tool in ("desktop_scroll", "window_focus", "window_control", "desktop_clipboard_read_text"):
             with self.subTest(tool=tool):
                 decision = self.policy.decide(tool, execution_requested=True, full_access=True)
-            self.assertEqual(decision.kind, DecisionKind.CONFIRM)
+            self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
-    def test_application_launch_requires_confirmation(self):
+    def test_application_launch_is_allowed_in_full_access(self):
         decision = self.policy.decide("application_launch", execution_requested=True, full_access=True)
-        self.assertEqual(decision.kind, DecisionKind.CONFIRM)
+        self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
     def test_task_authorization_allows_normal_desktop_steps(self):
         for tool in ("application_launch", "desktop_click", "desktop_type", "desktop_hotkey", "window_control"):
@@ -58,10 +68,10 @@ class ToolPolicyTests(unittest.TestCase):
                                               task_authorized=True)
                 self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
-    def test_high_risk_step_still_requires_confirmation_during_task(self):
+    def test_non_delete_high_risk_marker_does_not_require_confirmation(self):
         decision = self.policy.decide("desktop_click", execution_requested=True, full_access=True,
                                       task_authorized=True, high_risk=True)
-        self.assertEqual(decision.kind, DecisionKind.CONFIRM)
+        self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
 
 class ApprovalManagerTests(unittest.TestCase):

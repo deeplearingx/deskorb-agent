@@ -56,7 +56,10 @@ class ToolPolicy:
         "mcp_enable_server", "mcp_read_only",
     }
     REVERSIBLE_TOOLS = {"filesystem_write", "filesystem_patch", "filesystem_copy"}
-    DESTRUCTIVE_TOOLS = {"filesystem_move", "filesystem_delete", "process_stop", "shell_run"}
+    # Only actual file deletion remains confirmation-gated. Other requested
+    # actions are automatic when Full access is enabled.
+    DESTRUCTIVE_TOOLS = {"filesystem_delete"}
+    AUTOMATIC_TOOLS = {"shell_run", "filesystem_move", "process_stop"}
     EXTERNAL_TOOLS = {"desktop_click", "desktop_type", "desktop_hotkey", "desktop_scroll", "window_focus",
                       "window_control", "desktop_clipboard_read_text", "process_start", "application_launch"}
     TASK_SCOPED_TOOLS = EXTERNAL_TOOLS
@@ -65,24 +68,22 @@ class ToolPolicy:
                task_authorized: bool = False, high_risk: bool = False) -> PolicyDecision:
         if tool_name in self.OBSERVE_TOOLS:
             return PolicyDecision(DecisionKind.ALLOW, Risk.OBSERVE, "Read-only observation")
-        if tool_name not in self.REVERSIBLE_TOOLS | self.DESTRUCTIVE_TOOLS | self.EXTERNAL_TOOLS:
+        known_tools = self.REVERSIBLE_TOOLS | self.DESTRUCTIVE_TOOLS | self.AUTOMATIC_TOOLS | self.EXTERNAL_TOOLS
+        if tool_name not in known_tools:
             return PolicyDecision(DecisionKind.DENY, Risk.EXTERNAL_OR_ELEVATED, "Unknown tool")
         if not full_access:
             return PolicyDecision(DecisionKind.DENY, Risk.EXTERNAL_OR_ELEVATED, "Read-only mode is enabled")
         if not execution_requested:
             return PolicyDecision(DecisionKind.DENY, Risk.EXTERNAL_OR_ELEVATED,
                                   "The user did not explicitly request an action")
-        if high_risk:
-            return PolicyDecision(DecisionKind.CONFIRM, Risk.EXTERNAL_OR_ELEVATED,
-                                  "This step has an external or sensitive effect")
+        if tool_name == "filesystem_delete" or (tool_name == "shell_run" and high_risk):
+            return PolicyDecision(DecisionKind.CONFIRM, Risk.DESTRUCTIVE_LOCAL,
+                                  "File deletion requires fresh confirmation")
         if tool_name in self.REVERSIBLE_TOOLS:
             return PolicyDecision(DecisionKind.ALLOW, Risk.REVERSIBLE_LOCAL,
                                   "Explicit, reversible local action")
-        if tool_name in self.TASK_SCOPED_TOOLS and task_authorized:
-            return PolicyDecision(DecisionKind.ALLOW, Risk.EXTERNAL_OR_ELEVATED,
-                                  "Covered by the active task authorization")
-        risk = Risk.DESTRUCTIVE_LOCAL if tool_name in self.DESTRUCTIVE_TOOLS else Risk.EXTERNAL_OR_ELEVATED
-        return PolicyDecision(DecisionKind.CONFIRM, risk, "Fresh confirmation required")
+        return PolicyDecision(DecisionKind.ALLOW, Risk.EXTERNAL_OR_ELEVATED,
+                              "Explicitly requested action; only file deletion is gated")
 
 
 class ApprovalManager:

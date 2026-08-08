@@ -31,6 +31,7 @@ def _environment_api_key(provider: str | None = None) -> str:
     provider_keys = {
         "openai": ("OPENAI_API_KEY",),
         "responses": ("OPENAI_API_KEY",),
+        "openai-compatible": ("OPENAI_API_KEY",),
         "deepseek": ("DEEPSEEK_API_KEY",),
         "qwen": ("QWEN_API_KEY", "DASHSCOPE_API_KEY"),
         "dashscope": ("DASHSCOPE_API_KEY", "QWEN_API_KEY"),

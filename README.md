@@ -12,8 +12,8 @@ app-server compatibility backend.
 
 ## Run
 
-1. Configure an API key and compatible endpoint in the parent-folder `.env`,
-   environment variables, or Connection settings.
+1. Configure an API key and compatible endpoint in `volcengine.env`, the
+   parent-folder `.env`, environment variables, or Connection settings.
 2. Run `setup.cmd` once.
 3. Run `Start DeskOrb Agent.cmd`.
 
@@ -34,6 +34,10 @@ Configuration overrides:
 - `OPENAI_BASE_URL`: API base URL (Responses for OpenAI, Chat Completions for compatible providers)
 - `DESKORB_AGENT_API_PROXY`: optional HTTP/HTTPS proxy URL
 - `DESKORB_AGENT_CONTEXT_TOKENS`: API context budget (defaults to `24000`)
+- `DESKORB_AGENT_OFFICECLI_TIMEOUT`: timeout for one OfficeCLI operation in
+  seconds (defaults to `180`)
+- `DESKORB_AGENT_OFFICECLI_MAX_TOOL_ROUNDS`: maximum Agent/MCP rounds for an
+  OfficeCLI task (defaults to `300`)
 - `DESKORB_AGENT_SHOW_IN_SCREEN_SHARE`: whether the overlay appears in screen shares
   (defaults to `1`). Set to `0` to request private mode only after verifying the
   window remains visible on the current desktop environment.
@@ -48,9 +52,8 @@ Configuration overrides:
   `glm-5.2` configuration
 - `DESKORB_AGENT_OFFICE_MAX_NONEMPTY_CELLS`: Excel attachment cell cap (defaults to `10000`)
 - `DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS`: Office attachment character cap (defaults to `120000`)
-- `DESKORB_AGENT_OFFICECLI_AUTO_APPROVE`: OfficeCLI `create/add/set/save`-style
-  generation/update operations skip confirmation by default; set to `0` to restore
-  explicit confirmations. Destructive `remove/move/close` operations remain guarded.
+- `DESKORB_AGENT_OFFICECLI_AUTO_APPROVE`: retained for compatibility. In Full access,
+  all non-delete operations are automatic; file deletion confirmation cannot be disabled.
 - `OPENAI_API_KEY`: optional alternative to the Windows Credential Manager entry
 - `DEEPSEEK_API_KEY`, `QWEN_API_KEY`, `DASHSCOPE_API_KEY`: provider-specific keys when
   `DESKORB_AGENT_PROVIDER` selects a compatible provider; they are not sent to another provider
@@ -68,8 +71,8 @@ Click the bottom status line or open **Gear → Connection settings**:
   arrives. It supports arbitrary model IDs and HTTPS-compatible API endpoints.
 - **agent** is the default independent API-backed runtime. It can inspect desktop
   state, list/read/search/write files, run PowerShell 7 commands, and control
-  mouse, keyboard, scrolling, and window focus. Read-only inspection is automatic;
-  any write, shell, or desktop-input action needs an in-chat one-time confirmation.
+  mouse, keyboard, scrolling, and window focus. In Full access, requested actions
+  run automatically; only file deletion needs an in-chat confirmation.
 - **auto** uses the independent Agent when a key is configured and falls back to
   Codex if the Agent request fails and Codex CLI is available.
 
@@ -78,8 +81,10 @@ cannot be reached directly (for example `http://127.0.0.1:7890`). The API key en
 Windows Credential Manager, never in `state.json` or the project files. Non-secret
 settings (backend, model ID, base URL, and proxy URL) are remembered in local app state.
 
-For compatibility with the existing workspace setup, the overlay also reads a
-parent-folder `.env` in this form:
+For compatibility with the existing workspace setup, the overlay reads the
+first existing file in this order: project `volcengine.env`, project `.env`,
+parent-folder `.env`. `DESKORB_AGENT_ENV_FILE` can point to an explicit file.
+The file uses this form:
 
 ```text
 api-key: your-key
@@ -95,6 +100,30 @@ outside version control.
 
 `model_name` must be a model ID, not an API URL. Environment variables and the
 settings window take precedence over this file.
+
+For Volcengine Ark Coding Plan, use a Coding Plan API key together with the
+Coding Plan endpoint and a Coding Plan model ID, for example:
+
+```text
+provider: openai-compatible
+api-key: <Ark Coding Plan API Key>
+url: https://ark.cn-beijing.volces.com/api/coding/v3
+model_name: ark-code-latest
+```
+
+For a regular Ark inference endpoint, use the standard Ark API key and endpoint
+instead; do not mix the two configurations:
+
+```text
+provider: openai-compatible
+api-key: <Ark standard API Key>
+url: https://ark.cn-beijing.volces.com/api/v3
+model_name: <your-endpoint-id>
+```
+
+Copy [`volcengine.env.example`](volcengine.env.example) to `volcengine.env`
+and replace the placeholders. The real file is ignored by Git and must never
+be committed.
 
 API mode provides direct text chat. Use **agent** mode for local shell/file tools and
 Windows mouse/keyboard control; Codex mode is optional. When
@@ -115,9 +144,9 @@ task starts neither. Custom servers can declare lightweight intent metadata; Des
 then routes matching requests automatically. When a request is ambiguous, the model sees
 only the small configured capability catalog, selects one integration, and then loads
 only that server's real tools. Browser snapshots are read-only,
-while navigation, clicking, typing and scrolling use the same task-level confirmation
-policy as desktop input. Submitting, purchasing, sending, uploading private data,
-deleting, or changing permissions still requires a fresh confirmation.
+while navigation, clicking, typing and scrolling run automatically in Full access.
+The current policy asks for confirmation only before deleting files. Submitting,
+publishing, and other requested actions continue automatically.
 
 The PowerToys MCP uses the locally installed `PowerToys.DSC.exe`, never a shell.
 It can inspect installed modules, settings, schemas, and backups; it can dry-run setting
@@ -126,10 +155,10 @@ after preflighting every entry; if a later entry fails, already-applied entries 
 back automatically. Writes are deliberately limited to reversible productivity modules:
 **Advanced Paste, Always on Top, Awake, Color Picker, Crop and Lock, FancyZones, Image
 Resizer, mouse utilities, Peek, PowerRename, Shortcut Guide, Workspaces, and ZoomIt**.
-Every write is a fresh high-risk confirmation. The service preflights the proposed partial
+In Full access, writes run automatically. The service preflights the proposed partial
 change, takes an in-memory backup, applies it, and rereads it to verify. A returned backup
-ID can be used by the separately confirmed restore action while the MCP session remains
-open. Keyboard Manager, Hosts, Environment Variables, Registry Preview, and global App
+ID can be used by a restore action while the MCP session remains open. Keyboard Manager,
+Hosts, Environment Variables, Registry Preview, and global App
 settings remain read-only until explicitly reviewed and added to the allowlist.
 
 OfficeCLI is an optional third local MCP server for disk-backed `.docx`, `.xlsx`, and
@@ -143,10 +172,11 @@ The build requires the .NET 10 SDK; the published runtime does not require .NET 
 machine where DeskOrb runs. If the binary is in a non-default location, set
 `DESKORB_AGENT_OFFICECLI_BINARY=C:\path\to\officecli.exe`. Set
 `DESKORB_AGENT_OFFICECLI=0` to disable automatic discovery. Ordinary desktop tasks do
-not start OfficeCLI; a matching Office file request loads it lazily. OfficeCLI write
-generation and update commands are automatically approved by the local runtime by default;
-destructive `remove`, `move`, and `close` commands still require confirmation. Set
-`DESKORB_AGENT_OFFICECLI_AUTO_APPROVE=0` to require confirmation for all OfficeCLI mutations.
+not start OfficeCLI; a matching Office file request loads it lazily. OfficeCLI generation
+and update commands run automatically in Full access. Only an explicit OfficeCLI file-delete
+command, if supported by the installed binary, requires confirmation. The
+`DESKORB_AGENT_OFFICECLI_AUTO_APPROVE` setting is retained for compatibility and cannot
+disable file-deletion confirmation.
 
 OfficeCLI operates on files saved to disk. The existing Word/Excel attachment and COM
 workflow remains the right path for active documents with unsaved edits. Do not ask
@@ -194,9 +224,8 @@ visible top-level windows first and returns a short-lived `window_id`; the agent
 uses that exact ID to focus, minimize, maximize, restore, snap left/right, move/resize,
 or toggle topmost. This avoids guessing window titles or stale screen coordinates.
 
-One task confirmation covers ordinary navigation and window layout steps. Closing a
-window always needs a fresh confirmation. Reading clipboard text also needs a fresh
-confirmation because clipboard contents can contain passwords, private text, or tokens.
+In Full access, ordinary navigation, window layout, clipboard reads, and desktop input
+run automatically. Only file deletion needs a fresh confirmation.
 After coordinate/keyboard/window actions, DeskOrb captures a fresh desktop observation
 before continuing.
 
@@ -277,14 +306,11 @@ again while the initial connection is being established.
 
 ### Desktop control
 
-In agent mode, shell and desktop-input actions are locally executed only after a
-one-time task authorization. After approval, normal application launch, navigation,
-typing, shortcuts, scrolling, and window-focus steps continue within the same task
-without repeated prompts. The authorization expires when the task finishes, is
-stopped, fails, or after ten minutes. Shell commands and high-impact steps—sending
-or publishing content, purchases, secrets or personal data, deletion, permission or
-security changes, and irreversible confirmation dialogs—still require a fresh
-confirmation at the point of risk.
+In agent mode, Full access executes requested shell and desktop-input actions without
+an approval prompt. Normal application launch, navigation,
+typing, shortcuts, scrolling, and window-focus steps execute automatically.
+The runtime pauses only before file deletion, including common PowerShell, `cmd`, Python,
+.NET, and `git clean` deletion commands.
 
 ## Attribution
 

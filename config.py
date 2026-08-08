@@ -77,12 +77,12 @@ MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
 PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
 OFFICECLI_ENABLED = _env_bool("DESKORB_AGENT_OFFICECLI", True)
 OFFICECLI_BINARY = os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "").strip()
-# OfficeCLI generation/update verbs are approved by the local runtime by default so a
-# DOCX/XLSX/PPTX task does not stop for create/add/set/save confirmations on every step.
-# Destructive verbs such as remove/move/close remain confirmation-protected. Set this to
-# 0 to restore explicit confirmations for all OfficeCLI mutations.
+# Retained for configuration compatibility. In Full access, all non-delete actions
+# are automatic; file deletion confirmation cannot be disabled by this setting.
 OFFICECLI_AUTO_APPROVE = _env_bool("DESKORB_AGENT_OFFICECLI_AUTO_APPROVE", True)
 MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
+OFFICECLI_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_OFFICECLI_TIMEOUT", 180, 30, 900)
+OFFICECLI_MAX_TOOL_ROUNDS = _env_int("DESKORB_AGENT_OFFICECLI_MAX_TOOL_ROUNDS", 300, 20, 1000)
 PERMISSION_MODE = "workspace-write"
                                  # the STARTUP permission mode; flip it at run time with the
                                  # status-bar "Read-only" toggle (◉ = "plan", a read-only agent

@@ -484,6 +484,30 @@ class OfficePlanApplyTests(unittest.TestCase):
 
         self.assertEqual(visited, [application.ActiveDocument])
 
+    def test_word_write_uses_the_application_that_owns_expected_window(self):
+        from office_edits import _with_active_document
+
+        pythoncom = Mock()
+        client = Mock()
+        wrong_application = Mock()
+        target_application = Mock()
+        wrong_application.ActiveWindow.Hwnd = 909
+        target_application.ActiveWindow.Hwnd = 101
+        wrong_application.ActiveDocument = Mock(name="wrong-document")
+        target_application.ActiveDocument = Mock(name="target-document")
+        client.GetActiveObject.return_value = wrong_application
+        visited = []
+
+        with patch("office_edits._load_com_modules", return_value=(pythoncom, client)), \
+                patch("office_edits.resolve_word_application_for_window",
+                      return_value=target_application) as resolve, \
+                patch("office_edits.root_window", side_effect=lambda hwnd: hwnd):
+            _with_active_document("word", 101, None, visited.append)
+
+        resolve.assert_called_once_with(pythoncom, client, 101)
+        client.GetActiveObject.assert_not_called()
+        self.assertEqual(visited, [target_application.ActiveDocument])
+
     def test_changed_snapshot_prevents_all_writes(self):
         from office_edits import OfficeEditPlan, WordTextEdit, OfficePlanError, apply_office_plan
 

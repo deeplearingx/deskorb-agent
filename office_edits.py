@@ -15,6 +15,7 @@ from office_sources import (
     read_active_office_snapshot,
     root_window,
 )
+from word_sources import resolve_word_application_for_window
 
 
 class OfficePlanError(ValueError):
@@ -344,14 +345,41 @@ def _with_active_document(
     try:
         pythoncom.CoInitialize()
         initialized = True
-        application = client.GetActiveObject("Word.Application" if kind == "word" else "Excel.Application")
-        active_root = int(root_window(application.ActiveWindow.Hwnd) or 0)
+        if kind == "word":
+            # GetActiveObject may return a different Word process when several
+            # Word instances are running.  Use the same ROT/window resolver as
+            # the read path so writes and verification target the previewed
+            # document rather than an unrelated instance.
+            application = resolve_word_application_for_window(pythoncom, client, expected_root)
+            if application is None:
+                application = client.GetActiveObject("Word.Application")
+        else:
+            application = client.GetActiveObject("Excel.Application")
+        active_root = _application_root_for_edit(application, kind, expected_root)
         if active_root != expected_root:
             raise OfficePlanError("The active Office document no longer matches the previewed window.")
         callback(application.ActiveDocument if kind == "word" else application.ActiveWorkbook)
     finally:
         if initialized:
             pythoncom.CoUninitialize()
+
+
+def _application_root_for_edit(application: Any, kind: str, expected_root: int) -> int:
+    """Return the active window root, tolerating transient Word HWND failures."""
+    for owner in (application, application.ActiveDocument if kind == "word" else None):
+        if owner is None:
+            continue
+        try:
+            hwnd = int(owner.ActiveWindow.Hwnd or 0)
+            if hwnd:
+                return int(root_window(hwnd) or 0)
+        except Exception:
+            continue
+    if kind == "word" and expected_root:
+        # The resolver already matched this Word application to expected_root;
+        # Word can temporarily reject ActiveWindow.Hwnd during SDI focus changes.
+        return int(expected_root)
+    return 0
 
 
 def _write_word_text(document: Any, edit: WordTextEdit) -> None:
