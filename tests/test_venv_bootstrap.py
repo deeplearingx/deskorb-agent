@@ -93,5 +93,27 @@ class VenvBootstrapTests(unittest.TestCase):
         self.assertIn("broken environment", stderr.getvalue())
 
 
+class BatchEntrypointTests(unittest.TestCase):
+    @staticmethod
+    def _script(name: str) -> str:
+        return (PROJECT_ROOT / name).read_text(encoding="utf-8").replace("/", "\\").lower()
+
+    def test_setup_delegates_to_bootstrap_ensure(self):
+        setup = self._script("setup.cmd")
+        self.assertIn('python "tools\\venv_bootstrap.py" ensure --project-root "%cd%"', setup)
+
+    def test_setup_checks_python_version_and_runtime_imports(self):
+        setup = self._script("setup.cmd")
+        self.assertIn("sys.version_info >= (3, 10)", setup)
+        self.assertIn("from pil import image; import keyboard; import win32com.client", setup)
+
+    def test_launcher_checks_environment_before_starting(self):
+        launcher = self._script("Start DeskOrb Agent.cmd")
+        check = 'python "tools\\venv_bootstrap.py" check --project-root "%cd%"'
+        launch = 'start "" ".venv\\scripts\\pythonw.exe" "deskorb_agent.py"'
+        self.assertIn(check, launcher)
+        self.assertLess(launcher.index(check), launcher.index(launch))
+
+
 if __name__ == "__main__":
     unittest.main()
