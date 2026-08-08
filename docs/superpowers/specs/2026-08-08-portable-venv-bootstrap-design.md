@@ -18,7 +18,7 @@ a Python-version lock or an exact dependency lock file.
   and pywin32 can be imported before reporting that setup succeeded.
 - Preserve the current copied environment as `.venv.stale-20260808` during this
   repair. Delete that backup only after the replacement environment starts and
-  all 220 Python unit tests pass.
+  all 220 existing Python unit tests plus the new bootstrap tests pass.
 - Do not change application behavior, backend configuration, model settings,
   OfficeCLI, or the current dependency-version policy.
 
@@ -107,13 +107,14 @@ reproduction test fail. Cover these behaviors using temporary directories:
 5. A healthy environment is reused without recreation.
 6. The command-line `check` and `ensure` modes return meaningful exit statuses.
 
-After the focused test is green, run all 220 test methods with:
+After the focused tests are green, run the complete suite, including the 220
+existing test methods and 10 new bootstrap/startup tests, with:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 ```
 
-The final run must report 220 tests executed with zero failures and zero errors.
+The final run must report 230 tests executed with zero failures and zero errors.
 
 ## Acceptance criteria
 
@@ -123,6 +124,7 @@ The final run must report 220 tests executed with zero failures and zero errors.
   current runtime dependencies.
 - Running `Start DeskOrb Agent.cmd` self-recovers from a missing or unhealthy
   environment and launches the application after successful setup.
-- The full test suite reports exactly 220 passing tests.
+- The full test suite reports exactly 230 passing tests: all 220 pre-existing
+  tests and the 10 new bootstrap/startup tests.
 - The stale backup is deleted only after the new environment, tests, and launch
   verification all succeed.
