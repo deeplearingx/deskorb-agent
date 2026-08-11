@@ -20,9 +20,11 @@
 
 ```powershell
 python -m pytest -q
-python tests\matrix_e2e_runner.py --repetitions 1 --output artifacts\matrix-e2e.json
-python tests\run_quality_gate.py --report artifacts\matrix-e2e.json --require-full-matrix --repetitions 1
+python tests\matrix_e2e_runner.py --repetitions 3 --output artifacts\matrix-e2e.json
+python tests\run_quality_gate.py --report artifacts\matrix-e2e.json --validate-report-only
 ```
+
+确定性控制组的完整发布门禁要使用真实 runner 生成的规范化报告；控制组本身用于验证工具编排和覆盖，不伪造真实确认交互。真实 runner 报告满足授权与预检条件后，可按评测计划追加 `--require-full-matrix --repetitions 3` 门禁。
 
 本机真实 runner 默认是 fail-closed。只有在当前机器已完成预检、并且用户明确授权时才加上公网或当前桌面开关：
 
