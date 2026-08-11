@@ -59,6 +59,60 @@ Configuration overrides:
   `DESKORB_AGENT_PROVIDER` selects a compatible provider; they are not sent to another provider
 - `DESKORB_AGENT_SERVICE_TIER`: CLI service tier (defaults to `fast`)
 - `DESKORB_AGENT_SHOT_SCOPE`: `screens` or `window`
+- `DESKORB_AGENT_MEETING_DIR`: meeting audio/transcript output directory
+- `DESKORB_AGENT_MEETING_CHUNK_CHARS`: maximum transcript characters per summary chunk (default `8000`)
+- `DESKORB_AGENT_MEETING_MERGE_BATCH`: maximum partial summaries per merge request (default `8`)
+- `DESKORB_AGENT_WHISPERX_ROOT`: WhisperX checkout (defaults to the repository's `whisperX-main` folder)
+- `DESKORB_AGENT_WHISPERX_PYTHON`: Python executable for WhisperX; otherwise DeskOrb discovers
+  `.venv\Scripts\python.exe` below the checkout
+- `DESKORB_AGENT_WHISPERX_MODEL`, `DESKORB_AGENT_WHISPERX_DEVICE`, and
+  `DESKORB_AGENT_WHISPERX_COMPUTE_TYPE`: WhisperX runtime options (defaults `small`, `cpu`, `int8`)
+- `DESKORB_AGENT_WHISPERX_LANGUAGE`: optional language code; `DESKORB_AGENT_WHISPERX_DIARIZE=1`
+  enables diarization; `DESKORB_AGENT_WHISPERX_ALIGN=1` enables word alignment
+- The transcript and structured minutes pass through OpenCC `t2s` post-processing, so Traditional Chinese is saved as Simplified Chinese.
+
+## Meeting recording with WhisperX
+
+The status bar's `Record` button starts a local meeting recording. Click `Stop`
+to finish; audio capture and WhisperX transcription run in background threads, so chat,
+Office integration, and other controls remain usable while recording or transcribing.
+
+The WhisperX source is included in this repository at `whisperX-main\`. Its heavy ML
+runtime stays isolated in the ignored `whisperX-main\.venv\`, while DeskOrb itself keeps
+using its normal lightweight environment.
+
+1. From the DeskOrb repository root, create and install the bundled WhisperX environment
+   (Python 3.10--3.13 is supported by this checkout):
+   ```powershell
+   .\setup-whisperx.cmd
+   ```
+   The script creates `whisperX-main\.venv` and installs the local `whisperX-main` project.
+2. Start DeskOrb and click `Record` / `Stop`. By default files are written to
+   `%USERPROFILE%\Documents\DeskOrb Meetings`; set `DESKORB_AGENT_MEETING_DIR` to
+   choose another directory.
+3. The default `DESKORB_AGENT_WHISPERX_ROOT` points to the repository's
+   `whisperX-main` folder. Set it only when intentionally using another checkout; set
+   `DESKORB_AGENT_WHISPERX_PYTHON` only when its Python executable is outside that folder.
+
+After `Stop`, one session produces the audio plus WhisperX transcript under the meeting directory:
+
+- `meeting-001.wav` — the recorded microphone/speaker mix
+- `whisperx\meeting-001.json` and `.txt` — the timestamped transcript
+- `minutes\meeting-001.md` and `.json` — the agent-generated meeting minutes (summary, key points, decisions, action items, and questions)
+
+The minutes request is sent through the same configured DeskOrb agent. If the agent/API is unavailable,
+the transcript and audio are still kept; the UI shows the minutes error instead of discarding the recording.
+
+For long meetings, DeskOrb summarizes bounded transcript chunks first and then merges those
+structured summaries hierarchically. The full transcript remains on disk, while the UI reports
+chunk and merge progress in the background. If a chunk or merge fails, completed partial summaries
+are kept in `minutes\meeting-001.partial.json` for diagnosis or retry; no incomplete final minutes are written.
+
+The default transcription mode is CPU + `int8` with the `small` model. Word alignment is disabled by default
+so the base transcription does not require a second alignment model; set `DESKORB_AGENT_WHISPERX_ALIGN=1`
+when word-level timestamps are required. Transcript text is normalized from Traditional to Simplified Chinese after WhisperX and before TXT/JSON/minutes are saved. Speaker diarization
+is opt-in because it may require extra model credentials; enable it with
+`DESKORB_AGENT_WHISPERX_DIARIZE=1`.
 
 ## Connection modes
 

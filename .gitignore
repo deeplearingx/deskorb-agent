@@ -53,3 +53,10 @@ Thumbs.db
 # Inbound contribution archives (kept locally as provenance only - may carry a
 # contributor's private email / unsanitized patch; never commit to the public repo)
 *-submission.zip
+# Optional in-repo meeting output when DESKORB_AGENT_MEETING_DIR points here.
+/meeting-recordings/
+
+# Bundled WhisperX runtime state (source is committed; generated environments/outputs are not)
+/whisperX-main/.venv/
+/whisperX-main/outputs/
+/whisperX-main/.cache/
