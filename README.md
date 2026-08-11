@@ -334,6 +334,11 @@ machine. A missing interactive desktop, model, or human handoff is reported as
 `blocked`, never as a successful task. Reports contain normalized counters and
 failure categories only.
 
+The test entrypoints and their resource boundaries are documented in
+[`tests/README.md`](tests/README.md). The deterministic runner and the real
+runner share one canonical 60-case dataset loader; the old runner function
+imports remain available for compatibility.
+
 ## Attribution
 
 Copyright (c) 2025 Shengyan Lin. Original project and UI licensed under the MIT

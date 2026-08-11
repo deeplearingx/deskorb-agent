@@ -120,3 +120,13 @@
 - 已补充空 Office 上下文、malformed function arguments、已执行危险动作与仅计划危险动作的回归覆盖。
 - 本机真实 `diagnose-001` smoke 已通过：`filesystem_read ×4 → filesystem_write → shell_verify`，`completed=true`、`verified=true`、证据通过；此前的解释器漂移、必需动作漏检和收尾超时误判均已修复。
 - 下一步仅在真实会话预检和显式授权满足后运行本机真实桌面、公网只读 smoke，再运行正式 `60 × 3`；环境不满足时保留 `blocked`/具体失败分类。
+
+## 代码整理状态（2026-08-11）
+
+本节是当前维护入口；上方较早的执行数字和环境结论保留为历史记录，不作为新的运行结果。
+
+- [x] 已创建代码整理设计：`docs/superpowers/specs/2026-08-11-code-organization-design.md`。
+- [x] 已将基础任务集、扩展任务集和步骤基线路径集中到 `tests/e2e_support/datasets.py`。
+- [x] 两个 E2E runner 仍提供原有函数和脚本入口，同时委托共享矩阵 loader。
+- [x] 已补充 `tests/README.md`，说明单测、确定性控制组、真实 runner、探针和质量门禁的资源边界。
+- [ ] 后续可在单独切片中拆分大 runner 文件；本轮不改生产 Tk UI 单体，也不改变测试判定逻辑。

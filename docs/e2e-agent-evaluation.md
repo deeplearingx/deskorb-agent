@@ -36,6 +36,8 @@
 
 ### 本机真实全链路矩阵
 
+代码入口、测试分类和默认命令见 [`tests/README.md`](../tests/README.md)。两个矩阵 runner 通过共享数据模块读取同一份 60 条任务集；`matrix_e2e_runner.py` 是确定性控制组，`local_real_e2e_runner.py` 才会在显式授权后接触当前桌面或公网。
+
 统一入口是 `tests/local_real_e2e_runner.py`。它只在调用者显式传入对应授权且预检通过时运行公网或当前桌面；预检失败会记录 `blocked`，不会伪造成功：
 
 ```powershell
