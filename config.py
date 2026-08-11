@@ -309,3 +309,37 @@ THEMES = {
     },
 }
 T = THEMES.get(THEME, THEMES["light"])
+
+# Meeting recorder / WhisperX integration. The WhisperX source checkout is kept in
+# the DeskOrb repository under ``whisperX-main`` so the project can be uploaded and
+# merged as one folder. Its heavy ML environment remains isolated in that folder's
+# ignored ``.venv``; environment variables can still override the defaults locally.
+PROJECT_ROOT = Path(__file__).resolve().parent
+MEETING_RECORDINGS_DIR = Path(
+    os.environ.get(
+        "DESKORB_AGENT_MEETING_DIR",
+        str(Path.home() / "Documents" / "DeskOrb Meetings"),
+    ).strip()
+).expanduser()
+MEETING_CHUNK_CHARS = _env_int(
+    "DESKORB_AGENT_MEETING_CHUNK_CHARS", 8000, 1000, 50000
+)
+MEETING_MERGE_BATCH = _env_int(
+    "DESKORB_AGENT_MEETING_MERGE_BATCH", 8, 2, 16
+)
+WHISPERX_ROOT = Path(
+    os.environ.get(
+        "DESKORB_AGENT_WHISPERX_ROOT",
+        str(PROJECT_ROOT / "whisperX-main"),
+    ).strip()
+).expanduser()
+_whisperx_python = os.environ.get("DESKORB_AGENT_WHISPERX_PYTHON", "").strip()
+WHISPERX_PYTHON = Path(_whisperx_python).expanduser() if _whisperx_python else None
+WHISPERX_MODEL = os.environ.get("DESKORB_AGENT_WHISPERX_MODEL", "small").strip() or "small"
+WHISPERX_DEVICE = os.environ.get("DESKORB_AGENT_WHISPERX_DEVICE", "cpu").strip() or "cpu"
+WHISPERX_COMPUTE_TYPE = (
+    os.environ.get("DESKORB_AGENT_WHISPERX_COMPUTE_TYPE", "int8").strip() or "int8"
+)
+WHISPERX_LANGUAGE = os.environ.get("DESKORB_AGENT_WHISPERX_LANGUAGE", "").strip() or None
+WHISPERX_DIARIZE = _env_bool("DESKORB_AGENT_WHISPERX_DIARIZE", False)
+WHISPERX_ALIGN = _env_bool("DESKORB_AGENT_WHISPERX_ALIGN", False)

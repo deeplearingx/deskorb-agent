@@ -40,6 +40,19 @@ from debuglog import dbg, DEBUG_LOG
 from win32utils import *
 from win32utils import _user32, _gdi32
 from worker import CodexWorker
+from meeting_recording import (
+    MeetingRecorder,
+    RecordingState,
+    WhisperXCommandBuilder,
+    WhisperXTranscriber,
+    resolve_whisperx_python,
+)
+from meeting_minutes import (
+    build_minutes_prompt,
+    parse_minutes_response,
+    save_minutes,
+    save_partial_minutes,
+)
 from word_sources import WordMaterial, is_word_window, read_active_word_document
 from office_sources import OfficeSnapshot, is_excel_window, read_active_office_snapshot
 from office_edits import (OfficeEditPlan, OfficeEditRecord, OfficePlanError,
@@ -159,6 +172,29 @@ class Overlay:
                                   backend=self._backend, model=startup_model,
                                   api_base_url=self._api_base_url,
                                   api_proxy_url=self._api_proxy_url)
+        self._meeting_result = None
+        self._meeting_transcript = ""
+        self._meeting_minutes_parts: list[str] = []
+        self._meeting_minutes_pending = False
+        self._meeting_minutes_audio_path = None
+        whisperx_python = resolve_whisperx_python(WHISPERX_ROOT, WHISPERX_PYTHON)
+        whisperx_builder = WhisperXCommandBuilder(
+            root=WHISPERX_ROOT,
+            python_executable=whisperx_python,
+            model=WHISPERX_MODEL,
+            device=WHISPERX_DEVICE,
+            compute_type=WHISPERX_COMPUTE_TYPE,
+            language=WHISPERX_LANGUAGE,
+            diarize=WHISPERX_DIARIZE,
+            no_align=not WHISPERX_ALIGN,
+        )
+        self.meeting_recorder = MeetingRecorder(
+            MEETING_RECORDINGS_DIR,
+            transcriber=WhisperXTranscriber(whisperx_builder),
+            on_event=lambda kind, payload: self.ui_q.put(
+                ("meeting_event", (kind, payload))
+            ),
+        )
         self.worker.start()
 
         self.auto_shot = AUTO_SCREENSHOT_DEFAULT
@@ -1147,6 +1183,10 @@ class Overlay:
         self.toggle_screen.pack(side="left", padx=(self.px(16), self.px(2)), pady=pad)
         self.toggle_screen.bind("<Button-1>", lambda e: self.toggle_auto())
         self._paint_screen_toggle()
+        self.meeting_button = tk.Label(st, text="Record", bg=T["bg"], fg=T["muted"],
+                                       font=self.f_small, cursor="hand2")
+        self.meeting_button.pack(side="left", padx=self.px(8), pady=pad)
+        self.meeting_button.bind("<Button-1>", lambda _event: self._toggle_meeting_recording())
         self._chip(st, "Compact", self.compact_now)
         self._chip(st, "Clear", self.reset)
         # The Window-only / Shareable / Read-only toggles used to sit inline here, which
@@ -1169,6 +1209,133 @@ class Overlay:
         self.grip.bind("<ButtonPress-1>", self._resize_start)
         self.grip.bind("<B1-Motion>", self._resize_move)
 
+    def _toggle_meeting_recording(self):
+        state = self.meeting_recorder.state
+        if state is RecordingState.RECORDING:
+            try:
+                self.meeting_recorder.stop()
+            except Exception as exc:
+                self.add_err(f"Could not stop meeting recording: {exc}")
+            self._refresh_meeting_button()
+            return
+        if state is not RecordingState.IDLE:
+            return
+        try:
+            self.meeting_recorder.start()
+        except Exception as exc:
+            self._refresh_meeting_button()
+            self.add_err(f"Meeting recording unavailable: {exc}")
+
+    def _refresh_meeting_button(self):
+        button = getattr(self, "meeting_button", None)
+        recorder = getattr(self, "meeting_recorder", None)
+        if button is None or recorder is None:
+            return
+        state = recorder.state
+        labels = {
+            RecordingState.IDLE: "Record",
+            RecordingState.RECORDING: "Stop",
+            RecordingState.FINALIZING: "Saving",
+            RecordingState.TRANSCRIBING: "Transcribing",
+        }
+        button.configure(
+            text=labels.get(state, "Record"),
+            fg=T["accent"] if state is RecordingState.RECORDING else T["muted"],
+        )
+
+    def _handle_meeting_event(self, payload):
+        try:
+            kind, value = payload
+        except (TypeError, ValueError):
+            return
+        self._refresh_meeting_button()
+        if kind == "recording_started":
+            self.add_sys(f"Meeting recording started: {Path(value).name}")
+        elif kind == "transcribing":
+            self.add_sys("Recording stopped. WhisperX is transcribing in the background.")
+        elif kind == "completed":
+            self._meeting_result = value
+            self._meeting_transcript = str(getattr(value, "transcript", "") or "")
+            audio_path = getattr(value, "audio_path", None)
+            transcript_path = getattr(value, "text_path", None)
+            target = transcript_path or getattr(value, "json_path", None) or audio_path
+            self.add_sys(f"Meeting transcript ready: {target}")
+            if self._meeting_transcript.strip() and audio_path:
+                self._meeting_minutes_parts = []
+                self._meeting_minutes_pending = True
+                self._meeting_minutes_audio_path = Path(audio_path)
+                self.add_sys("转写完成，智能体正在整理会议纪要…")
+                try:
+                    batch_request = getattr(self.worker, "ask_meeting_minutes_batch", None)
+                    if callable(batch_request):
+                        batch_request(self._meeting_transcript)
+                    else:
+                        self.worker.ask_meeting_minutes(build_minutes_prompt(self._meeting_transcript))
+                except Exception as exc:
+                    self._meeting_minutes_pending = False
+                    self.add_err(f"Meeting minutes could not start: {exc}")
+        elif kind == "error":
+            self.add_err(f"Meeting recording failed: {value}")
+
+    def _handle_meeting_minutes_event(self, kind, payload):
+        if kind == "delta":
+            self._meeting_minutes_parts.append(str(payload or ""))
+            return
+        if kind == "progress":
+            info = payload if isinstance(payload, dict) else {}
+            stage = str(info.get("stage") or "")
+            current = info.get("current")
+            total = info.get("total")
+            if stage == "chunk":
+                self.add_sys(f"\u6b63\u5728\u6574\u7406\u4f1a\u8bae\u7b2c {current}/{total} \u6bb5\u2026")
+            elif stage == "merge":
+                self.add_sys(f"\u6b63\u5728\u5408\u5e76\u4f1a\u8bae\u7eaa\u8981\uff08{current}/{total}\uff09\u2026")
+            return
+        if kind == "error" and isinstance(payload, dict) and payload.get("partials"):
+            self._meeting_minutes_pending = False
+            audio_path = self._meeting_minutes_audio_path
+            if audio_path:
+                try:
+                    transcript_path = getattr(self._meeting_result, "text_path", None)
+                    partial_path = save_partial_minutes(
+                        Path(audio_path).parent / "minutes",
+                        Path(audio_path).stem,
+                        payload["partials"],
+                        stage=str(payload.get("stage") or "unknown"),
+                        chunk_count=int(payload.get("chunk_count") or 0),
+                        transcript_path=Path(transcript_path) if transcript_path else None,
+                    )
+                    self.add_sys(f"\u4e2d\u95f4\u6458\u8981\u5df2\u4fdd\u5b58\uff1a{partial_path}")
+                except Exception as exc:
+                    self.add_err(f"\u4e2d\u95f4\u6458\u8981\u4fdd\u5b58\u5931\u8d25\uff1a{exc}")
+            self.add_err(f"\u4f1a\u8bae\u7eaa\u8981\u751f\u6210\u5931\u8d25\uff1a{payload.get('message', payload)}")
+            return
+        if kind == "error":
+            self._meeting_minutes_pending = False
+            self.add_err(f"会议纪要生成失败：{payload}")
+            return
+        if kind != "turn_done":
+            return
+        raw_response = "".join(self._meeting_minutes_parts).strip()
+        self._meeting_minutes_parts = []
+        self._meeting_minutes_pending = False
+        audio_path = self._meeting_minutes_audio_path
+        if not raw_response or audio_path is None:
+            self.add_err("会议纪要生成失败：智能体没有返回内容。")
+            return
+        try:
+            transcript_path = getattr(self._meeting_result, "text_path", None)
+            payload = parse_minutes_response(raw_response)
+            saved = save_minutes(
+                audio_path.parent / "minutes",
+                audio_path.stem,
+                payload,
+                transcript_path=Path(transcript_path) if transcript_path else None,
+                raw_response=raw_response,
+            )
+            self.add_sys(f"会议纪要已生成：{saved.markdown_path}")
+        except Exception as exc:
+            self.add_err(f"会议纪要保存失败：{exc}")
     def _build_statusline(self):
         sl = tk.Frame(self.root, bg=T["bg"])
         sl.pack(fill="x", side="bottom")
@@ -4352,6 +4519,10 @@ class Overlay:
             self._capture_busy = False
             if payload:
                 self._precaptured = (payload, time.monotonic())
+        elif kind == "meeting_event":
+            self._handle_meeting_event(payload)
+        elif kind.startswith("meeting_minutes_"):
+            self._handle_meeting_minutes_event(kind[len("meeting_minutes_"):], payload)
         elif kind == "status":
             self._set_status(str(payload))
         elif kind == "permission_mode":
@@ -4387,6 +4558,11 @@ class Overlay:
         if self._quitting:        # idempotent: a rapid double-close must not destroy() twice
             return
         self._quitting = True
+        try:
+            if getattr(self, "meeting_recorder", None) is not None:
+                self.meeting_recorder.abort()
+        except Exception:
+            pass
         try:
             if getattr(self, "_keyboard", None):
                 self._keyboard.unhook_all()

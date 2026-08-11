@@ -36,6 +36,21 @@ _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 _SERVICE_TIER = os.environ.get("DESKORB_AGENT_SERVICE_TIER", "fast").strip() or "fast"
 
 
+class _EventChannel:
+    """Prefix worker events so an isolated task cannot alter normal chat state."""
+
+    def __init__(self, sink, prefix: str):
+        self.sink = sink
+        self.prefix = prefix
+
+    def put(self, item):
+        if isinstance(item, tuple) and item:
+            kind = str(item[0])
+            payload = item[1] if len(item) > 1 else None
+            self.sink.put((f"{self.prefix}_{kind}", payload))
+        else:
+            self.sink.put(item)
+
 class CodexWorker(threading.Thread):
     """Translate the persistent Codex app-server protocol into UI events."""
 
@@ -86,6 +101,14 @@ class CodexWorker(threading.Thread):
     def ask_ephemeral(self, text: str, image_paths=None):
         """Run one turn without adding its input to normal conversation memory."""
         self.req.put(("ask_ephemeral", (text, list(image_paths or []))))
+
+    def ask_meeting_minutes(self, text: str):
+        """Run an isolated agent turn whose output is routed to the minutes channel."""
+        self.req.put(("ask_meeting_minutes", str(text)))
+    def ask_meeting_minutes_batch(self, text: str):
+        """Run bounded chunk summaries and hierarchical merges in the worker."""
+        self.req.put(("ask_meeting_minutes_batch", str(text)))
+
 
     def ask_office_plan(self, text: str):
         """Run an isolated, no-tools Office planning turn."""
@@ -166,6 +189,10 @@ class CodexWorker(threading.Thread):
                     self._run_turn(*payload)
                 elif kind == "ask_ephemeral":
                     self._run_turn(*payload, ephemeral=True)
+                elif kind == "ask_meeting_minutes":
+                    self._run_meeting_minutes(payload)
+                elif kind == "ask_meeting_minutes_batch":
+                    self._run_meeting_minutes_batch(payload)
                 elif kind == "ask_office_plan":
                     self._run_turn(payload, [], ephemeral=True, office_plan=True)
                 elif kind == "ask_office_context":
@@ -226,7 +253,90 @@ class CodexWorker(threading.Thread):
                 self.ui.put(("turn_done", None))
         self._stop_server()
 
+    def _run_meeting_minutes(self, text: str):
+        original_ui = self.ui
+        original_agent_ui = getattr(self._agent, "ui", None)
+        channel = _EventChannel(original_ui, "meeting_minutes")
+        self.ui = channel
+        if original_agent_ui is not None:
+            self._agent.ui = channel
+        try:
+            self._run_turn(str(text), [], ephemeral=True)
+        finally:
+            self.ui = original_ui
+            if original_agent_ui is not None:
+                self._agent.ui = original_agent_ui
+
     # -- app-server transport ----------------------------------------
+    def _run_isolated_agent_text(self, text: str) -> str:
+        """Run one ephemeral agent turn and return only its streamed text."""
+        class _Capture:
+            def __init__(self):
+                self.events = []
+
+            def put(self, item):
+                self.events.append(item)
+
+        original_ui = self.ui
+        original_agent_ui = getattr(self._agent, "ui", None)
+        capture = _Capture()
+        self.ui = capture
+        if original_agent_ui is not None:
+            self._agent.ui = capture
+        try:
+            self._run_turn(str(text), [], ephemeral=True)
+        finally:
+            self.ui = original_ui
+            if original_agent_ui is not None:
+                self._agent.ui = original_agent_ui
+        errors = [payload for kind, payload in capture.events if kind == "error"]
+        if errors:
+            raise RuntimeError(str(errors[-1]))
+        response = "".join(str(payload or "") for kind, payload in capture.events if kind == "delta").strip()
+        if not response:
+            raise RuntimeError("agent returned no text")
+        return response
+
+    def _run_meeting_minutes_batch(
+        self,
+        text: str,
+        *,
+        chunk_chars: int | None = None,
+        merge_batch: int | None = None,
+    ):
+        """Summarize a long transcript without placing it in one model request."""
+        from config import MEETING_CHUNK_CHARS, MEETING_MERGE_BATCH
+        from meeting_minutes import (
+            MeetingMinutesBatchError,
+            summarize_transcript_in_batches,
+        )
+
+        channel = _EventChannel(self.ui, "meeting_minutes")
+        try:
+            result = summarize_transcript_in_batches(
+                str(text),
+                self._run_isolated_agent_text,
+                chunk_chars=chunk_chars or MEETING_CHUNK_CHARS,
+                merge_batch=merge_batch or MEETING_MERGE_BATCH,
+                on_progress=lambda value: channel.put(("progress", value)),
+            )
+            payload = dict(result.payload)
+            payload["chunk_count"] = result.chunk_count
+            payload["summary_mode"] = result.summary_mode
+            channel.put(("delta", json.dumps(payload, ensure_ascii=False)))
+        except MeetingMinutesBatchError as exc:
+            channel.put(("error", {
+                "stage": exc.stage,
+                "chunk_count": exc.chunk_count,
+                "partials": exc.partials,
+                "message": str(exc),
+            }))
+        except BaseException as exc:
+            channel.put(("error", str(exc)))
+        finally:
+            channel.put(("turn_done", None))
+
+
     @staticmethod
     def _normalize_backend(value: Any) -> str:
         value = str(value or "auto").strip().lower()
