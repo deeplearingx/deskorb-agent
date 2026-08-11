@@ -68,10 +68,10 @@ class ToolPolicyTests(unittest.TestCase):
                                               task_authorized=True)
                 self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
-    def test_non_delete_high_risk_marker_does_not_require_confirmation(self):
+    def test_non_delete_high_risk_marker_requires_confirmation(self):
         decision = self.policy.decide("desktop_click", execution_requested=True, full_access=True,
                                       task_authorized=True, high_risk=True)
-        self.assertEqual(decision.kind, DecisionKind.ALLOW)
+        self.assertEqual(decision.kind, DecisionKind.CONFIRM)
 
 
 class ApprovalManagerTests(unittest.TestCase):

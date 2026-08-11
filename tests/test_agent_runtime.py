@@ -94,6 +94,17 @@ class ReadOnlyToolsTests(unittest.TestCase):
 
     def test_mcp_router_recognizes_natural_language_office_file_requests(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        class OfficeRouter:
+            available_servers = ("officecli",)
+
+            @staticmethod
+            def server_catalog():
+                return [{"name": "officecli", "description": "Office document tools",
+                         "keywords": ["word", "文档", "ppt", "excel"]}]
+
+        # This test verifies intent routing, so inject the configured server
+        # metadata instead of depending on an OfficeCLI binary on the host.
+        runtime.mcp = OfficeRouter()
         for task in ("创建一个word文档", "创建一个 Word 文档", "创建word和ppt",
                      "创建一个ppt演示文稿", "创建一个excel文件"):
             with self.subTest(task=task):
@@ -163,7 +174,7 @@ class ReadOnlyToolsTests(unittest.TestCase):
     def test_high_risk_marker_and_task_authorization(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
         self.assertFalse(runtime._high_risk_call("desktop_type", {"risk_level": "normal"}))
-        self.assertFalse(runtime._high_risk_call("desktop_type", {"risk_level": "high"}))
+        self.assertTrue(runtime._high_risk_call("desktop_type", {"risk_level": "high"}))
         self.assertFalse(runtime._high_risk_call("desktop_clipboard_read_text", {}))
         self.assertFalse(runtime._high_risk_call("window_control", {"action": "close"}))
         runtime._task_authorized_until = __import__("time").monotonic() + 10

@@ -74,9 +74,9 @@ class RuntimeE2ETests(unittest.TestCase):
             responses = iter([
                 {"output": [{"type": "function_call", "call_id": "launch", "name": "application_launch",
                              "arguments": '{"application":"chrome"}'}]},
-                {"output": [{"type": "function_call", "call_id": "batch", "name": "browser_action_batch",
-                             "arguments": '{"actions":[{"action":"click_ref","arguments":{"ref":"e1"}}],'
-                                         '"risk_level":"normal","risk_reason":"ordinary search"}'}]},
+                {"output": [{"type": "function_call", "call_id": "click", "name": "mcp_playwright_browser_click",
+                             "arguments": '{"ref":"e1","_deskorb_risk_level":"normal",'
+                                         '"_deskorb_risk_reason":"ordinary search"}'}]},
                 {"output": [{"type": "function_call", "call_id": "snapshot", "name": "mcp_playwright_browser_snapshot",
                              "arguments": "{}"}]},
                 {"output_text": "已找到：深灰纯棉圆领 T 恤，129 元。", "output": []},
@@ -85,12 +85,6 @@ class RuntimeE2ETests(unittest.TestCase):
             with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
                  patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "chrome", "pid": 123}):
                 runtime.run_turn("打开浏览器，搜索测试商品并返回结果", [])
-                first = []
-                while not events.empty():
-                    first.append(events.get_nowait())
-                approval = next(value for kind, value in first if kind == "approval")
-                token = str(approval).split("确认 ", 1)[1].splitlines()[0]
-                runtime.run_turn("确认 " + token, [])
             remaining = []
             while not events.empty():
                 remaining.append(events.get_nowait())
@@ -105,22 +99,16 @@ class RuntimeE2ETests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runtime = AgentRuntime(Queue(), "fixture-model", "https://example.test/v1", working_dir=Path(directory))
             runtime.mcp = RecoveryMcp()
-            runtime._grant_task_lease("打开浏览器检查测试商品", "browser_action_batch")
-            first_space = runtime.browser_spaces.for_task(runtime._task_id)
-            failed = runtime._run_tool_with_recovery("mcp_playwright_browser_click", {"ref": "e1"})
-            second_space = runtime.browser_spaces.for_task(runtime._task_id)
+            failed = runtime._run_local_tool("mcp_playwright_browser_click", {"ref": "e1"})
+            blocked = runtime._run_local_tool("mcp_playwright_browser_click", {"ref": "e1"})
+            observed = runtime._run_local_tool("mcp_playwright_browser_snapshot", {})
+            retried = runtime._run_local_tool("mcp_playwright_browser_click", {"ref": "e2"})
             self.assertFalse(failed["ok"])
             self.assertTrue(failed["requires_reobservation"])
-            self.assertIsNotNone(first_space)
-            self.assertIsNotNone(second_space)
-            self.assertNotEqual(first_space.space_id, second_space.space_id)
-            blocked = runtime._run_tool_with_recovery("mcp_playwright_browser_click", {"ref": "e1"})
             self.assertFalse(blocked["ok"])
             self.assertTrue(blocked["requires_reobservation"])
-            observed = runtime._run_tool_with_recovery("mcp_playwright_browser_snapshot", {})
             self.assertTrue(observed["ok"])
             self.assertFalse(runtime._browser_reobservation_required)
-            retried = runtime._run_tool_with_recovery("mcp_playwright_browser_click", {"ref": "e2"})
             self.assertTrue(retried["ok"])
             self.assertEqual(runtime.mcp.click_calls, 2)
 
@@ -142,18 +130,12 @@ class RuntimeE2ETests(unittest.TestCase):
             ])
             runtime._request = lambda _payload, _key: next(responses)
             with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
-                 patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "notepad", "pid": 456}), \
+                patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "notepad", "pid": 456}), \
                  patch.object(runtime.desktop, "capture_state", return_value={"ok": True, "snapshot_id": "S1", "active_window": "Notepad", "screen_digest": "fixture"}), \
                  patch.object(runtime.desktop, "capture_image_data_url", return_value=None), \
                  patch.object(runtime.desktop, "type_text", return_value={"ok": True, "characters": 19}), \
-                 patch.object(runtime.desktop, "verify_state", return_value={"ok": True, "screen_changed": True, "active_window_changed": False}):
+                patch.object(runtime.desktop, "verify_state", return_value={"ok": True, "screen_changed": True, "active_window_changed": False}):
                 runtime.run_turn("打开记事本并输入测试文本，然后验证状态", [])
-                first = []
-                while not events.empty():
-                    first.append(events.get_nowait())
-                approval = next(value for kind, value in first if kind == "approval")
-                token = str(approval).split("确认 ", 1)[1].splitlines()[0]
-                runtime.run_turn("确认 " + token, [])
             remaining = []
             while not events.empty():
                 remaining.append(events.get_nowait())

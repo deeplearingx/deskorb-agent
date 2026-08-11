@@ -71,6 +71,25 @@ class TaskRuntimeTests(unittest.TestCase):
         self.assertEqual(classify_failure("permission denied"), "permission_denied")
         self.assertEqual(classify_failure("API circuit open"), "provider_circuit_open")
 
+    def test_e2e_failure_categories_are_normalized_before_generic_fallback(self):
+        cases = {
+            "empty_model_input": "empty_model_input",
+            "API Key is not configured": "model_not_configured",
+            "provider_timeout": "provider_timeout",
+            "stale locator ref": "locator_failure",
+            "page_state_failure": "page_state_failure",
+            "desktop_focus_failure": "desktop_focus_failure",
+            "file_verification_failed": "file_verification_failure",
+            "safety_boundary": "safety_boundary",
+            "human_handoff_timeout": "human_handoff_timeout",
+            "permission_blocked": "permission_blocked",
+            "environment_not_ready": "environment_not_ready",
+            "tool_failure": "tool_failure",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(classify_failure(value), expected)
+
     def test_checkpoint_is_structural_and_recoverable_requires_reauthorization(self):
         with tempfile.TemporaryDirectory() as directory:
             journal = TaskJournal(Path(directory) / "tasks.sqlite3")

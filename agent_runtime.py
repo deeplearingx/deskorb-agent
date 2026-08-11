@@ -30,6 +30,8 @@ from model_adapter import ModelAdapter
 from conversation_context import ConversationContext
 from credential_store import get_api_key
 from responses_tool_protocol import continue_input, function_call_output, function_calls
+from runtime_task_state import RuntimeTaskState
+from task_runtime import InMemoryTaskJournal, classify_failure
 from win32utils import foreground_capture_window, window_bbox, window_title
 
 
@@ -341,7 +343,8 @@ class AgentRuntime:
                  working_dir: str | Path = WORKING_DIR, full_access: bool = True,
                  context_tokens: int = API_CONTEXT_TOKEN_BUDGET,
                  recent_turns: int = API_CONTEXT_RECENT_TURNS,
-                 model_provider: str | None = None):
+                 model_provider: str | None = None,
+                 task_journal: Any | None = None):
         self.ui = ui_queue
         self.model = model
         self.model_provider = model_provider or MODEL_PROVIDER
@@ -373,6 +376,10 @@ class AgentRuntime:
         self._pending_human_verification: dict[str, Any] | None = None
         self._task_authorized_until = 0.0
         self._task_mcp_servers: set[str] = set()
+        self.task_journal = task_journal if task_journal is not None else InMemoryTaskJournal()
+        self._task_state: RuntimeTaskState | None = None
+        self._browser_recovery_attempts = 0
+        self._browser_reobservation_required = False
 
     def configure(self, model: str, api_base_url: str, api_proxy_url: str = "",
                   model_provider: str | None = None):
@@ -388,6 +395,10 @@ class AgentRuntime:
         self._pending_human_verification = None
         self._task_authorized_until = 0.0
         self._task_mcp_servers.clear()
+        self._task_state = None
+        self._browser_recovery_attempts = 0
+        self._browser_reobservation_required = False
+        self.desktop.clear_target_window()
 
     def reset(self):
         self.context.clear()
@@ -396,6 +407,10 @@ class AgentRuntime:
         self._pending_human_verification = None
         self._task_authorized_until = 0.0
         self._task_mcp_servers.clear()
+        self._task_state = None
+        self._browser_recovery_attempts = 0
+        self._browser_reobservation_required = False
+        self.desktop.clear_target_window()
 
     def compact(self, force: bool = True) -> dict[str, int] | None:
         """Summarize older turns while retaining recent dialogue verbatim."""
@@ -431,26 +446,45 @@ class AgentRuntime:
                 pass
 
     def run_turn(self, text: str, image_paths: list[str]):
+        if not str(text or "").strip():
+            self._block_empty_input()
+            return
         try:
             return self._run_turn(text, image_paths)
-        except BaseException:
+        except BaseException as exc:
             self._task_authorized_until = 0.0
+            self._finish_task("failed", failure_kind=self._runtime_failure_kind(exc))
             raise
+
+    def set_desktop_target_window(self, hwnd: int) -> dict[str, Any]:
+        """Constrain this runtime to a disposable foreground window."""
+        return self.desktop.set_target_window(hwnd)
+
+    def clear_desktop_target_window(self) -> None:
+        self.desktop.clear_target_window()
 
     def run_ephemeral_turn(self, text: str, image_paths: list[str]):
         """Run one request without reading or updating normal conversation context."""
+        if not str(text or "").strip():
+            self._block_empty_input()
+            return
         try:
             return self._run_turn(text, image_paths, ephemeral=True)
-        except BaseException:
+        except BaseException as exc:
             self._task_authorized_until = 0.0
+            self._finish_task("failed", failure_kind=self._runtime_failure_kind(exc))
             raise
 
     def run_office_plan_turn(self, text: str):
         """Generate an ephemeral Office plan with no local or MCP tool access."""
+        if not str(text or "").strip():
+            self._block_empty_input()
+            return
         try:
             return self._run_turn(text, [], ephemeral=True, allow_tools=False)
-        except BaseException:
+        except BaseException as exc:
             self._task_authorized_until = 0.0
+            self._finish_task("failed", failure_kind=self._runtime_failure_kind(exc))
             raise
 
     def run_office_context_turn(self, question: str, office_prompt: str | None = None,
@@ -462,11 +496,61 @@ class AgentRuntime:
                 office_prompt if office_prompt is not None else question,
                 [], ephemeral=True, allow_tools=False,
             )
-        except BaseException:
+        except BaseException as exc:
             self._task_authorized_until = 0.0
+            self._finish_task("failed", failure_kind=self._runtime_failure_kind(exc))
             raise
         finally:
             self._office_event_token = None
+
+    def _runtime_failure_kind(self, error: Any) -> str:
+        """Map an exception to the privacy-safe task failure taxonomy."""
+        return classify_failure(str(error))
+
+    def _task_requires_contract(self, text: str) -> bool:
+        """Return whether a user request claims an external or local effect."""
+        lowered = str(text or "").lower()
+        markers = (
+            "搜索", "查找", "研究", "检查", "诊断", "验证", "结果", "商品", "网页", "网站",
+            "文件", "文档", "打开", "启动", "输入", "点击", "运行", "创建", "写入", "保存",
+            "browser", "search", "research", "verify", "file", "document", "open", "launch",
+            "type", "click", "run", "create", "write", "save",
+        )
+        return self._execution_requested(lowered) or any(marker in lowered for marker in markers)
+
+    def _ensure_task_state(self, goal: str) -> RuntimeTaskState:
+        if self._task_state is None:
+            self._task_state = RuntimeTaskState.start(
+                self.task_journal,
+                goal,
+                requires_action=self._task_requires_contract(goal),
+            )
+        return self._task_state
+
+    def _finish_task(self, terminal: str, *, failure_kind: str | None = None) -> dict[str, Any] | None:
+        state = self._task_state
+        if state is None:
+            return None
+        progress = state.finish(terminal, failure_kind=failure_kind)
+        self.ui.put(("task_progress", progress))
+        self._task_state = None
+        return progress
+
+    def _block_empty_input(self) -> None:
+        state = RuntimeTaskState.start(self.task_journal, "Desktop task", requires_action=False)
+        progress = state.finish("blocked", failure_kind="empty_model_input")
+        self.ui.put(("task_progress", progress))
+
+    def recoverable_tasks(self) -> list[dict[str, Any]]:
+        """Expose only journal checkpoints; authorization is never restored."""
+        recoverable = getattr(self.task_journal, "recoverable", None)
+        return list(recoverable()) if callable(recoverable) else []
+
+    def task_evidence(self, task_id: str | None = None) -> dict[str, Any]:
+        """Return the journal's bounded structural evidence projection."""
+        wanted = task_id or (self._task_state.task_id if self._task_state else None)
+        snapshot = getattr(self.task_journal, "evidence_snapshot", None)
+        return snapshot(wanted) if callable(snapshot) else {"ok": False, "error": "Task journal is unavailable."}
 
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                   allow_tools: bool = True):
@@ -489,6 +573,8 @@ class AgentRuntime:
             self.ui.put(("system", "A CAPTCHA handoff is waiting. Complete it in the browser, then click ‘我已完成验证，继续’."))
             return
         if verification_status == "resume" and continuation:
+            if self._task_state is not None:
+                self._task_state.resumed_by_human()
             transcript = list(continuation["transcript"])
             transcript.append({"role": "user", "content": [{
                 "type": "input_text",
@@ -512,6 +598,8 @@ class AgentRuntime:
             # A new user task gets a new, minimal MCP selection.  Approval and
             # CAPTCHA continuations retain their selected server(s).
             self._task_mcp_servers.clear()
+            self._browser_recovery_attempts = 0
+            self._browser_reobservation_required = False
         if not ephemeral:
             self._maybe_compact_context(api_key)
         self.ui.put(("status", "agent inspecting…"))
@@ -525,9 +613,12 @@ class AgentRuntime:
                 content.append({"type": "input_image", "image_url": f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"})
         transcript: list[dict[str, Any]] = [{"role": "user", "content": content}]
         original_text = "Answer the attached Word question" if ephemeral else self._clean_task_text(text)
+        if not ephemeral:
+            self._ensure_task_state(original_text)
         if approval_status == "approved" and self._pending_execution:
             call, transcript, original_text = self._pending_execution
             self._pending_execution = None
+            self._ensure_task_state(original_text)
             if self._is_task_scoped(call.name):
                 self._task_authorized_until = time.monotonic() + self.TASK_AUTHORIZATION_SECONDS
                 self.ui.put(("system", "✓ Task authorized. Normal steps will continue without further confirmation."))
@@ -538,6 +629,7 @@ class AgentRuntime:
                 result = self._run_local_tool(call.name, arguments)
             except (json.JSONDecodeError, ValueError) as exc:
                 result = {"ok": False, "error": f"Invalid confirmed function call: {exc}"}
+            self._task_state.record_tool_result(call.name, result)
             transcript.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
             transcript = self._append_desktop_observation(transcript, call.name)
         return self._run_task_loop(api_key, transcript, original_text, ephemeral)
@@ -563,6 +655,8 @@ class AgentRuntime:
     def _run_task_loop(self, api_key: str, transcript: list[dict[str, Any]], original_text: str,
                        ephemeral: bool) -> None:
         """Run (or resume) an agent task against its existing tool transcript."""
+        if not ephemeral:
+            self._ensure_task_state(original_text)
         instructions = SYSTEM_APPEND + (
             "\nYou are the independent DeskOrb Agent Runtime. You may inspect the active window and files below the configured working directory. "
             "When Full access is enabled and the user explicitly asks for a local change, filesystem_write may be used and its result is verified by rereading the file. "
@@ -573,6 +667,7 @@ class AgentRuntime:
         for _ in range(self._tool_round_limit(original_text)):
             if self._cancelled.is_set():
                 self._task_authorized_until = 0.0
+                self._finish_task("failed", failure_kind="cancelled")
                 self.ui.put(("system", "stopped."))
                 return
             response = self._request({"model": self.model, "instructions": instructions, "input": transcript,
@@ -588,6 +683,7 @@ class AgentRuntime:
                 self.ui.put(("delta", answer))
                 if not ephemeral:
                     self.ui.put(("ctx", self.context.usage_percent()))
+                    self._finish_task("completed")
                 return
             outputs = []
             for call in calls:
@@ -614,15 +710,21 @@ class AgentRuntime:
                             if self._is_task_scoped(call.name, arguments) and not high_risk and not self._task_authorized():
                                 summary = "Authorize task: " + original_text[:180]
                             request = self.request_approval(call.name, arguments, decision.risk, summary)
+                            if self._task_state is not None:
+                                self._task_state.record_confirmation()
                             self._pending_execution = (call, continue_input(transcript, response, []), original_text)
                             return
                         else:
                             result = self._run_local_tool(call.name, arguments)
                 except (json.JSONDecodeError, ValueError) as exc:
                     result = {"ok": False, "error": f"Invalid function call: {exc}"}
+                if not ephemeral and self._task_state is not None:
+                    self._task_state.record_tool_result(call.name, result)
                 outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
                 captcha_marker = self._captcha_marker(call.name, result)
                 if captcha_marker:
+                    if not ephemeral and self._task_state is not None:
+                        self._task_state.waiting_for_human(captcha_marker)
                     continuation = continue_input(transcript, response, outputs)
                     self._pause_for_human_verification(continuation, original_text, ephemeral,
                                                        captcha_marker, arguments)
@@ -631,6 +733,7 @@ class AgentRuntime:
             if calls:
                 transcript = self._append_desktop_observation(transcript, calls[-1].name)
         self._task_authorized_until = 0.0
+        self._finish_task("failed", failure_kind="tool_round_limit")
         raise RuntimeError("Agent exceeded the tool round limit")
 
     def _tool_round_limit(self, task_text: str) -> int:
@@ -707,8 +810,14 @@ class AgentRuntime:
             return True
         if self.mcp and self.mcp.owns(name):
             server_name = getattr(self.mcp, "server_name", lambda _name: None)(name)
-            return server_name == "officecli" and self._officecli_deletes_file(arguments.get("command"))
-        return False
+            if server_name == "officecli" and self._officecli_deletes_file(arguments.get("command")):
+                return True
+            read_only = getattr(self.mcp, "is_read_only_call", None)
+            if callable(read_only) and read_only(name, arguments):
+                return False
+        risk_level = str(arguments.get("_deskorb_risk_level") or arguments.get("risk_level") or "").lower()
+        return risk_level == "high" and (name in self.DESKTOP_ACTION_TOOLS or
+                                          bool(self.mcp and self.mcp.owns(name)))
 
     @staticmethod
     def _shell_deletes_file(command: Any) -> bool:
@@ -970,6 +1079,37 @@ class AgentRuntime:
         return {"desktop_get_active_window": "Active window", "filesystem_list": "List files",
                 "filesystem_read_text": "Read file", "filesystem_search_text": "Search files"}.get(name, name)
 
+    def _is_browser_mcp_tool(self, name: str) -> bool:
+        if not self.mcp or not self.mcp.owns(name):
+            return False
+        server_name = getattr(self.mcp, "server_name", lambda _name: None)(name)
+        return server_name == "playwright" or str(name).startswith("mcp_playwright_")
+
+    @staticmethod
+    def _is_browser_observation_tool(name: str) -> bool:
+        lowered = str(name).lower()
+        return any(marker in lowered for marker in ("snapshot", "observe", "content"))
+
+    @staticmethod
+    def _is_browser_connection_failure(result: dict[str, Any]) -> bool:
+        if not isinstance(result, dict) or result.get("ok"):
+            return False
+        text = str(result.get("error") or result.get("message") or "").lower()
+        return any(marker in text for marker in (
+            "target closed", "browser closed", "page closed", "context closed",
+            "connection closed", "disconnected", "broken pipe", "transport",
+        ))
+
+    def _reconnect_browser_mcp(self) -> None:
+        close = getattr(self.mcp, "close", None) if self.mcp else None
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # The failed tool result remains the source of truth.  A
+                # subsequent fresh snapshot is still required before action.
+                pass
+
     def _run_local_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "mcp_enable_server":
             server = str(arguments.get("server_name") or "").strip()
@@ -980,7 +1120,23 @@ class AgentRuntime:
             return {"ok": True, "server": server,
                     "message": "Integration selected. Its tool schemas are available on the next step."}
         if self.mcp and self.mcp.owns(name):
-            return self.mcp.call(name, arguments)
+            is_browser = self._is_browser_mcp_tool(name)
+            if is_browser and self._browser_reobservation_required \
+                    and not self._is_browser_observation_tool(name):
+                return {"ok": False,
+                        "error": "Fresh browser observation is required before retrying this action.",
+                        "requires_reobservation": True}
+            result = self.mcp.call(name, arguments)
+            if is_browser and self._is_browser_connection_failure(result):
+                self._browser_reobservation_required = True
+                if self._browser_recovery_attempts < 1:
+                    self._browser_recovery_attempts += 1
+                    self._reconnect_browser_mcp()
+                return {**result, "requires_reobservation": True,
+                        "recovery_attempts": self._browser_recovery_attempts}
+            if is_browser and self._is_browser_observation_tool(name) and isinstance(result, dict) and result.get("ok"):
+                self._browser_reobservation_required = False
+            return result
         if name == "filesystem_write":
             return self.tools.write_text(arguments)
         if name == "application_launch":

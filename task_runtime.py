@@ -56,6 +56,27 @@ def new_task_id() -> str:
 def classify_failure(value: Any) -> str:
     """Return a stable recovery category without exposing raw upstream text."""
     text = str(value or "").lower()
+    exact_categories = (
+        ("empty_model_input", "empty_model_input"),
+        ("model_not_configured", "model_not_configured"),
+        ("api key is not configured", "model_not_configured"),
+        ("provider_timeout", "provider_timeout"),
+        ("locator_failure", "locator_failure"),
+        ("stale locator", "locator_failure"),
+        ("target closed", "locator_failure"),
+        ("page_state_failure", "page_state_failure"),
+        ("desktop_focus_failure", "desktop_focus_failure"),
+        ("file_verification_failure", "file_verification_failure"),
+        ("file_verification_failed", "file_verification_failure"),
+        ("safety_boundary", "safety_boundary"),
+        ("human_handoff_timeout", "human_handoff_timeout"),
+        ("permission_blocked", "permission_blocked"),
+        ("environment_not_ready", "environment_not_ready"),
+        ("tool_failure", "tool_failure"),
+    )
+    for marker, category in exact_categories:
+        if marker in text:
+            return category
     if any(marker in text for marker in ("api circuit open", "circuit open", "熔断")):
         return "provider_circuit_open"
     if any(marker in text for marker in ("duplicate side effect", "duplicate_prevented", "重复副作用")):

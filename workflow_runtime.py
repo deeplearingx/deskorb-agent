@@ -169,7 +169,14 @@ class TaskContract:
             return True
         action_nodes = [node for node in nodes if node.kind in {"action", "verification"}]
         if not action_nodes:
-            return True
+            # An explicitly action-oriented task cannot be completed by a
+            # prose-only model response.  Pure question/answer tasks use a
+            # contract with ``requires_verification=False`` and still pass.
+            return False
+        if any(node.status is NodeStatus.FAILED for node in action_nodes):
+            # Later evidence cannot prove that a failed side effect occurred;
+            # the caller must classify and recover the failed node explicitly.
+            return False
         evidence_nodes = [node for node in nodes if node.evidence and node.status is NodeStatus.SUCCEEDED]
         if not evidence_nodes:
             return False
@@ -234,16 +241,21 @@ class TaskWorkflow:
 
     def finish(self, terminal: str) -> dict[str, Any]:
         requested_terminal = str(terminal)
-        actions = [node for node in self._nodes if node.kind in {"action", "verification"} and node.status is NodeStatus.SUCCEEDED]
         # A pure answer/observation task has no claimed external effect.  For a
         # task that changed something, require a separately observable result.
         self._verified = self.contract.verify(self._nodes)
         # Do not let a successful model response turn an unverified action
         # sequence into a completed task.  The runtime may later resume this
         # state after a fresh observation or an explicit verifier result.
-        self._terminal = ("waiting_verification"
-                          if requested_terminal == "completed" and actions and not self._verified
-                          else requested_terminal)
+        failed_actions = any(node.status is NodeStatus.FAILED for node in self._nodes
+                             if node.kind in {"action", "verification"})
+        if requested_terminal == "completed" and failed_actions:
+            self._terminal = "failed"
+        elif (requested_terminal == "completed" and self.contract.requires_verification
+              and not self._verified):
+            self._terminal = "waiting_verification"
+        else:
+            self._terminal = requested_terminal
         return self.progress()
 
     def progress(self) -> dict[str, Any]:
@@ -291,6 +303,12 @@ class TaskWorkflow:
     def _has_verifiable_evidence(tool_name: str, result: dict[str, Any]) -> bool:
         if bool(result.get("verified")):
             return True
+        if tool_name in {"filesystem_list", "filesystem_read_text", "filesystem_search_text",
+                         "desktop_get_active_window", "desktop_list_windows", "process_list",
+                         "desktop_capture_state"}:
+            return bool(result.get("ok"))
+        if tool_name in {"window_control", "window_focus"}:
+            return bool(result.get("ok") and (result.get("after") or result.get("title")))
         if tool_name == "desktop_verify_state":
             return bool(result.get("screen_changed") or result.get("active_window_changed"))
         if tool_name == "shell_run":

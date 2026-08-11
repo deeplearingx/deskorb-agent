@@ -77,8 +77,35 @@ class DesktopTools:
         self.snapshot: DesktopSnapshot | None = None
         self._window_snapshot: dict[int, WindowSnapshot] = {}
         self._window_snapshot_at = 0.0
+        self.target_window: int | None = None
         self.user32 = ctypes.windll.user32 if os.name == "nt" else None
         self.kernel32 = ctypes.windll.kernel32 if os.name == "nt" else None
+
+    def set_target_window(self, hwnd: int) -> dict:
+        """Restrict future desktop observations and actions to one HWND."""
+        try:
+            value = int(hwnd)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Target window handle must be an integer."}
+        if value <= 0:
+            return {"ok": False, "error": "Target window handle must be positive."}
+        if self.user32 is not None:
+            try:
+                if not self.user32.IsWindow(value):
+                    return {"ok": False, "error": "Target window handle is not a live window."}
+            except (AttributeError, OSError):
+                return {"ok": False, "error": "Target window could not be validated."}
+        self.target_window = value
+        self.snapshot = None
+        self._window_snapshot.clear()
+        self._window_snapshot_at = 0.0
+        return {"ok": True, "target_window": value}
+
+    def clear_target_window(self) -> None:
+        self.target_window = None
+        self.snapshot = None
+        self._window_snapshot.clear()
+        self._window_snapshot_at = 0.0
 
     def capture_state(self) -> dict:
         if not self.user32:
@@ -86,6 +113,8 @@ class DesktopTools:
         point = ctypes.wintypes.POINT()
         self.user32.GetCursorPos(ctypes.byref(point))
         hwnd = foreground_capture_window()
+        if self.target_window is not None and int(hwnd or 0) != self.target_window:
+            return {"ok": False, "error": "Target window is not the foreground window."}
         digest = ""
         try:
             image = ImageGrab.grab()
@@ -262,6 +291,8 @@ class DesktopTools:
         except Exception as exc:
             return {"ok": False, "error": f"Could not enumerate windows: {exc}"}
         windows.sort(key=lambda item: item.title.lower())
+        if self.target_window is not None:
+            windows = [item for item in windows if item.window_id == self.target_window]
         self._window_snapshot = {item.window_id: item for item in windows}
         self._window_snapshot_at = time.monotonic()
         return {"ok": True, "windows": [self._window_dict(item) for item in windows],
@@ -357,6 +388,8 @@ class DesktopTools:
             return "Desktop controls require Windows."
         if not state or snapshot_id != state.snapshot_id:
             return "Unknown desktop snapshot; capture fresh state first."
+        if self.target_window is not None and state.active_hwnd != self.target_window:
+            return "Desktop snapshot is not for the configured target window."
         if time.monotonic() - state.created_at > self.TTL_SECONDS:
             return "Desktop snapshot expired; capture fresh state first."
         if require_same_target and state.active_hwnd:
@@ -375,6 +408,8 @@ class DesktopTools:
         if time.monotonic() - self._window_snapshot_at > self.TTL_SECONDS:
             return None, "Window list expired; list windows again before acting."
         item = self._window_snapshot.get(requested)
+        if self.target_window is not None and requested != self.target_window:
+            return None, "Window is outside the configured target window."
         if not item or not self.user32.IsWindow(requested):
             return None, "Unknown or closed window; list windows again before acting."
         if window_title(requested) != item.title:

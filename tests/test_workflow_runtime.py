@@ -41,6 +41,17 @@ class TaskWorkflowTests(unittest.TestCase):
         progress = workflow.finish("completed")
         self.assertTrue(progress["verified"])
 
+    def test_read_only_file_observation_is_evidence_for_diagnosis(self):
+        workflow = TaskWorkflow("T-file-read", "检查项目文件并报告错误")
+        workflow.record_tool_result("filesystem_search_text", {
+            "ok": True, "results": [{"path": "app.py", "line": 1}],
+        })
+
+        progress = workflow.finish("completed")
+
+        self.assertTrue(progress["verified"])
+        self.assertEqual(progress["terminal"], "completed")
+
     def test_successful_action_is_not_treated_as_verified_without_evidence(self):
         workflow = TaskWorkflow("T1", "Open an application")
         workflow.record_tool_result("application_launch", {"ok": True})
@@ -48,6 +59,18 @@ class TaskWorkflowTests(unittest.TestCase):
         self.assertFalse(progress["verified"])
         self.assertEqual(progress["terminal"], "waiting_verification")
         self.assertEqual(workflow.nodes[0].kind, "action")
+
+    def test_failed_action_cannot_be_hidden_by_later_evidence(self):
+        workflow = TaskWorkflow("T-failed", "打开浏览器并返回结果")
+        workflow.record_tool_result("mcp_playwright_browser_click", {"ok": False, "error": "target closed"})
+        workflow.record_tool_result("mcp_playwright_browser_snapshot", {
+            "ok": True, "verification": {"passed": True},
+        })
+
+        progress = workflow.finish("completed")
+
+        self.assertFalse(progress["verified"])
+        self.assertEqual(progress["terminal"], "failed")
 
     def test_verified_write_and_state_change_supply_evidence(self):
         workflow = TaskWorkflow("T2", "Write a file")

@@ -106,6 +106,18 @@ class DesktopToolsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("active window", result["error"].lower())
 
+    def test_target_window_boundary_rejects_snapshot_from_another_window(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 55, "other", "digest")
+        result = tools.type_text("FRESH", "hello")
+        self.assertFalse(result["ok"])
+        self.assertIn("target window", result["error"].lower())
+
+        tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 101, "target", "digest")
+        tools.user32.foreground = 101
+        self.assertTrue(tools.type_text("FRESH", "hello")["ok"])
+
     def test_hotkey_releases_keys_in_reverse_order(self):
         tools = self.ready_tools()
         result = tools.hotkey("FRESH", ["ctrl", "shift", "s"])

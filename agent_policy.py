@@ -79,6 +79,9 @@ class ToolPolicy:
         if tool_name == "filesystem_delete" or (tool_name == "shell_run" and high_risk):
             return PolicyDecision(DecisionKind.CONFIRM, Risk.DESTRUCTIVE_LOCAL,
                                   "File deletion requires fresh confirmation")
+        if high_risk:
+            return PolicyDecision(DecisionKind.CONFIRM, Risk.EXTERNAL_OR_ELEVATED,
+                                  "High-risk external action requires fresh confirmation")
         if tool_name in self.REVERSIBLE_TOOLS:
             return PolicyDecision(DecisionKind.ALLOW, Risk.REVERSIBLE_LOCAL,
                                   "Explicit, reversible local action")
