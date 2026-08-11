@@ -542,12 +542,18 @@ class AgentRuntime:
 
     def _publish_tool_result(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
         """Publish bounded tool telemetry without arguments or free-form output."""
-        self.ui.put(("tool_result", {
+        payload = {
             "tool": str(name),
             "ok": bool(isinstance(result, dict) and result.get("ok")),
             "verified": bool(isinstance(result, dict) and result.get("verified")),
             "high_risk": bool(self._high_risk_call(name, arguments)),
-        }))
+        }
+        if not payload["ok"]:
+            category = classify_failure(result.get("error") if isinstance(result, dict) else None)
+            payload["failure_kind"] = "tool_failure" if category == "unknown" else category
+        if isinstance(result, dict) and isinstance(result.get("exit_code"), int):
+            payload["exit_code"] = int(result["exit_code"])
+        self.ui.put(("tool_result", payload))
 
     def _block_empty_input(self) -> None:
         state = RuntimeTaskState.start(self.task_journal, "Desktop task", requires_action=False)
@@ -677,6 +683,8 @@ class AgentRuntime:
             "When Full access is enabled and the user explicitly asks for a local change, filesystem_write may be used and its result is verified by rereading the file. "
             "When the user asks to open or launch Chrome, Edge, Firefox, QQ, Explorer, Notepad, or Calculator, call application_launch immediately with the matching application name. Never substitute a different application, claim you cannot open it, or tell the user to click its desktop icon. When the user explicitly asks to run a shell command, call shell_run immediately; never ask for confirmation in prose, because the runtime itself handles confirmation. To manage windows, first call desktop_list_windows and then use window_control with the returned short-lived window_id; prefer this over guessing coordinates. Before the first coordinate or keyboard action, call desktop_capture_state and use its snapshot ID. After every desktop action, the runtime automatically supplies a fresh screenshot and snapshot ID so you can inspect the result and continue the whole task. "
             "When local MCP browser tools are available, use their structured page snapshots and actions instead of screen coordinates for web tasks. If mcp_enable_server is available and the request matches a listed integration, call it before attempting that integration; it only enables schemas for one trusted local server and does not perform the user's action. A single task authorization covers normal application launch, clicking, typing, hotkeys, scrolling, window focus, and normal MCP browser actions for that task. Mark desktop_click, desktop_type, desktop_hotkey, and action MCP tools with risk_level=high only when the specific step sends or publishes content, purchases or transfers value, exposes secrets or personal data, deletes data, changes permissions/security, uploads private data, or accepts an irreversible prompt; give a concise risk_reason. High-risk steps and every shell command require a fresh confirmation. Use risk_level=normal with a short reason for ordinary navigation and search. If an MCP page snapshot or result shows a CAPTCHA, ‘快速验证身份’, ‘我是人类’, or similar human-verification screen, do not solve, bypass, or repeatedly retry it. The runtime will pause and request a manual handoff. Continue autonomously until the requested outcome is verified, then answer concisely with what you completed."
+            "Maintain a compact action ledger from tool results. Do not repeat an identical successful observation or verification command unless a state-changing action occurred; never loop on verification. Once the required postcondition and evidence are satisfied, stop calling tools and return the final answer."
+            "If the task or evaluation names required semantic steps, treat them as hard acceptance conditions: map filesystem_write to an actual filesystem_write call and shell_verify to one non-destructive shell_run verification command; do not substitute a file reread for shell verification."
             "In Full access, execute requested actions automatically. Ask for confirmation only before deleting files; the runtime detects common deletion commands inside shell_run. Do not ask for confirmation in prose. "
         )
         for _ in range(self._tool_round_limit(original_text)):

@@ -91,8 +91,8 @@ class TaskContract:
         ))
         if message_intent and any(marker in text for marker in ("qq", "消息", "信息", "send", "发送", "发")):
             schemas.append("message_delivery")
-        if any(marker in text for marker in ("保存", "写入", "创建", "修改", "覆盖")) \
-                or re.search(r"\b(?:write|save|create|modify|overwrite)\b", text):
+        if any(marker in text for marker in ("保存", "写入", "创建", "修改", "覆盖", "修复")) \
+                or re.search(r"\b(?:write|save|create|modify|overwrite|fix|repair)\b", text):
             schemas.append("path_and_content_hash")
         # Browser page tasks commonly begin with “打开浏览器”.  Their
         # structured page snapshot is the authoritative evidence; requiring a

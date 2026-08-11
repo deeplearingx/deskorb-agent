@@ -34,7 +34,8 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
             self.assertIsNone(runtime._task_state)
             tool_results = [value for kind, value in list(events.queue) if kind == "tool_result"]
             self.assertEqual(tool_results, [{"tool": "shell_run", "ok": True,
-                                             "verified": False, "high_risk": False}])
+                                             "verified": False, "high_risk": False,
+                                             "exit_code": 0}])
 
     def test_unverified_action_publishes_waiting_verification(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -102,7 +103,8 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
 
         tool_results = [value for kind, value in list(events.queue) if kind == "tool_result"]
         self.assertEqual(tool_results, [{"tool": "shell_run", "ok": False,
-                                         "verified": False, "high_risk": False}])
+                                         "verified": False, "high_risk": False,
+                                         "failure_kind": "tool_failure"}])
 
 
 if __name__ == "__main__":

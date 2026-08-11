@@ -35,6 +35,14 @@ def _node_data(node: WorkflowNode) -> dict[str, Any]:
     }
 
 
+def _tool_failure_kind(result: dict[str, Any]) -> str | None:
+    """Normalize an unsuccessful tool result to a non-empty stable category."""
+    if bool(result.get("ok")):
+        return None
+    category = classify_failure(result.get("error"))
+    return "tool_failure" if category == "unknown" else category
+
+
 @dataclass
 class RuntimeTaskState:
     """One runtime task's contract, workflow graph and privacy-safe journal."""
@@ -70,7 +78,7 @@ class RuntimeTaskState:
         safe_result = result if isinstance(result, dict) else {}
         failure = failure_kind
         if failure is None and not bool(safe_result.get("ok")):
-            failure = classify_failure(safe_result.get("error"))
+            failure = _tool_failure_kind(safe_result)
         if failure:
             self.last_failure_kind = failure
         node = self.workflow.record_tool_result(str(tool_name), safe_result, failure_kind=failure)

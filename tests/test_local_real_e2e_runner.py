@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from local_real_e2e_runner import (
     _finish_record,
     _DesktopFixtureSession,
+    _append_contract_guidance,
     _is_desktop_case,
     _is_local_browser_case,
     _run_runtime_task,
@@ -21,6 +23,7 @@ from local_real_e2e_runner import (
     load_matrix_cases,
     normalize_runtime_events,
     _unsafe_action_observed,
+    _prepare_evaluation_tool_environment,
     wait_for_handoff,
 )
 
@@ -64,6 +67,27 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertNotIn("text", json.dumps(result))
 
+    def test_event_normalization_preserves_terminal_failure_category(self):
+        result = normalize_runtime_events(
+            [("task_progress", {"terminal": "failed", "verified": False,
+                                 "failure_kind": "file_verification_failure"})],
+            started_at=0.0, finished_at=1.0,
+        )
+        self.assertEqual(result["terminal"], "failed")
+        self.assertEqual(result["failure_kind"], "file_verification_failure")
+
+    def test_event_normalization_preserves_only_failed_tool_structure(self):
+        result = normalize_runtime_events(
+            [("tool_result", {"tool": "shell_run", "ok": False,
+                               "failure_kind": "tool_failure", "exit_code": 1,
+                               "error": "private output"})],
+            started_at=0.0, finished_at=1.0,
+        )
+        self.assertEqual(result["failed_tool"], "shell_run")
+        self.assertEqual(result["tool_failure_kind"], "tool_failure")
+        self.assertEqual(result["failed_exit_code"], 1)
+        self.assertNotIn("private output", json.dumps(result))
+
     def test_safety_boundary_passes_only_when_the_dangerous_call_was_not_executed(self):
         cases = load_matrix_cases()
         case = next(item for item in cases if item["id"] == "safety-001")
@@ -100,6 +124,32 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
              "unsafe_action": True, "total_latency_ms": 10},
         )
         self.assertTrue(result["safety_passed"])
+
+    def test_missing_required_actions_cannot_be_reported_as_passed(self):
+        case = next(item for item in load_matrix_cases() if item["id"] == "diagnose-001")
+        baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
+        result = _finish_record(
+            case, 1, baselines,
+            {"action_sequence": ["filesystem_read"], "action_steps": 1,
+             "confirmation_count": 0, "handoff_count": 0, "completed": True,
+             "verified": True, "evidence_passed": True, "total_latency_ms": 10},
+        )
+        self.assertEqual(result["outcome"], "partial")
+        self.assertEqual(result["failure_kind"], "required_action_missing")
+        self.assertEqual(result["missing_required_action_kinds"], ["filesystem_write", "shell_verify"])
+
+    def test_real_task_prompt_includes_required_baseline_actions(self):
+        case = next(item for item in load_matrix_cases() if item["id"] == "diagnose-001")
+        baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
+        prompt = _append_contract_guidance("diagnose", case, baselines)
+        self.assertIn("filesystem_write", prompt)
+        self.assertIn("shell_run once", prompt)
+
+    def test_evaluation_shell_environment_uses_runner_python_directory(self):
+        runner_dir = str(Path(sys.executable).resolve().parent)
+        with patch.dict(os.environ, {"PATH": "C:\\Windows\\System32"}, clear=False):
+            _prepare_evaluation_tool_environment()
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], runner_dir)
 
     def test_desktop_fixture_session_reuses_one_window_for_a_batch(self):
         class FakeProcess:
@@ -189,6 +239,29 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertIsNone(failure)
         self.assertEqual(calls, ["完成隔离任务", "确认 ABCDEF"])
         self.assertTrue(metrics["completed"])
+
+    def test_completed_terminal_event_wins_over_thread_timeout_during_cleanup(self):
+        class FakeRuntime:
+            def __init__(self):
+                self.ui = Queue()
+
+            def interrupt(self):
+                return None
+
+        runtime = FakeRuntime()
+
+        def bounded(_runtime, _text, _timeout):
+            runtime.ui.put(("task_progress", {"terminal": "completed", "verified": True}))
+            return False, "provider_timeout"
+
+        with patch("local_real_e2e_runner._run_turn_bounded", side_effect=bounded):
+            metrics, failure = _run_runtime_task(
+                runtime, "完成隔离任务", 5, 0, False, allow_automatic_confirmation=True,
+            )
+
+        self.assertIsNone(failure)
+        self.assertTrue(metrics["completed"])
+        self.assertTrue(metrics["verified"])
 
     def test_bounded_turn_rejects_empty_input_before_runtime_call(self):
         class FakeRuntime:

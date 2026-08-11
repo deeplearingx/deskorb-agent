@@ -31,3 +31,4 @@
 - `394 passed, 50 subtests passed`。
 - 确定性矩阵 `57 passed, 3 skipped, 0 failed`；live/consent 场景未计入成功。
 - 空输入、Office 空上下文、malformed function arguments、危险动作阻断/执行判定均有回归覆盖。
+- 真实 `diagnose-001` smoke 通过：4 次读取、1 次最小写入、1 次非破坏性 shell 验证；运行时收尾超时不再覆盖已发布的完成终态。

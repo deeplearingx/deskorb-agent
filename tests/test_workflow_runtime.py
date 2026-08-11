@@ -34,6 +34,15 @@ class TaskWorkflowTests(unittest.TestCase):
         contract = TaskContract.from_goal("检查项目文件并报告错误", requires_action=True)
         self.assertNotIn("path_and_content_hash", contract.required_evidence_schemas)
 
+    def test_repair_task_requires_verified_file_change_evidence(self):
+        contract = TaskContract.from_goal("诊断问题并修复安全修复的问题", requires_action=True)
+        self.assertIn("path_and_content_hash", contract.required_evidence_schemas)
+        workflow = TaskWorkflow("T-repair", contract.goal, contract=contract)
+        workflow.record_tool_result("filesystem_search_text", {"ok": True, "results": []})
+        progress = workflow.finish("completed")
+        self.assertFalse(progress["verified"])
+        self.assertEqual(progress["terminal"], "waiting_verification")
+
     def test_successful_read_only_shell_check_is_exit_status_evidence(self):
         workflow = TaskWorkflow("T-shell", "运行语法检查并报告结果",
                                 contract=TaskContract.from_goal("运行语法检查并报告结果", requires_action=True))
