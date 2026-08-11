@@ -20,11 +20,18 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_runtime import AgentRuntime
+from tests.e2e_support.datasets import (
+    E2E_DATASET_PATH,
+    E2E_EXPANSIONS_PATH,
+    load_e2e_matrix_cases,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASET = Path(__file__).with_name("e2e_task_dataset.json")
-EXPANSIONS = Path(__file__).with_name("e2e_task_dataset_expansions.json")
+
+# Compatibility aliases for callers that imported the runner's old constants.
+DATASET = E2E_DATASET_PATH
+EXPANSIONS = E2E_EXPANSIONS_PATH
 
 
 class MatrixMcp:
@@ -76,12 +83,8 @@ class MatrixMcp:
 
 
 def load_matrix_cases() -> list[dict[str, Any]]:
-    base = json.loads(DATASET.read_text(encoding="utf-8"))["tasks"]
-    expanded = json.loads(EXPANSIONS.read_text(encoding="utf-8"))["cases"]
-    cases = [*base, *expanded]
-    if len(cases) != 60 or len({str(item.get("id")) for item in cases}) != 60:
-        raise ValueError("The evaluation matrix must contain 60 unique cases")
-    return cases
+    """Compatibility entry point for the canonical matrix loader."""
+    return load_e2e_matrix_cases()
 
 
 def run_matrix(repetitions: int = 3, *, progress: Callable[[str, int, int], None] | None = None) -> list[dict[str, Any]]:

@@ -44,13 +44,21 @@ from e2e_metrics import (
     summarize_runs,
 )
 from task_runtime import InMemoryTaskJournal
+from tests.e2e_support.datasets import (
+    E2E_DATASET_PATH,
+    E2E_EXPANSIONS_PATH,
+    E2E_STEP_BASELINES_PATH,
+    load_e2e_matrix_cases,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASET = Path(__file__).with_name("e2e_task_dataset.json")
-EXPANSIONS = Path(__file__).with_name("e2e_task_dataset_expansions.json")
-STEP_BASELINES = Path(__file__).with_name("e2e_step_baselines.json")
 FIXTURE_WEB_ROOT = Path(__file__).with_name("fixtures") / "web"
+
+# Compatibility aliases for callers that imported the runner's old constants.
+DATASET = E2E_DATASET_PATH
+EXPANSIONS = E2E_EXPANSIONS_PATH
+STEP_BASELINES = E2E_STEP_BASELINES_PATH
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 _HANDOFF_CASE_MARKERS = ("captcha", "login", "qr", "manual_handoff")
@@ -221,14 +229,8 @@ class _DesktopFixtureSession:
 
 
 def load_matrix_cases() -> list[dict[str, Any]]:
-    """Load the base and expansion datasets and require the complete matrix."""
-    base = json.loads(DATASET.read_text(encoding="utf-8"))
-    expanded = json.loads(EXPANSIONS.read_text(encoding="utf-8"))
-    cases = [*base.get("tasks", []), *expanded.get("cases", [])]
-    ids = [str(item.get("id") or "") for item in cases]
-    if len(cases) != 60 or len(set(ids)) != 60 or any(not item for item in ids):
-        raise ValueError("The evaluation matrix must contain 60 unique cases")
-    return cases
+    """Compatibility entry point for the canonical matrix loader."""
+    return load_e2e_matrix_cases()
 
 
 def wait_for_handoff(resume_event: threading.Event, *, timeout_seconds: int | float) -> dict[str, Any]:
