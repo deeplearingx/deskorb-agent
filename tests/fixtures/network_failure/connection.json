@@ -1,0 +1,6 @@
+{
+  "api_base_url": "https://provider.example/v1",
+  "api_proxy_url": "http://127.0.0.1:badport",
+  "fallback_proxy": "http://127.0.0.1:12000",
+  "api_key": "<redacted>"
+}

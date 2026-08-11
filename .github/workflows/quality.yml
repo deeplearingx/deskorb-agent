@@ -1,0 +1,364 @@
+name: DeskOrb Agent quality gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      run_desktop_vm_hard_gate:
+        description: "Run the non-advisory interactive Windows VM hard gate"
+        required: true
+        default: false
+        type: boolean
+      run_provider_capability_matrix:
+        description: "Run real no-op tool-call checks for configured providers (requires repository secrets)"
+        required: true
+        default: false
+        type: boolean
+      run_browser_agent_matrix:
+        description: "Run the 20x real local Playwright browser-agent matrix (requires primary API secret)"
+        required: true
+        default: false
+        type: boolean
+      run_public_browser_acceptance:
+        description: "Run public read-only browser acceptance (requires an interactive isolated Windows runner)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  local-quality:
+    name: Local tests and repeatable E2E
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run unit and component tests
+        run: python tests/run_unittest_suite.py
+
+      - name: Run repeatable E2E matrix
+        run: python tests/matrix_e2e_runner.py --repetitions 3 --output artifacts/e2e-report.json
+
+      - name: Run process-restart recovery probe
+        run: python tests/process_restart_probe.py
+
+      - name: Enforce privacy-safe quality gate
+        run: >-
+          python tests/run_quality_gate.py
+          --report artifacts/e2e-report.json
+          --require-full-matrix
+          --repetitions 3
+
+      - name: Compile Python sources
+        run: python -m compileall -q .
+
+      - name: Check whitespace
+        shell: bash
+        run: git diff --check
+
+      - name: Upload normalized report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskorb-e2e-report
+          path: artifacts/e2e-report.json
+          if-no-files-found: ignore
+
+  provider-capability-matrix:
+    name: Configured provider capability matrix
+    if: github.event_name == 'workflow_dispatch' && inputs.run_provider_capability_matrix == true
+    runs-on: windows-latest
+    # The release acceptance criterion is a 20-run matrix per configured
+    # provider, not a one-shot connectivity check. Keep this job opt-in so
+    # normal PR validation does not spend the provider quota.
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      OPENAI_API_KEY: ${{ secrets.DESKORB_OPENAI_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DESKORB_DEEPSEEK_API_KEY }}
+      QWEN_API_KEY: ${{ secrets.DESKORB_QWEN_API_KEY }}
+      DASHSCOPE_API_KEY: ${{ secrets.DESKORB_DASHSCOPE_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.DESKORB_OPENAI_BASE_URL }}
+      DESKORB_AGENT_API_MODEL: ${{ secrets.DESKORB_AGENT_API_MODEL }}
+      DESKORB_AGENT_MODEL_FALLBACKS: ${{ secrets.DESKORB_AGENT_MODEL_FALLBACKS }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run required provider tool matrix
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          python tests/provider_capability_probe.py --repetitions 20 --delay-seconds 1 `
+            --history-path artifacts/provider-health.sqlite3 `
+            --require-provider deepseek --require-provider qwen `
+            2>&1 | Tee-Object artifacts/provider-capability.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload provider capability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskorb-provider-capability
+          path: |
+            artifacts/provider-capability.json
+            artifacts/provider-health.sqlite3
+          if-no-files-found: ignore
+
+  browser-agent-matrix:
+    name: Real browser-agent verification matrix
+    if: github.event_name == 'workflow_dispatch' && inputs.run_browser_agent_matrix == true
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      OPENAI_API_KEY: ${{ secrets.DESKORB_OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.DESKORB_OPENAI_BASE_URL }}
+      DESKORB_AGENT_API_MODEL: ${{ secrets.DESKORB_AGENT_API_MODEL }}
+      DESKORB_AGENT_PROVIDER: ${{ secrets.DESKORB_AGENT_PROVIDER }}
+      DESKORB_AGENT_BROWSER_BACKEND: isolated-playwright
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: Install pinned Playwright MCP
+        shell: cmd
+        run: setup-playwright-mcp.cmd
+
+      - name: Run fresh-runtime browser matrix
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          python tests/e2e_local_browser_probe.py --repetitions 20 2>&1 | Tee-Object artifacts/browser-agent-matrix.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload browser matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskorb-browser-agent-matrix
+          path: artifacts/browser-agent-matrix.json
+          if-no-files-found: ignore
+
+  public-browser-acceptance:
+    name: Public read-only browser acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_public_browser_acceptance == true
+    runs-on: [self-hosted, windows, deskorb-desktop]
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      OPENAI_API_KEY: ${{ secrets.DESKORB_OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ secrets.DESKORB_OPENAI_BASE_URL }}
+      DESKORB_AGENT_API_MODEL: ${{ secrets.DESKORB_AGENT_API_MODEL }}
+      DESKORB_AGENT_PROVIDER: ${{ secrets.DESKORB_AGENT_PROVIDER }}
+      DESKORB_AGENT_BROWSER_BACKEND: isolated-playwright
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+
+      - name: Install pinned Playwright MCP
+        shell: cmd
+        run: setup-playwright-mcp.cmd
+
+      - name: Check isolated Playwright readiness
+        run: python tests/mcp_readiness_probe.py
+
+      - name: Run public read-only scenarios
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          python tests/e2e_public_browser_probe.py --live --no-human-resume --scenario taobao-search,bing-fastapi --repetitions 1 --output artifacts/public-browser-acceptance.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate privacy-safe acceptance report
+        if: always()
+        run: >-
+          python tests/run_quality_gate.py
+          --report artifacts/public-browser-acceptance.json
+          --validate-report-only
+
+      - name: Upload sanitized acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskorb-public-browser-acceptance
+          path: artifacts/public-browser-acceptance.json
+          if-no-files-found: ignore
+
+  desktop-readiness:
+    name: Windows UIA and desktop readiness (advisory)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 8
+    continue-on-error: true
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install desktop dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run privacy-safe UIA probe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          python tests/desktop_uia_probe.py 2>&1 | Tee-Object artifacts/desktop-uia-probe.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run isolated desktop input E2E probe
+        shell: pwsh
+        run: |
+          python tests/e2e_desktop_local_probe.py 2>&1 | Tee-Object artifacts/desktop-e2e-probe.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run isolated Notepad application probe
+        shell: pwsh
+        run: |
+          python tests/e2e_notepad_app_probe.py 2>&1 | Tee-Object artifacts/notepad-e2e-probe.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run isolated File Explorer application probe
+        shell: pwsh
+        run: |
+          python tests/e2e_explorer_app_probe.py 2>&1 | Tee-Object artifacts/explorer-e2e-probe.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run read-only QQ profile probe
+        shell: pwsh
+        run: |
+          python tests/e2e_qq_app_probe.py 2>&1 | Tee-Object artifacts/qq-uia-probe.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload UIA probe
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskorb-desktop-readiness
+          path: |
+            artifacts/desktop-uia-probe.json
+            artifacts/desktop-e2e-probe.json
+            artifacts/notepad-e2e-probe.json
+            artifacts/explorer-e2e-probe.json
+            artifacts/qq-uia-probe.json
+          if-no-files-found: ignore
+
+  desktop-vm-hard-gate:
+    name: Interactive Windows VM hard gate
+    if: github.event_name == 'workflow_dispatch' && inputs.run_desktop_vm_hard_gate == true
+    runs-on: [self-hosted, windows, deskorb-desktop]
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Verify interactive desktop preflight
+        run: python tests/desktop_vm_preflight.py
+
+      - name: Verify connected authenticated browser readiness
+        run: python tests/connected_browser_readiness_probe.py --require-connected --require-authenticated
+
+      - name: Run full unit and component tests
+        run: python tests/run_unittest_suite.py
+
+      - name: Run process-restart hard gate
+        run: python tests/process_restart_probe.py
+
+      - name: Run real interactive desktop hard gate
+        shell: pwsh
+        run: |
+          python tests/desktop_input_probe.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/desktop_window_probe.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/desktop_uia_probe.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/e2e_desktop_local_probe.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/e2e_notepad_app_probe.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/e2e_explorer_app_probe.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tests/e2e_qq_app_probe.py --require-running
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

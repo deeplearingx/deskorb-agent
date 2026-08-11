@@ -32,6 +32,38 @@
           "\u5de5\u4f5c\u7c3f"
         ]
       }
+    },
+    "documents": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["document_mcp.py"],
+      "cwd": ".",
+      "env": {
+        "DESKORB_AGENT_DOCUMENT_ROOTS": "."
+      },
+      "deskorb": {
+        "capability": "documents",
+        "keywords": ["文档", "PDF", "Word", "Excel", "PPT", "document", "pdf"],
+        "description": "Read one explicitly scoped local document as bounded evidence.",
+        "allowed_tools": ["document_status", "document_inspect", "document_convert_file"],
+        "read_only_tools": ["document_status", "document_inspect", "document_convert_file"],
+        "allowed_roots": ["."]
+      }
+    },
+    "public_fetch": {
+      "command": ".venv\\Scripts\\python.exe",
+      "args": ["public_fetch_mcp.py"],
+      "cwd": ".",
+      "env": {
+        "DESKORB_AGENT_PUBLIC_ALLOWED_DOMAINS": "bing.com,fastapi.tiangolo.com,taobao.com,tmall.com"
+      },
+      "deskorb": {
+        "capability": "public_fetch",
+        "keywords": ["公开网页", "公网只读", "Fetch", "public web", "research"],
+        "description": "Fetch one allowlisted public HTTPS page as untrusted read-only text.",
+        "allowed_tools": ["public_fetch_status", "public_fetch"],
+        "read_only_tools": ["public_fetch_status", "public_fetch"],
+        "allowed_domains": ["bing.com", "fastapi.tiangolo.com", "taobao.com", "tmall.com"]
+      }
     }
   }
 }

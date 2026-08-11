@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 .worktrees/
+.claude/
 .pytest_cache/
 .env
 *.env
@@ -35,6 +36,11 @@ app-server-schema/
 claude_overlay_shots/
 deskorb_agent_shots/
 .playwright-mcp/
+.deskorb-agent/
+.deskorb-playwright-*/
+.mcp-probe-*/
+mcp-profile-*/
+artifacts/
 
 # OfficeCLI self-contained release output (package separately)
 /tools/officecli/

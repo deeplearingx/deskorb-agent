@@ -1,0 +1,2 @@
+# Intentionally incomplete fixture: app.py imports python-dotenv.
+requests==2.32.3

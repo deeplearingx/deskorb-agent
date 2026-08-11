@@ -13,6 +13,8 @@ Run:   pythonw deskorb_agent.py     (no console)
        python  deskorb_agent.py     (console, for debugging)
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import ctypes

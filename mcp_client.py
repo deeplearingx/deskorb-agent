@@ -19,6 +19,45 @@ from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
 
+from mcp_security import URLPolicyError, validate_local_path, validate_public_url
+
+
+PLAYWRIGHT_MCP_BROWSER = "chromium"
+
+
+def default_playwright_paths() -> dict[str, Path]:
+    """Return paths for the pinned local Playwright MCP installation."""
+    root = Path(__file__).resolve().parent / ".playwright-mcp"
+    return {
+        "root": root,
+        "cli": root / "cli.js",
+        "dependencies": root / "node_modules" / "playwright-core" / "package.json",
+        "browsers": root / "ms-playwright",
+    }
+
+
+def local_playwright_diagnostics() -> list[str]:
+    """Return stable installation diagnostics without starting a process."""
+    paths = default_playwright_paths()
+    diagnostics: list[str] = []
+    if shutil.which("node") is None:
+        diagnostics.append("node_not_found")
+    if not paths["cli"].is_file():
+        diagnostics.append("playwright_cli_missing")
+    if not paths["dependencies"].is_file():
+        diagnostics.append("playwright_dependencies_missing")
+    browsers = paths["browsers"]
+    try:
+        has_browser = browsers.is_dir() and any(
+            child.is_dir() and child.name.casefold().startswith("chromium-")
+            for child in browsers.iterdir()
+        )
+    except OSError:
+        has_browser = False
+    if not has_browser:
+        diagnostics.append("chromium_browser_missing")
+    return diagnostics
+
 
 class MCPError(RuntimeError):
     """A user-facing error from a local MCP process."""
@@ -33,6 +72,15 @@ class MCPServerSpec:
     cwd: str | None = None
     intent_keywords: tuple[str, ...] = ()
     description: str = ""
+    allowed_tools: tuple[str, ...] = ()
+    allowed_domains: tuple[str, ...] = ()
+    allow_safe_tools: bool = False
+    capability: str = ""
+    read_only_tools: tuple[str, ...] = ()
+    action_tools: tuple[str, ...] = ()
+    allowed_roots: tuple[str, ...] = ()
+    max_input_bytes: int = 256 * 1024
+    max_output_bytes: int = 64 * 1024
 
 
 def resolve_officecli_binary(explicit: str | Path | None = None) -> str | None:
@@ -84,8 +132,18 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
         console_python = interpreter
     result: list[MCPServerSpec] = []
     if enable_playwright:
-        result.append(MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest"), {}, None))
-    result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root)))
+        local = default_playwright_paths()
+        if not local_playwright_diagnostics():
+            result.append(MCPServerSpec(
+                "playwright", "node", (str(local["cli"]), "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated"),
+                {"PLAYWRIGHT_BROWSERS_PATH": str(local["browsers"])}, str(root),
+                allow_safe_tools=True,
+            ))
+        else:
+            result.append(MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest"), {}, None,
+                                        allow_safe_tools=True))
+    result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root),
+                                allow_safe_tools=True))
     if enable_officecli:
         binary = resolve_officecli_binary(officecli_binary)
         if binary:
@@ -112,6 +170,7 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                     "文档生成", "演示文稿", "工作簿",
                 ),
                 description="Create, read, modify, validate, and render Office files.",
+                allow_safe_tools=True,
             ))
     return result
 
@@ -150,8 +209,41 @@ def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
         raise MCPError(f"MCP server {name!r} deskorb.keywords must be an array of strings.")
     keywords = tuple(item.strip() for item in raw_keywords if item.strip())
     description = str(metadata.get("description") or "").strip()
-    return MCPServerSpec(name.strip(), command, tuple(str(item) for item in raw_args),
-                         {key: str(item) for key, item in raw_env.items()}, cwd, keywords, description)
+    def _metadata_list(key: str) -> tuple[str, ...]:
+        raw = metadata.get(key, [])
+        if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            raise MCPError(f"MCP server {name!r} deskorb.{key} must be an array of strings.")
+        return tuple(item.strip().lower() for item in raw if item.strip())
+
+    allowed_tools = _metadata_list("allowed_tools")
+    allowed_domains = _metadata_list("allowed_domains")
+    read_only_tools = _metadata_list("read_only_tools")
+    action_tools = _metadata_list("action_tools")
+    if set(read_only_tools).intersection(action_tools):
+        raise MCPError(f"MCP server {name!r} classifies a tool as both read-only and action.")
+    raw_roots = metadata.get("allowed_roots", [])
+    if not isinstance(raw_roots, list) or not all(isinstance(item, str) for item in raw_roots):
+        raise MCPError(f"MCP server {name!r} deskorb.allowed_roots must be an array of strings.")
+    try:
+        max_input_bytes = max(1, min(4 * 1024 * 1024, int(metadata.get("max_input_bytes", 256 * 1024))))
+        max_output_bytes = max(1, min(4 * 1024 * 1024, int(metadata.get("max_output_bytes", 64 * 1024))))
+    except (TypeError, ValueError) as exc:
+        raise MCPError(f"MCP server {name!r} deskorb size limits must be integers.") from exc
+    # A custom server with no explicit tool policy retains the historical
+    # trusted-local behavior. Once any allowlist/classification is declared,
+    # unknown tools fail closed on discovery.
+    explicit_policy = bool(allowed_tools or read_only_tools or action_tools)
+    roots = tuple(str((base / item).resolve(strict=False) if not Path(item).is_absolute()
+                      else Path(item).expanduser().resolve(strict=False))
+                  for item in raw_roots if item.strip())
+    return MCPServerSpec(
+        name.strip(), command, tuple(str(item) for item in raw_args),
+        {key: str(item) for key, item in raw_env.items()}, cwd, keywords, description,
+        allowed_tools=allowed_tools, allowed_domains=allowed_domains,
+        allow_safe_tools=not explicit_policy, capability=str(metadata.get("capability") or "").strip().lower(),
+        read_only_tools=read_only_tools, action_tools=action_tools, allowed_roots=roots,
+        max_input_bytes=max_input_bytes, max_output_bytes=max_output_bytes,
+    )
 
 
 class StdioMCPClient:
@@ -272,8 +364,10 @@ class MCPToolBridge:
 
     READ_ONLY_WORDS = ("snapshot", "screenshot", "console", "network", "find", "inspect", "list", "get",
                        "status", "schema", "test", "export", "version")
-    BLOCKED_WORDS = ("unsafe",)
-    HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore")
+    BLOCKED_WORDS = ("unsafe", "run_code", "evaluate", "javascript", "shell",
+                     "terminal", "command", "execute", "file_write", "filesystem", "download")
+    HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore", "submit",
+                       "send", "purchase", "delete", "permission", "login")
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
                  enable_officecli: bool = True, officecli_binary: str | Path | None = None,
@@ -318,6 +412,9 @@ class MCPToolBridge:
             if server not in selected:
                 continue
             parameters = _json_schema_object(schema)
+            # OfficeCLI mutations are classified from their command verb and
+            # handled by the dedicated runtime policy; do not make the model
+            # manufacture generic browser risk fields for that tool.
             if action and server != "officecli":
                 properties = dict(parameters.get("properties") or {})
                 properties["_deskorb_risk_level"] = {"type": "string", "enum": ["normal", "high"]}
@@ -330,6 +427,24 @@ class MCPToolBridge:
                             "parameters": parameters})
         return schemas
 
+    def schemas_for_task(self, server_names: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Return the bounded subset suitable for a browser task prompt."""
+        selected = set(server_names or self.clients)
+        schemas = self.schemas(selected)
+        allowed = {
+            "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+            "browser_fill_form", "browser_press_key", "browser_select_option",
+            "browser_wait_for", "browser_tabs",
+        }
+        result: list[dict[str, Any]] = []
+        for schema in schemas:
+            exposed = str(schema.get("name") or "")
+            item = self._tools.get(exposed)
+            if item and item[0] == "playwright" and item[1] not in allowed:
+                continue
+            result.append(schema)
+        return result
+
     def server_catalog(self) -> list[dict[str, Any]]:
         """Safe, process-free capability hints for intent routing.
 
@@ -337,11 +452,17 @@ class MCPToolBridge:
         are deliberately excluded.  Only user-provided intent metadata is
         shown to the model before a server is selected.
         """
-        return [
-            {"name": spec.name, "description": spec.description[:240],
-             "keywords": list(spec.intent_keywords[:64])}
-            for spec in self.specs
-        ]
+        catalog: list[dict[str, Any]] = []
+        for spec in self.specs:
+            item: dict[str, Any] = {
+                "name": spec.name,
+                "description": spec.description[:240],
+                "keywords": list(spec.intent_keywords[:64]),
+            }
+            if spec.capability:
+                item["capability"] = spec.capability
+            catalog.append(item)
+        return catalog
 
     def owns(self, name: str) -> bool:
         return name in self._tools
@@ -379,6 +500,17 @@ class MCPToolBridge:
         clean = {key: value for key, value in arguments.items() if not key.startswith("_deskorb_")}
         if server == "officecli" and "command" in clean:
             clean["command"] = _normalize_officecli_command(clean["command"])
+        spec = self._spec_for_server(server)
+        if spec is None or not self._tool_allowed(spec, original):
+            return {"ok": False, "error": "MCP tool is not permitted by the local capability policy."}
+        try:
+            encoded = json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "MCP arguments are not JSON serializable."}
+        if len(encoded) > spec.max_input_bytes:
+            return {"ok": False, "error": "MCP arguments exceed the server input limit."}
+        if self._blocked_url(spec, clean) or self._blocked_path(spec, clean):
+            return {"ok": False, "error": "MCP arguments violate the local capability boundary."}
         try:
             result = self.clients[server].call_tool(original, clean)
         except MCPError as exc:
@@ -388,7 +520,7 @@ class MCPToolBridge:
             return {"ok": False, "error": message}
         content = result.get("content", result)
         rendered = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
-        cap = 64 * 1024
+        cap = spec.max_output_bytes
         if server == "officecli" and result.get("isError"):
             return {"ok": False, "server": server, "tool": original,
                     "content": content if len(rendered) <= cap else rendered[:cap],
@@ -408,6 +540,24 @@ class MCPToolBridge:
         requested = {str(name).strip() for name in server_names if str(name).strip()}
         return set(self.clients).intersection(requested)
 
+    def _spec_for_server(self, server: str) -> MCPServerSpec | None:
+        """Return the policy for a configured or explicitly injected client.
+
+        The normal path creates every client from ``self.specs``.  Tests and
+        embedders may replace an entry in ``clients`` with an in-process MCP
+        adapter, so there is no command-line policy to parse for that entry.
+        Keep that compatibility path local to the already-injected client and
+        retain the tool-name deny list; stdio clients never use this fallback.
+        """
+        spec = next((candidate for candidate in self.specs if candidate.name == server), None)
+        if spec is not None:
+            return spec
+        if (server in {"playwright", "powertoys", "officecli"}
+                and server in self.clients
+                and not isinstance(self.clients[server], StdioMCPClient)):
+            return MCPServerSpec(name=server, command="", args=(), env={}, allow_safe_tools=True)
+        return None
+
     def _discover(self, servers: Iterable[str]) -> None:
         for server in servers:
             if server in self._discovered_servers:
@@ -422,17 +572,81 @@ class MCPToolBridge:
             try:
                 for tool in client.list_tools():
                     original = str(tool["name"])
-                    if any(word in original.lower() for word in self.BLOCKED_WORDS):
+                    spec = self._spec_for_server(server)
+                    if spec is None or not self._tool_allowed(spec, original):
                         continue
                     exposed = _exposed_tool_name(server, original, self._tools)
                     self._tools[exposed] = (server, original, dict(tool.get("inputSchema") or {}),
-                                            self._is_action(original))
+                                            self._is_action(spec, original, tool))
             except MCPError as exc:
                 self.diagnostics.append(str(exc))
 
-    def _is_action(self, tool_name: str) -> bool:
+    def _is_action(self, spec: MCPServerSpec, tool_name: str,
+                   tool: dict[str, Any] | None = None) -> bool:
         lowered = tool_name.lower()
+        if lowered in set(spec.read_only_tools):
+            return False
+        if lowered in set(spec.action_tools):
+            return True
+        annotations = tool.get("annotations") if isinstance(tool, dict) else None
+        if isinstance(annotations, dict):
+            if annotations.get("readOnlyHint") is True:
+                return False
+            if annotations.get("destructiveHint") is True:
+                return True
         return not any(word in lowered for word in self.READ_ONLY_WORDS)
+
+    def _tool_allowed(self, spec: MCPServerSpec, tool_name: str) -> bool:
+        lowered = str(tool_name).lower()
+        if any(word in lowered for word in self.BLOCKED_WORDS):
+            return False
+        if spec.allow_safe_tools:
+            return True
+        return lowered in (set(spec.allowed_tools) | set(spec.read_only_tools) | set(spec.action_tools))
+
+    @staticmethod
+    def _blocked_url(spec: MCPServerSpec, arguments: dict[str, Any]) -> bool:
+        if not spec.allowed_domains:
+            return False
+
+        def values(value: Any) -> Iterable[str]:
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, dict):
+                for child in value.values():
+                    yield from values(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    yield from values(child)
+
+        for value in values(arguments):
+            if not value.lower().startswith(("http://", "https://")):
+                continue
+            try:
+                validate_public_url(value, spec.allowed_domains)
+            except URLPolicyError:
+                return True
+        return False
+
+    @staticmethod
+    def _blocked_path(spec: MCPServerSpec, arguments: dict[str, Any]) -> bool:
+        if not spec.allowed_roots:
+            return False
+        path_keys = frozenset({"path", "file", "file_path", "input_path", "document_path", "root"})
+
+        def visit(value: Any, key: str = "") -> bool:
+            if isinstance(value, dict):
+                return any(visit(child, str(child_key).lower()) for child_key, child in value.items())
+            if isinstance(value, (list, tuple)):
+                return any(visit(child, key) for child in value)
+            if key in path_keys and isinstance(value, str):
+                try:
+                    validate_local_path(value, spec.allowed_roots)
+                except (OSError, ValueError):
+                    return True
+            return False
+
+        return visit(arguments)
 
     def is_high_risk(self, name: str, arguments: dict[str, Any] | None = None) -> bool:
         item = self._tools.get(name)

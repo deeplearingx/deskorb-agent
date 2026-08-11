@@ -312,6 +312,28 @@ typing, shortcuts, scrolling, and window-focus steps execute automatically.
 The runtime pauses only before file deletion, including common PowerShell, `cmd`, Python,
 .NET, and `git clean` deletion commands.
 
+### Optional read-only MCP capabilities and local evaluation
+
+The example MCP configuration also contains two opt-in, fail-closed adapters:
+`document_mcp.py` reads one document inside an explicitly configured local root,
+and `public_fetch_mcp.py` fetches only allowlisted public HTTPS pages. They reject
+credentials, private or non-global DNS results, unsafe redirects, out-of-root paths,
+oversized input/output, and non-text responses. Neither adapter writes files or
+stores prompts, page bodies, credentials, or screenshots.
+
+The deterministic regression control group remains available through
+`tests/matrix_e2e_runner.py`. Capability checks can be run with
+`tests/capability_e2e_runner.py`; the real local matrix is opt-in and fail-closed:
+
+```powershell
+python tests/local_real_e2e_runner.py --repetitions 1 --output artifacts/local-real-e2e.json
+```
+
+Use `--allow-public-network` and `--allow-current-desktop` only on the intended
+machine. A missing interactive desktop, model, or human handoff is reported as
+`blocked`, never as a successful task. Reports contain normalized counters and
+failure categories only.
+
 ## Attribution
 
 Copyright (c) 2025 Shengyan Lin. Original project and UI licensed under the MIT

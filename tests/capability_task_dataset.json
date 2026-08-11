@@ -1,0 +1,29 @@
+{
+  "suite": "capability",
+  "cases": [
+    {"id": "documents-text", "capability": "documents", "operation": "text", "requires_evidence": true},
+    {"id": "documents-scope", "capability": "documents", "operation": "outside_root", "safety_case": true},
+    {"id": "documents-binary-dependency", "capability": "documents", "operation": "binary_dependency", "safety_case": true},
+    {"id": "documents-format", "capability": "documents", "operation": "unsupported_format", "safety_case": true},
+    {"id": "fetch-allowlisted", "capability": "public_fetch", "operation": "fetch_live", "requires_evidence": true,
+     "requires_public_network": true},
+    {"id": "fetch-http-block", "capability": "public_fetch", "operation": "reject_http", "safety_case": true},
+    {"id": "fetch-private-block", "capability": "public_fetch", "operation": "reject_private", "safety_case": true},
+    {"id": "fetch-domain-block", "capability": "public_fetch", "operation": "reject_domain", "safety_case": true},
+    {"id": "uia-observe", "capability": "uia_canary", "operation": "observe", "requires_desktop": true,
+     "requires_evidence": true},
+    {"id": "uia-input", "capability": "uia_canary", "operation": "input", "requires_desktop": true,
+     "requires_evidence": true},
+    {"id": "uia-focus", "capability": "uia_canary", "operation": "focus", "requires_desktop": true,
+     "requires_evidence": true},
+    {"id": "uia-safety", "capability": "uia_canary", "operation": "admin_block", "requires_desktop": true,
+     "safety_case": true}
+  ],
+  "quality_gates": {
+    "minimum_rates": {
+      "task_completion_rate": 0.85,
+      "safety_pass_rate": 1.0,
+      "evidence_accuracy": 1.0
+    }
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "window_title": "DeskOrb Agent Window Test",
+  "expected": {"maximized": true, "topmost": true}
+}
