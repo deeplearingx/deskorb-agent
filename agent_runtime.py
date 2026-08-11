@@ -490,10 +490,14 @@ class AgentRuntime:
     def run_office_context_turn(self, question: str, office_prompt: str | None = None,
                                 event_token: int | None = None):
         """Answer a persistent Office follow-up without storing Office text in context."""
+        prompt = office_prompt if office_prompt is not None else question
+        if not str(prompt or "").strip():
+            self._block_empty_input()
+            return
         try:
             self._office_event_token = event_token
             return self._run_turn(
-                office_prompt if office_prompt is not None else question,
+                prompt,
                 [], ephemeral=True, allow_tools=False,
             )
         except BaseException as exc:
@@ -535,6 +539,15 @@ class AgentRuntime:
         self.ui.put(("task_progress", progress))
         self._task_state = None
         return progress
+
+    def _publish_tool_result(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        """Publish bounded tool telemetry without arguments or free-form output."""
+        self.ui.put(("tool_result", {
+            "tool": str(name),
+            "ok": bool(isinstance(result, dict) and result.get("ok")),
+            "verified": bool(isinstance(result, dict) and result.get("verified")),
+            "high_risk": bool(self._high_risk_call(name, arguments)),
+        }))
 
     def _block_empty_input(self) -> None:
         state = RuntimeTaskState.start(self.task_journal, "Desktop task", requires_action=False)
@@ -619,6 +632,7 @@ class AgentRuntime:
             call, transcript, original_text = self._pending_execution
             self._pending_execution = None
             self._ensure_task_state(original_text)
+            arguments: dict[str, Any] = {}
             if self._is_task_scoped(call.name):
                 self._task_authorized_until = time.monotonic() + self.TASK_AUTHORIZATION_SECONDS
                 self.ui.put(("system", "✓ Task authorized. Normal steps will continue without further confirmation."))
@@ -630,6 +644,7 @@ class AgentRuntime:
             except (json.JSONDecodeError, ValueError) as exc:
                 result = {"ok": False, "error": f"Invalid confirmed function call: {exc}"}
             self._task_state.record_tool_result(call.name, result)
+            self._publish_tool_result(call.name, arguments if isinstance(arguments, dict) else {}, result)
             transcript.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
             transcript = self._append_desktop_observation(transcript, call.name)
         return self._run_task_loop(api_key, transcript, original_text, ephemeral)
@@ -687,6 +702,7 @@ class AgentRuntime:
                 return
             outputs = []
             for call in calls:
+                arguments: dict[str, Any] = {}
                 try:
                     arguments = json.loads(call.arguments)
                     if not isinstance(arguments, dict):
@@ -720,6 +736,7 @@ class AgentRuntime:
                     result = {"ok": False, "error": f"Invalid function call: {exc}"}
                 if not ephemeral and self._task_state is not None:
                     self._task_state.record_tool_result(call.name, result)
+                    self._publish_tool_result(call.name, arguments, result)
                 outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
                 captcha_marker = self._captcha_marker(call.name, result)
                 if captcha_marker:
@@ -807,6 +824,8 @@ class AgentRuntime:
         if name == "shell_run":
             return self._shell_deletes_file(arguments.get("command"))
         if name == "filesystem_delete":
+            return True
+        if name == "window_control" and str(arguments.get("action") or "").lower() == "close":
             return True
         if self.mcp and self.mcp.owns(name):
             server_name = getattr(self.mcp, "server_name", lambda _name: None)(name)

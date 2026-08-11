@@ -176,7 +176,7 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertFalse(runtime._high_risk_call("desktop_type", {"risk_level": "normal"}))
         self.assertTrue(runtime._high_risk_call("desktop_type", {"risk_level": "high"}))
         self.assertFalse(runtime._high_risk_call("desktop_clipboard_read_text", {}))
-        self.assertFalse(runtime._high_risk_call("window_control", {"action": "close"}))
+        self.assertTrue(runtime._high_risk_call("window_control", {"action": "close"}))
         runtime._task_authorized_until = __import__("time").monotonic() + 10
         self.assertTrue(runtime._task_authorized())
         runtime.set_permission_mode("plan")
@@ -212,6 +212,9 @@ class ReadOnlyToolsTests(unittest.TestCase):
         approvals = [payload for kind, payload in event_list if kind == "approval"]
         self.assertEqual(len(approvals), 1)
         self.assertIn("Delete file command: Remove-Item report.docx", approvals[0])
+        self.assertFalse(any(kind == "tool_result" and isinstance(payload, dict)
+                             and payload.get("ok") and payload.get("high_risk")
+                             for kind, payload in event_list))
 
     def test_officecli_reads_are_observations_and_mutations_are_automatic(self):
         class OfficeClient:

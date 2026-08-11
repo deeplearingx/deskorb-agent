@@ -22,6 +22,12 @@
 ## 当前权威执行清单（2026-08-11）
 
 - [x] Slice 1：接入生产运行时任务协议与结构化终态。
-- [ ] Slice 2：移除本机真实 runner 对旧私有 API 的依赖（当前进行中）。
+- [x] Slice 2：移除本机真实 runner 对旧私有 API 的依赖；统一读取 `tool_result` 脱敏事件，并校验桌面目标窗口绑定。
 - [ ] Slice 3：统一控制组指标、失败分类和质量门禁。
 - [ ] Slice 4：完成预检后执行真实桌面、公网只读和 60 × 3 验收。
+
+## 最新回归（2026-08-11）
+
+- `394 passed, 50 subtests passed`。
+- 确定性矩阵 `57 passed, 3 skipped, 0 failed`；live/consent 场景未计入成功。
+- 空输入、Office 空上下文、malformed function arguments、危险动作阻断/执行判定均有回归覆盖。

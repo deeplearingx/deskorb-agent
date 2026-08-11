@@ -110,4 +110,12 @@
 
 - [x] Slice 1：生产运行时任务协议、结构化终态、空输入 fail closed。
 - [x] Slice 2a：浏览器断连有界恢复和当前桌面目标窗口隔离。
-- [ ] Slice 2b：本机真实 runner 完全移除旧私有 API 依赖。
+- [x] Slice 2b：本机真实 runner 完全移除旧私有 API 依赖；改用运行时公开任务事件和脱敏 `tool_result`，桌面目标窗口绑定失败时 fail-closed。
+
+### 最新验证（2026-08-11）
+
+- 全量 pytest：`394 passed, 50 subtests passed`。
+- 相关运行时/指标/桌面/浏览器回归：`55 passed, 14 subtests passed`；浏览器探针：`37 passed`。
+- 确定性 60 条控制矩阵：`57 passed, 3 skipped, 0 failed`；skipped 为 live/consent 场景，未被伪报成功。
+- 已补充空 Office 上下文、malformed function arguments、已执行危险动作与仅计划危险动作的回归覆盖。
+- 下一步仅在真实会话预检和显式授权满足后运行本机真实桌面、公网只读 smoke，再运行正式 `60 × 3`；环境不满足时保留 `blocked`/具体失败分类。

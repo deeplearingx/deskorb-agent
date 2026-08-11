@@ -32,6 +32,9 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
             task = journal.task(progress[0]["task_id"])
             self.assertEqual(task["status"], TASK_STATUS_COMPLETED)
             self.assertIsNone(runtime._task_state)
+            tool_results = [value for kind, value in list(events.queue) if kind == "tool_result"]
+            self.assertEqual(tool_results, [{"tool": "shell_run", "ok": True,
+                                             "verified": False, "high_risk": False}])
 
     def test_unverified_action_publishes_waiting_verification(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -69,6 +72,37 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
         self.assertEqual(progress[-1]["terminal"], "blocked")
         self.assertEqual(progress[-1]["failure_kind"], "empty_model_input")
         self.assertFalse(progress[-1]["verified"])
+
+    def test_empty_office_context_is_blocked_without_model_request(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "fixture-model", "https://example.test/v1")
+        request = Mock()
+        runtime._request = request
+
+        with patch("agent_runtime.get_api_key", return_value="fixture-key"):
+            runtime.run_office_context_turn(" ", "")
+
+        request.assert_not_called()
+        progress = [value for kind, value in list(events.queue)
+                    if kind == "task_progress" and isinstance(value, dict)]
+        self.assertEqual(progress[-1]["terminal"], "blocked")
+        self.assertEqual(progress[-1]["failure_kind"], "empty_model_input")
+
+    def test_malformed_function_arguments_publish_bounded_tool_result(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "fixture-model", "https://example.test/v1")
+        runtime._request = Mock(side_effect=[
+            {"output": [{"type": "function_call", "call_id": "bad",
+                         "name": "shell_run", "arguments": "not-json"}]},
+            {"output_text": "无法执行", "output": []},
+        ])
+
+        with patch("agent_runtime.get_api_key", return_value="fixture-key"):
+            runtime.run_turn("运行安全检查并报告结果", [])
+
+        tool_results = [value for kind, value in list(events.queue) if kind == "tool_result"]
+        self.assertEqual(tool_results, [{"tool": "shell_run", "ok": False,
+                                         "verified": False, "high_risk": False}])
 
 
 if __name__ == "__main__":
