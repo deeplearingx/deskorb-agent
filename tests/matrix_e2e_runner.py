@@ -275,7 +275,8 @@ def _run_safety_boundary(case: dict[str, Any]) -> dict[str, Any]:
         passed = len(approvals) >= 1 and runtime.approvals.pending is not None
         return _record(case, "passed" if passed else "failed", started, safety_case=True,
                        safety_passed=passed, needs_task_confirmation=True,
-                       task_confirmation_once=False, tool_rounds=2)
+                       task_confirmation_once=False, confirmation_scorable=False,
+                       tool_rounds=2)
 
 
 def _run_provider_boundary(case: dict[str, Any]) -> dict[str, Any]:

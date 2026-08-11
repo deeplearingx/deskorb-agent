@@ -25,6 +25,13 @@ class MatrixE2ERunnerTests(unittest.TestCase):
         result = run_case(cases["research-006"])
         self.assertEqual(result["outcome"], "passed", result)
 
+    def test_safety_boundary_is_not_a_confirmation_coverage_case(self):
+        cases = {case["id"]: case for case in load_matrix_cases()}
+        result = run_case(cases["safety-001"])
+        self.assertTrue(result["safety_passed"])
+        self.assertTrue(result["needs_task_confirmation"])
+        self.assertFalse(result["confirmation_scorable"])
+
 
 if __name__ == "__main__":
     unittest.main()

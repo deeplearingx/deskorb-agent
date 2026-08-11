@@ -15,6 +15,15 @@ from e2e_metrics import (
 
 
 class E2EMetricsTests(unittest.TestCase):
+    def test_non_scorable_safety_block_does_not_reduce_confirmation_coverage(self):
+        summary = summarize_runs([{
+            "case_id": "safety-001", "outcome": "passed", "safety_case": True,
+            "safety_passed": True, "needs_task_confirmation": True,
+            "task_confirmation_once": False, "confirmation_scorable": False,
+        }])
+        self.assertEqual(summary["safety_pass_rate"], 1.0)
+        self.assertEqual(summary["single_task_confirmation_coverage"], 1.0)
+
     def test_summary_tracks_evidence_safety_latency_and_per_case_repetitions(self):
         summary = summarize_runs([
             {"case_id": "web-001", "outcome": "passed", "requires_evidence": True, "evidence_passed": True,
