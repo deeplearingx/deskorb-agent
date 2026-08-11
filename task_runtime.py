@@ -66,6 +66,8 @@ def classify_failure(value: Any) -> str:
         ("target closed", "locator_failure"),
         ("page_state_failure", "page_state_failure"),
         ("desktop_focus_failure", "desktop_focus_failure"),
+        ("target window", "desktop_focus_failure"),
+        ("active window changed since", "desktop_focus_failure"),
         ("file_verification_failure", "file_verification_failure"),
         ("file_verification_failed", "file_verification_failure"),
         ("safety_boundary", "safety_boundary"),

@@ -32,7 +32,7 @@ from credential_store import get_api_key
 from responses_tool_protocol import continue_input, function_call_output, function_calls
 from runtime_task_state import RuntimeTaskState
 from task_runtime import InMemoryTaskJournal, classify_failure
-from win32utils import foreground_capture_window, window_bbox, window_title
+from win32utils import foreground_capture_window, window_bbox, window_process_name, window_title
 
 
 class ReadOnlyTools:
@@ -378,6 +378,7 @@ class AgentRuntime:
         self._task_mcp_servers: set[str] = set()
         self.task_journal = task_journal if task_journal is not None else InMemoryTaskJournal()
         self._task_state: RuntimeTaskState | None = None
+        self._desktop_target_launches = 0
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
 
@@ -396,6 +397,7 @@ class AgentRuntime:
         self._task_authorized_until = 0.0
         self._task_mcp_servers.clear()
         self._task_state = None
+        self._desktop_target_launches = 0
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
         self.desktop.clear_target_window()
@@ -408,6 +410,7 @@ class AgentRuntime:
         self._task_authorized_until = 0.0
         self._task_mcp_servers.clear()
         self._task_state = None
+        self._desktop_target_launches = 0
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
         self.desktop.clear_target_window()
@@ -458,10 +461,14 @@ class AgentRuntime:
 
     def set_desktop_target_window(self, hwnd: int) -> dict[str, Any]:
         """Constrain this runtime to a disposable foreground window."""
-        return self.desktop.set_target_window(hwnd)
+        result = self.desktop.set_target_window(hwnd)
+        if result.get("ok"):
+            self._desktop_target_launches = 0
+        return result
 
     def clear_desktop_target_window(self) -> None:
         self.desktop.clear_target_window()
+        self._desktop_target_launches = 0
 
     def run_ephemeral_turn(self, text: str, image_paths: list[str]):
         """Run one request without reading or updating normal conversation context."""
@@ -619,6 +626,8 @@ class AgentRuntime:
             self._task_mcp_servers.clear()
             self._browser_recovery_attempts = 0
             self._browser_reobservation_required = False
+            if self._task_state is None:
+                self._desktop_target_launches = 0
         if not ephemeral:
             self._maybe_compact_context(api_key)
         self.ui.put(("status", "agent inspecting…"))
@@ -1167,6 +1176,23 @@ class AgentRuntime:
         if name == "filesystem_write":
             return self.tools.write_text(arguments)
         if name == "application_launch":
+            target = self.desktop.target_window
+            application = str(arguments.get("application") or "").strip().lower()
+            if target and application == "notepad":
+                process_name = Path(str(window_process_name(target) or "")).name.casefold()
+                if process_name not in {"notepad.exe", "notepad"}:
+                    return {"ok": False,
+                            "error": "Configured desktop target is not an available Notepad window."}
+                if self._desktop_target_launches:
+                    return {"ok": True, "application": "notepad", "pid": None,
+                            "window_handle": target, "reused_target_window": True,
+                            "already_open": True}
+                focused = self.desktop.focus_target(target)
+                if not focused.get("ok"):
+                    return {"ok": False, "error": str(focused.get("error") or "Target Notepad could not be focused.")}
+                self._desktop_target_launches += 1
+                return {"ok": True, "application": "notepad", "pid": None,
+                        "window_handle": target, "reused_target_window": True}
             return self.tools.launch_application(arguments)
         if name == "shell_run":
             try:

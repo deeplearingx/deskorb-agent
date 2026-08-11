@@ -293,7 +293,7 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(transcript[-1]["content"][-1]["type"], "input_image")
         self.assertIn("NEXT", transcript[-1]["content"][0]["text"])
 
-    def test_normal_desktop_steps_need_no_confirmation(self):
+    def test_normal_desktop_steps_use_one_task_confirmation_then_continue(self):
         events = Queue()
         runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
         responses = iter([
@@ -309,11 +309,6 @@ class ReadOnlyToolsTests(unittest.TestCase):
              patch.object(runtime, "_run_local_tool", return_value={"ok": True}), \
              patch.object(runtime, "_append_desktop_observation", side_effect=lambda transcript, name: transcript):
             runtime.run_turn("打开 Edge 并聚焦地址栏", [])
-            current_events = list(events.queue)
-            self.assertFalse(any(kind == "approval" for kind, _ in current_events))
-            self.assertTrue(any(kind == "delta" and payload == "TASK_DONE" for kind, payload in current_events))
-            self.assertFalse(runtime._task_authorized())
-            return
             first_events = []
             while not events.empty():
                 first_events.append(events.get_nowait())
@@ -326,6 +321,33 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(sum(1 for kind, _ in all_events if kind == "approval"), 1)
         self.assertTrue(any(kind == "delta" and payload == "TASK_DONE" for kind, payload in all_events))
         self.assertFalse(runtime._task_authorized())
+
+    def test_targeted_notepad_launch_reuses_the_locked_desktop_fixture(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.desktop.target_window = 101
+        with patch("agent_runtime.window_process_name", return_value="notepad.exe"), \
+             patch.object(runtime.desktop, "focus_target", return_value={"ok": True, "verified": True}) as focus, \
+             patch.object(runtime.tools, "launch_application") as launch:
+            result = runtime._run_local_tool("application_launch", {"application": "notepad"})
+            repeated = runtime._run_local_tool("application_launch", {"application": "notepad"})
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["reused_target_window"])
+        self.assertTrue(repeated["ok"])
+        self.assertTrue(repeated["already_open"])
+        focus.assert_called_once_with(101)
+        launch.assert_not_called()
+
+    def test_targeted_notepad_launch_fails_closed_when_locked_target_is_not_notepad(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.desktop.target_window = 101
+        with patch("agent_runtime.window_process_name", return_value="msedge.exe"), \
+             patch.object(runtime.tools, "launch_application") as launch:
+            result = runtime._run_local_tool("application_launch", {"application": "notepad"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("configured desktop target", result["error"].lower())
+        launch.assert_not_called()
 
     def test_agent_context_uses_configured_budget_and_compacts(self):
         events = Queue()

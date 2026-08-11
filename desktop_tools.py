@@ -78,6 +78,10 @@ class DesktopTools:
         self._window_snapshot: dict[int, WindowSnapshot] = {}
         self._window_snapshot_at = 0.0
         self.target_window: int | None = None
+        self.overlay_window: int | None = None
+        self.overlay_windows: set[int] = set()
+        self._current_desktop_authorized = False
+        self._action_baseline: DesktopSnapshot | None = None
         self.user32 = ctypes.windll.user32 if os.name == "nt" else None
         self.kernel32 = ctypes.windll.kernel32 if os.name == "nt" else None
 
@@ -96,25 +100,244 @@ class DesktopTools:
             except (AttributeError, OSError):
                 return {"ok": False, "error": "Target window could not be validated."}
         self.target_window = value
+        self._current_desktop_authorized = False
+        self._action_baseline = None
         self.snapshot = None
         self._window_snapshot.clear()
         self._window_snapshot_at = 0.0
         return {"ok": True, "target_window": value}
 
+    def set_current_desktop_authorization(self, authorized: bool) -> None:
+        """Enable explicit harness-only recovery from an unrelated foreground HWND."""
+        self._current_desktop_authorized = bool(authorized)
+
     def clear_target_window(self) -> None:
         self.target_window = None
+        self.overlay_window = None
+        self.overlay_windows.clear()
+        self._current_desktop_authorized = False
+        self._action_baseline = None
         self.snapshot = None
         self._window_snapshot.clear()
         self._window_snapshot_at = 0.0
+
+    @staticmethod
+    def _top_level_window(user32: object, hwnd: int) -> int:
+        """Normalize child/owned foreground handles to one top-level HWND."""
+        try:
+            get_ancestor = getattr(user32, "GetAncestor", None)
+            if callable(get_ancestor):
+                return int(get_ancestor(int(hwnd), 2) or int(hwnd))
+        except Exception:
+            pass
+        return int(hwnd or 0)
+
+    def set_overlay_window(self, hwnd: int | None) -> None:
+        """Remember a temporary test/interaction overlay allowed to hand back focus."""
+        try:
+            value = int(hwnd or 0)
+        except (TypeError, ValueError):
+            value = 0
+        self.overlay_window = value if value > 0 else None
+        self.overlay_windows = {value} if value > 0 else set()
+
+    def add_overlay_window(self, hwnd: int | None) -> None:
+        """Add another known runner/overlay HWND without widening the focus boundary."""
+        try:
+            value = int(hwnd or 0)
+        except (TypeError, ValueError):
+            return
+        if value > 0:
+            self.overlay_windows.add(value)
+
+    def _foreground_matches_target(self, foreground: int, target: int) -> bool:
+        """Accept a child/owned foreground handle for the locked target window."""
+        foreground = int(foreground or 0)
+        target = int(target or 0)
+        return foreground == target or (
+            foreground > 0
+            and target > 0
+            and self._top_level_window(self.user32, foreground)
+            == self._top_level_window(self.user32, target)
+        )
+
+    def _activate_with_thread_input(self, target: int, current: int) -> bool:
+        """Use the Windows foreground-lock fallback within the existing boundary."""
+        if not self.user32 or not current or current == target:
+            return self._foreground_matches_target(current, target)
+        try:
+            get_thread = getattr(self.user32, "GetWindowThreadProcessId", None)
+            attach_input = getattr(self.user32, "AttachThreadInput", None)
+            set_foreground = getattr(self.user32, "SetForegroundWindow", None)
+            if not callable(get_thread) or not callable(attach_input) or not callable(set_foreground):
+                return False
+            get_thread.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)]
+            get_thread.restype = ctypes.wintypes.DWORD
+            attach_input.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.wintypes.BOOL]
+            attach_input.restype = ctypes.wintypes.BOOL
+            target_pid = ctypes.wintypes.DWORD()
+            target_thread = int(get_thread(target, ctypes.byref(target_pid)) or 0)
+            if not target_thread:
+                return False
+            peek_message = getattr(self.user32, "PeekMessageW", None)
+            if callable(peek_message):
+                try:
+                    peek_message.argtypes = [ctypes.c_void_p, ctypes.wintypes.HWND, ctypes.wintypes.UINT,
+                                             ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+                    peek_message.restype = ctypes.wintypes.BOOL
+                    peek_message(None, 0, 0, 0, 0)
+                except Exception:
+                    pass
+            thread_candidates: list[int] = []
+            get_current_thread = getattr(self.kernel32, "GetCurrentThreadId", None)
+            if callable(get_current_thread):
+                try:
+                    get_current_thread.restype = ctypes.wintypes.DWORD
+                    thread_candidates.append(int(get_current_thread() or 0))
+                except Exception:
+                    pass
+            current_pid = ctypes.wintypes.DWORD()
+            foreground_thread = int(get_thread(current, ctypes.byref(current_pid)) or 0)
+            thread_candidates.append(foreground_thread)
+            seen: set[int] = set()
+            for source_thread in thread_candidates:
+                if not source_thread or source_thread == target_thread or source_thread in seen:
+                    continue
+                seen.add(source_thread)
+                attached = bool(attach_input(source_thread, target_thread, True))
+                if not attached:
+                    continue
+                try:
+                    bring_to_top = getattr(self.user32, "BringWindowToTop", None)
+                    if callable(bring_to_top):
+                        bring_to_top(target)
+                    set_foreground(target)
+                    set_active = getattr(self.user32, "SetActiveWindow", None)
+                    if callable(set_active):
+                        set_active(target)
+                    set_focus = getattr(self.user32, "SetFocus", None)
+                    if callable(set_focus):
+                        set_focus(target)
+                finally:
+                    attach_input(source_thread, target_thread, False)
+                deadline = time.monotonic() + 0.75
+                while time.monotonic() < deadline:
+                    foreground = int(self.user32.GetForegroundWindow() or 0)
+                    if self._foreground_matches_target(foreground, target):
+                        return True
+                    time.sleep(0.02)
+                foreground = int(self.user32.GetForegroundWindow() or 0)
+                if self._foreground_matches_target(foreground, target):
+                    return True
+            return self._activate_with_alt_wakeup(target)
+        except Exception:
+            return False
+
+    def _activate_with_alt_wakeup(self, target: int) -> bool:
+        """Wake Windows' foreground permission before one bounded retry."""
+        if not self.user32:
+            return False
+        keybd_event = getattr(self.user32, "keybd_event", None)
+        set_foreground = getattr(self.user32, "SetForegroundWindow", None)
+        if not callable(keybd_event) or not callable(set_foreground):
+            return False
+        try:
+            keybd_event.argtypes = [ctypes.wintypes.BYTE, ctypes.wintypes.BYTE,
+                                    ctypes.wintypes.DWORD, ctypes.c_void_p]
+            keybd_event.restype = None
+            keybd_event(0x12, 0, 0, 0)       # VK_MENU down.
+            keybd_event(0x12, 0, 0x0002, 0)  # VK_MENU up.
+            bring_to_top = getattr(self.user32, "BringWindowToTop", None)
+            if callable(bring_to_top):
+                bring_to_top(target)
+            set_foreground(target)
+            deadline = time.monotonic() + 0.75
+            while time.monotonic() < deadline:
+                foreground = int(self.user32.GetForegroundWindow() or 0)
+                if self._foreground_matches_target(foreground, target):
+                    return True
+                time.sleep(0.02)
+            foreground = int(self.user32.GetForegroundWindow() or 0)
+            return self._foreground_matches_target(foreground, target)
+        except Exception:
+            return False
+
+    def focus_target(self, hwnd: int) -> dict:
+        """Return focus to the configured target only from the known overlay window.
+
+        The foreground-window check is deliberate: it prevents a stale desktop
+        action from stealing focus from an unrelated application after the
+        user has interacted with the desktop.
+        """
+        if not self.user32:
+            return {"ok": False, "error": "Desktop controls require Windows."}
+        try:
+            target = int(hwnd)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Target window handle must be an integer."}
+        if target <= 0:
+            return {"ok": False, "error": "Target window handle must be positive."}
+        if self.target_window is not None and target != self.target_window:
+            return {"ok": False, "error": "Target window is outside the configured desktop boundary."}
+        try:
+            if not self.user32.IsWindow(target):
+                return {"ok": False, "error": "The target window is no longer available; observe again."}
+            is_visible = getattr(self.user32, "IsWindowVisible", None)
+            if callable(is_visible) and not is_visible(target):
+                return {"ok": False, "error": "The target window is not visible; observe again."}
+            current = int(self.user32.GetForegroundWindow() or 0)
+            if current != target:
+                if (not self._current_desktop_authorized
+                        and (not self.overlay_windows or current not in self.overlay_windows)):
+                    return {"ok": False,
+                            "error": "Active window changed since the snapshot; focus the intended application and observe again."}
+                show_window = getattr(self.user32, "ShowWindow", None)
+                if callable(show_window):
+                    show_window(target, 9)  # SW_RESTORE
+                bring_to_top = getattr(self.user32, "BringWindowToTop", None)
+                if callable(bring_to_top):
+                    bring_to_top(target)
+                result = self.user32.SetForegroundWindow(target)
+                foreground_after = int(self.user32.GetForegroundWindow() or 0)
+                verified = self._foreground_matches_target(foreground_after, target)
+                if not verified:
+                    verified = self._activate_with_thread_input(target, current)
+                if not verified and result is not None and not bool(result):
+                    return {"ok": False, "error": "Windows rejected the target window focus."}
+            else:
+                verified = True
+            if not verified:
+                return {"ok": False,
+                        "error": "Windows did not activate the target window; retry after focusing it manually."}
+            return {"ok": True, "window_handle": target, "verified": True}
+        except Exception as exc:
+            return {"ok": False, "error": f"Could not activate the target window: {exc}"}
 
     def capture_state(self) -> dict:
         if not self.user32:
             return {"ok": False, "error": "Desktop controls require Windows."}
         point = ctypes.wintypes.POINT()
         self.user32.GetCursorPos(ctypes.byref(point))
+        if self.target_window is not None:
+            current_getter = getattr(self.user32, "GetForegroundWindow", None)
+            current = int(current_getter() or 0) if callable(current_getter) else 0
+            target = int(self.target_window)
+            if current and self._top_level_window(self.user32, current) != self._top_level_window(self.user32, target):
+                focused = self.focus_target(target)
+                if not focused.get("ok"):
+                    return focused
         hwnd = foreground_capture_window()
-        if self.target_window is not None and int(hwnd or 0) != self.target_window:
-            return {"ok": False, "error": "Target window is not the foreground window."}
+        if self.target_window is not None:
+            target = int(self.target_window)
+            if int(hwnd or 0) != target:
+                current_getter = getattr(self.user32, "GetForegroundWindow", None)
+                current = int(current_getter() or 0) if callable(current_getter) else 0
+                if not current or self._top_level_window(self.user32, current) != self._top_level_window(self.user32, target):
+                    return {"ok": False, "error": "Target window is not the foreground window."}
+                # Windows can report a child/owned foreground handle while
+                # the target boundary was recorded against its top-level
+                # ancestor. Keep evidence tied to the configured target.
+                hwnd = target
         digest = ""
         try:
             image = ImageGrab.grab()
@@ -127,6 +350,12 @@ class DesktopTools:
         self.snapshot = state
         return {"ok": True, "snapshot_id": state.snapshot_id, "cursor": {"x": point.x, "y": point.y},
                 "active_window": state.active_title, "screen_digest": state.screen_digest}
+
+    def _remember_action_baseline(self, snapshot_id: str) -> None:
+        """Keep the pre-action snapshot while auto-observation advances ``snapshot``."""
+        state = self.snapshot
+        if state is not None and state.snapshot_id == str(snapshot_id):
+            self._action_baseline = state
 
     @staticmethod
     def capture_image_data_url() -> str | None:
@@ -157,6 +386,7 @@ class DesktopTools:
             return {"ok": False, "error": "Click count must be 1 or 2."}
         if not self._in_virtual_screen(x, y):
             return {"ok": False, "error": "Click coordinates are outside the virtual desktop."}
+        self._remember_action_baseline(snapshot_id)
         if not self.user32.SetCursorPos(x, y):
             return {"ok": False, "error": "Windows rejected the cursor move."}
         flags = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010),
@@ -174,6 +404,7 @@ class DesktopTools:
         text = str(text)
         if not text or len(text) > 4000 or "\x00" in text:
             return {"ok": False, "error": "Text must contain 1-4000 characters."}
+        self._remember_action_baseline(snapshot_id)
         encoded = text.encode("utf-16-le")
         units = [int.from_bytes(encoded[i:i + 2], "little") for i in range(0, len(encoded), 2)]
         inputs = []
@@ -210,6 +441,7 @@ class DesktopTools:
                 virtual.append(self.VK[key])
             else:
                 return {"ok": False, "error": f"Unsupported hotkey key: {key}"}
+        self._remember_action_baseline(snapshot_id)
         pressed = []
         try:
             for vk in virtual:
@@ -233,6 +465,7 @@ class DesktopTools:
         axis = str(axis).lower()
         if axis not in {"vertical", "horizontal"}:
             return {"ok": False, "error": "Scroll axis must be vertical or horizontal."}
+        self._remember_action_baseline(snapshot_id)
         flag = 0x0800 if axis == "vertical" else 0x1000
         self.user32.mouse_event(flag, 0, 0, ctypes.c_ulong(amount * 120).value, 0)
         return {"ok": True, "delta": amount, "axis": axis}
@@ -373,13 +606,25 @@ class DesktopTools:
 
     def verify_state(self, snapshot_id: str) -> dict:
         state = self.snapshot
-        if not state or state.snapshot_id != snapshot_id:
+        baseline = self._action_baseline
+        valid_ids = {str(state.snapshot_id) if state else ""}
+        if baseline is not None:
+            valid_ids.add(str(baseline.snapshot_id))
+        if not state or str(snapshot_id) not in valid_ids:
             return {"ok": False, "error": "Unknown desktop snapshot."}
         current = self.capture_state()
         if not current.get("ok"):
             return current
-        return {"ok": True, "active_window_changed": current["active_window"] != state.active_title,
-                "screen_changed": bool(state.screen_digest and current["screen_digest"] and current["screen_digest"] != state.screen_digest),
+        reference = baseline if baseline is not None and str(snapshot_id) in {
+            str(baseline.snapshot_id), str(state.snapshot_id)
+        } else state
+        active_changed = current["active_window"] != reference.active_title
+        screen_changed = bool(reference.screen_digest and current["screen_digest"]
+                              and current["screen_digest"] != reference.screen_digest)
+        verified = bool(active_changed or screen_changed)
+        self._action_baseline = None
+        return {"ok": True, "active_window_changed": active_changed,
+                "screen_changed": screen_changed, "verified": verified,
                 "after": current}
 
     def _valid(self, snapshot_id: str, *, require_same_target: bool = False) -> str | None:

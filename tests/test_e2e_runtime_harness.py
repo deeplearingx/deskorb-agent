@@ -5,6 +5,7 @@ browser batch executor, workflow evidence, journal and UI events are real.
 No external website, account, or provider is contacted.
 """
 import tempfile
+import re
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -66,6 +67,21 @@ class RecoveryMcp(FixtureMcp):
 
 
 class RuntimeE2ETests(unittest.TestCase):
+    @staticmethod
+    def _approve_pending_task(runtime, events):
+        pending = []
+        while not events.empty():
+            pending.append(events.get_nowait())
+        token = next(
+            match.group(1)
+            for kind, value in pending
+            if kind == "approval"
+            for match in [re.search(r"确认\s+([A-F0-9]{6,})", str(value))]
+            if match
+        )
+        runtime.run_turn("确认 " + token, [])
+        return pending
+
     def test_browser_task_reaches_verified_terminal_state(self):
         with tempfile.TemporaryDirectory() as directory:
             events = Queue()
@@ -85,7 +101,8 @@ class RuntimeE2ETests(unittest.TestCase):
             with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
                  patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "chrome", "pid": 123}):
                 runtime.run_turn("打开浏览器，搜索测试商品并返回结果", [])
-            remaining = []
+                pending = self._approve_pending_task(runtime, events)
+            remaining = list(pending)
             while not events.empty():
                 remaining.append(events.get_nowait())
             progress = [value for kind, value in remaining if kind == "task_progress" and isinstance(value, dict) and value.get("terminal")]
@@ -130,13 +147,14 @@ class RuntimeE2ETests(unittest.TestCase):
             ])
             runtime._request = lambda _payload, _key: next(responses)
             with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
-                patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "notepad", "pid": 456}), \
+                 patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "notepad", "pid": 456}), \
                  patch.object(runtime.desktop, "capture_state", return_value={"ok": True, "snapshot_id": "S1", "active_window": "Notepad", "screen_digest": "fixture"}), \
                  patch.object(runtime.desktop, "capture_image_data_url", return_value=None), \
-                 patch.object(runtime.desktop, "type_text", return_value={"ok": True, "characters": 19}), \
+                patch.object(runtime.desktop, "type_text", return_value={"ok": True, "characters": 19}), \
                 patch.object(runtime.desktop, "verify_state", return_value={"ok": True, "screen_changed": True, "active_window_changed": False}):
                 runtime.run_turn("打开记事本并输入测试文本，然后验证状态", [])
-            remaining = []
+                pending = self._approve_pending_task(runtime, events)
+            remaining = list(pending)
             while not events.empty():
                 remaining.append(events.get_nowait())
             terminal = [value for kind, value in remaining if kind == "task_progress" and isinstance(value, dict) and value.get("terminal")]

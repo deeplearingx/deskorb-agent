@@ -24,6 +24,8 @@ from local_real_e2e_runner import (
     normalize_runtime_events,
     _unsafe_action_observed,
     _prepare_evaluation_tool_environment,
+    _remember_current_host_overlay,
+    _remember_host_process_overlays,
     wait_for_handoff,
 )
 
@@ -138,12 +140,35 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertEqual(result["failure_kind"], "required_action_missing")
         self.assertEqual(result["missing_required_action_kinds"], ["filesystem_write", "shell_verify"])
 
+    def test_confirmation_is_satisfied_by_an_approval_event_not_a_tool_label(self):
+        case = next(item for item in load_matrix_cases() if item["id"] == "desktop-003")
+        baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
+        result = _finish_record(
+            case, 1, baselines,
+            {"action_sequence": ["launch", "desktop_observe", "desktop_input", "desktop_verify"],
+             "action_steps": 4, "confirmation_count": 1, "handoff_count": 0,
+             "completed": True, "verified": True, "evidence_passed": True,
+             "total_latency_ms": 10},
+        )
+        self.assertEqual(result["outcome"], "passed")
+        self.assertEqual(result["missing_required_action_kinds"], [])
+
     def test_real_task_prompt_includes_required_baseline_actions(self):
         case = next(item for item in load_matrix_cases() if item["id"] == "diagnose-001")
         baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
         prompt = _append_contract_guidance("diagnose", case, baselines)
         self.assertIn("filesystem_write", prompt)
         self.assertIn("shell_run once", prompt)
+
+    def test_desktop_task_prompt_requires_continuation_after_observation(self):
+        case = next(item for item in load_matrix_cases() if item["id"] == "desktop-003")
+        baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
+        prompt = _append_contract_guidance("desktop task", case, baselines)
+        self.assertIn("desktop_capture_state", prompt)
+        self.assertIn("desktop_type", prompt)
+        self.assertIn("Do not stop after observation", prompt)
+        self.assertIn("runtime", prompt)
+        self.assertIn("risk_level=normal", prompt)
 
     def test_evaluation_shell_environment_uses_runner_python_directory(self):
         runner_dir = str(Path(sys.executable).resolve().parent)
@@ -199,12 +224,126 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertEqual(activations, [202, 202])
         self.assertTrue(launches[0].terminated)
 
-    def test_default_desktop_fixture_launch_suppresses_helper_console_window(self):
+    def test_desktop_fixture_session_retries_a_transient_focus_rejection(self):
+        class FakeProcess:
+            pid = 101
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        activations = iter([False, True])
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("local_real_e2e_runner.time.sleep"):
+            session = _DesktopFixtureSession(
+                Path(directory), launch_process=lambda _target: FakeProcess(),
+                find_window=lambda _pid, _title, timeout=8.0: 202,
+                activate_window=lambda _hwnd: next(activations),
+                reset_document=lambda _hwnd: True,
+            )
+            self.assertEqual(session.acquire()[0], 202)
+            session.close()
+
+    def test_desktop_fixture_waits_for_new_window_input_queue_before_focus(self):
+        class FakeProcess:
+            pid = 101
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        events = []
+
+        def fake_sleep(_seconds):
+            events.append("sleep")
+
+        def activate(_hwnd):
+            events.append("activate")
+            return events.count("sleep") > 0
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("local_real_e2e_runner.time.sleep", side_effect=fake_sleep):
+            session = _DesktopFixtureSession(
+                Path(directory), launch_process=lambda _target: FakeProcess(),
+                find_window=lambda _pid, _title, timeout=8.0: 202,
+                activate_window=activate,
+                reset_document=lambda _hwnd: True,
+            )
+            self.assertEqual(session.acquire()[0], 202)
+            session.close()
+
+        self.assertEqual(events[:2], ["sleep", "activate"])
+
+    def test_desktop_fixture_session_remembers_pre_fixture_foreground_as_overlay(self):
+        class FakeProcess:
+            pid = 101
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch("local_real_e2e_runner._foreground_window_handle", return_value=303):
+            session = _DesktopFixtureSession(
+                Path(directory), launch_process=lambda _target: FakeProcess(),
+                find_window=lambda _pid, _title, timeout=8.0: 202,
+                activate_window=lambda _hwnd: True,
+                reset_document=lambda _hwnd: True,
+            )
+            session.acquire()
+            overlay = session.overlay_window
+            session.close()
+
+        self.assertEqual(overlay, 303)
+
+    def test_runner_remembers_only_the_current_host_window_as_overlay(self):
+        with patch("local_real_e2e_runner._foreground_window_handle", return_value=404):
+            overlays = _remember_current_host_overlay({303}, target_hwnd=202)
+        self.assertEqual(overlays, {303, 404})
+
+        with patch("local_real_e2e_runner._foreground_window_handle", return_value=202):
+            overlays = _remember_current_host_overlay({303}, target_hwnd=202)
+        self.assertEqual(overlays, {303})
+
+    def test_runner_adds_only_visible_windows_from_runner_process_ancestors(self):
+        with patch("local_real_e2e_runner._foreground_window_handle", return_value=404), \
+             patch("local_real_e2e_runner._process_ancestry_ids", return_value={11, 22}), \
+             patch("local_real_e2e_runner._visible_top_level_windows_for_processes",
+                   return_value={505, 606}):
+            overlays = _remember_host_process_overlays({303}, target_hwnd=202)
+
+        self.assertEqual(overlays, {303, 404, 505, 606})
+
+    def test_runner_does_not_add_target_or_unrelated_windows_to_host_overlays(self):
+        with patch("local_real_e2e_runner._foreground_window_handle", return_value=202), \
+             patch("local_real_e2e_runner._process_ancestry_ids", return_value={11}), \
+             patch("local_real_e2e_runner._visible_top_level_windows_for_processes",
+                   return_value={202, 707}):
+            overlays = _remember_host_process_overlays({303}, target_hwnd=202)
+
+        self.assertEqual(overlays, {303, 707})
+
+    def test_default_desktop_fixture_launch_uses_gui_process_defaults(self):
         fake_process = object()
         with patch("local_real_e2e_runner.subprocess.Popen", return_value=fake_process) as popen:
             result = _DesktopFixtureSession._launch_default(Path("fixture.txt"))
         self.assertIs(result, fake_process)
-        self.assertEqual(popen.call_args.kwargs["creationflags"], 0x08000000)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], 0)
 
     def test_captcha_safety_cases_do_not_open_a_desktop_fixture(self):
         case = next(item for item in load_matrix_cases() if item["id"] == "safety-008")
@@ -263,6 +402,32 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertTrue(metrics["completed"])
         self.assertTrue(metrics["verified"])
 
+    def test_completed_verified_terminal_clears_recovered_focus_failure(self):
+        class FakeRuntime:
+            def __init__(self):
+                self.ui = Queue()
+
+            def interrupt(self):
+                return None
+
+        runtime = FakeRuntime()
+
+        def bounded(_runtime, _text, _timeout):
+            runtime.ui.put(("task_progress", {
+                "terminal": "completed", "verified": True,
+                "failure_kind": "desktop_focus_failure",
+            }))
+            return True, None
+
+        with patch("local_real_e2e_runner._run_turn_bounded", side_effect=bounded):
+            metrics, failure = _run_runtime_task(
+                runtime, "完成隔离任务", 5, 0, False, allow_automatic_confirmation=True,
+            )
+
+        self.assertIsNone(failure)
+        self.assertTrue(metrics["completed"])
+        self.assertTrue(metrics["verified"])
+
     def test_bounded_turn_rejects_empty_input_before_runtime_call(self):
         class FakeRuntime:
             def __init__(self):
@@ -279,6 +444,18 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(failure, "empty_model_input")
         self.assertFalse(runtime.called)
+
+    def test_turn_failure_preserves_transient_network_category(self):
+        class FakeRuntime:
+            def run_turn(self, _text, _images):
+                raise RuntimeError("API network connection failed after 3 attempt(s)")
+
+            def interrupt(self):
+                return None
+
+        ok, failure = _run_turn_bounded(FakeRuntime(), "continue the task", 1)
+        self.assertFalse(ok)
+        self.assertEqual(failure, "transient_network")
 
 
 if __name__ == "__main__":

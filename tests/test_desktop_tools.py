@@ -1,6 +1,6 @@
 import unittest
 import time
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from desktop_tools import DesktopSnapshot, DesktopTools, WindowSnapshot
 
@@ -117,6 +117,209 @@ class DesktopToolsTests(unittest.TestCase):
         tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 101, "target", "digest")
         tools.user32.foreground = 101
         self.assertTrue(tools.type_text("FRESH", "hello")["ok"])
+
+    def test_capture_accepts_a_child_foreground_handle_of_the_locked_target(self):
+        class ForegroundChild(FakeUser32):
+            foreground = 202
+
+            def GetCursorPos(self, point_ptr):
+                point_ptr._obj.x, point_ptr._obj.y = 10, 20
+
+            def GetAncestor(self, hwnd, _flags):
+                return 101 if int(hwnd) == 202 else int(hwnd)
+
+            def IsWindowVisible(self, hwnd):
+                return int(hwnd) in {101, 202}
+
+        tools = DesktopTools()
+        tools.user32 = ForegroundChild()
+        tools.user32.foreground = 202
+        self.assertTrue(tools.set_target_window(101)["ok"])
+        with patch("desktop_tools.foreground_capture_window", return_value=None), \
+             patch("desktop_tools.window_title", return_value="Fixture Window"):
+            result = tools.capture_state()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["active_window"], "Fixture Window")
+
+    def test_capture_recovers_focus_from_the_known_overlay_before_observing(self):
+        class OverlayForeground(FakeUser32):
+            def GetCursorPos(self, point_ptr):
+                point_ptr._obj.x, point_ptr._obj.y = 10, 20
+
+        tools = DesktopTools()
+        tools.user32 = OverlayForeground()
+        tools.user32.foreground = 99
+        self.assertTrue(tools.set_target_window(101)["ok"])
+        tools.set_overlay_window(99)
+        with patch("desktop_tools.foreground_capture_window", side_effect=lambda: tools.user32.foreground), \
+             patch("desktop_tools.window_title", return_value="Fixture Window"):
+            result = tools.capture_state()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(tools.user32.foreground, 101)
+
+    def test_focus_target_only_releases_test_overlay_and_verifies_foreground(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.set_overlay_window(99)
+        tools.user32.foreground = 99
+
+        focused = tools.focus_target(101)
+
+        self.assertTrue(focused["ok"])
+        self.assertTrue(focused["verified"])
+        self.assertEqual(tools.user32.foreground, 101)
+
+        tools.user32.foreground = 77
+        rejected = tools.focus_target(101)
+        self.assertFalse(rejected["ok"])
+        self.assertIn("active window", rejected["error"].lower())
+
+    def test_focus_target_allows_unknown_foreground_only_after_explicit_desktop_authorization(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.user32.foreground = 77
+
+        tools.set_current_desktop_authorization(True)
+        focused = tools.focus_target(101)
+
+        self.assertTrue(focused["ok"], focused)
+        self.assertEqual(tools.user32.foreground, 101)
+
+    def test_verify_uses_action_baseline_after_runtime_replaces_snapshot(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.user32.foreground = 101
+        tools.snapshot = DesktopSnapshot("BEFORE", time.monotonic(), 0, 0, 101, "target", "before")
+        self.assertTrue(tools.type_text("BEFORE", "hello")["ok"])
+        tools.snapshot = DesktopSnapshot("AFTER", time.monotonic(), 0, 0, 101, "target*", "after")
+
+        with patch.object(tools, "capture_state", return_value={
+            "ok": True, "active_window": "target*", "screen_digest": "after",
+        }):
+            result = tools.verify_state("AFTER")
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["screen_changed"])
+        self.assertTrue(result["active_window_changed"])
+        self.assertTrue(result["verified"])
+
+    def test_focus_target_accepts_a_second_known_runner_overlay(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.set_overlay_window(99)
+        tools.add_overlay_window(98)
+        tools.user32.foreground = 98
+
+        focused = tools.focus_target(101)
+
+        self.assertTrue(focused["ok"])
+        self.assertEqual(tools.user32.foreground, 101)
+
+    def test_focus_target_accepts_child_foreground_handle_after_activation(self):
+        class ChildReportingForeground(FakeUser32):
+            def GetAncestor(self, hwnd, _flags):
+                return 101 if int(hwnd) == 202 else int(hwnd)
+
+            def IsWindow(self, hwnd):
+                return int(hwnd) in {101, 202}
+
+            def IsWindowVisible(self, hwnd):
+                return int(hwnd) in {101, 202}
+
+            def SetForegroundWindow(self, hwnd):
+                self.foreground = 202 if int(hwnd) == 101 else int(hwnd)
+
+        tools = self.ready_tools()
+        tools.user32 = ChildReportingForeground()
+        tools.set_target_window(101)
+        tools.set_overlay_window(99)
+        tools.user32.foreground = 99
+
+        focused = tools.focus_target(101)
+
+        self.assertTrue(focused["ok"], focused)
+        self.assertTrue(focused["verified"])
+        self.assertEqual(tools.user32.foreground, 202)
+
+    def test_focus_target_uses_thread_input_when_windows_rejects_direct_focus(self):
+        class ForegroundLocked(FakeUser32):
+            def __init__(self):
+                super().__init__()
+                self.attached = False
+                self.message_queue = False
+                self.GetWindowThreadProcessId = Mock(side_effect=self._get_window_thread)
+                self.AttachThreadInput = Mock(side_effect=self._attach_thread_input)
+                self.PeekMessageW = Mock(side_effect=self._peek_message)
+
+            def _get_window_thread(self, hwnd, pid_ptr):
+                pid_ptr._obj.value = 11 if int(hwnd) == 99 else 22
+                return 11 if int(hwnd) == 99 else 22
+
+            def _attach_thread_input(self, _current_thread, _target_thread, attach):
+                self.attached = bool(attach)
+                return int(self.message_queue)
+
+            def _peek_message(self, *_args):
+                self.message_queue = True
+                return 1
+
+            def SetForegroundWindow(self, hwnd):
+                if self.attached:
+                    self.foreground = int(hwnd)
+                    return 1
+                return 0
+
+        tools = self.ready_tools()
+        tools.user32 = ForegroundLocked()
+        tools.kernel32 = Mock()
+        tools.kernel32.GetCurrentThreadId = Mock(return_value=33)
+        tools.set_target_window(101)
+        tools.set_overlay_window(99)
+        tools.user32.foreground = 99
+
+        focused = tools.focus_target(101)
+
+        self.assertTrue(focused["ok"], focused)
+        self.assertTrue(focused["verified"])
+        self.assertEqual(tools.user32.foreground, 101)
+        self.assertTrue(tools.user32.PeekMessageW.called)
+        self.assertEqual(tools.user32.AttachThreadInput.call_args_list[0].args[:2], (33, 22))
+
+    def test_focus_target_uses_alt_wakeup_after_thread_attachment_is_rejected(self):
+        class AltWakeup(FakeUser32):
+            def __init__(self):
+                super().__init__()
+                self.alt_woken = False
+                self.GetWindowThreadProcessId = Mock(side_effect=self._get_window_thread)
+                self.AttachThreadInput = Mock(return_value=False)
+                self.PeekMessageW = Mock(return_value=1)
+                self.keybd_event = Mock(side_effect=self._key_event)
+
+            def _get_window_thread(self, hwnd, pid_ptr):
+                pid_ptr._obj.value = 22
+                return 22
+
+            def _key_event(self, _vk, _scan, flags, _extra):
+                self.alt_woken = flags == 0x0002
+
+            def SetForegroundWindow(self, hwnd):
+                if self.alt_woken:
+                    self.foreground = int(hwnd)
+                    return 1
+                return 0
+
+        tools = self.ready_tools()
+        tools.user32 = AltWakeup()
+        tools.kernel32 = Mock()
+        tools.kernel32.GetCurrentThreadId = Mock(return_value=33)
+        tools.set_target_window(101)
+        tools.set_overlay_window(99)
+        tools.user32.foreground = 99
+
+        focused = tools.focus_target(101)
+
+        self.assertTrue(focused["ok"], focused)
+        self.assertTrue(tools.user32.keybd_event.called)
 
     def test_hotkey_releases_keys_in_reverse_order(self):
         tools = self.ready_tools()

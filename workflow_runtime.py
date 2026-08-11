@@ -14,6 +14,26 @@ from enum import Enum
 from typing import Any
 
 
+_FILE_CHANGE_MARKER = re.compile(
+    r"保存|写入|创建|修改|覆盖|修复|\b(?:write|save|create|modify|overwrite|fix|repair)\b",
+    re.I,
+)
+_NEGATED_FILE_CHANGE = re.compile(
+    r"(?:\b(?:do\s+not|don't|never|not|without|no)\b|禁止|不要|不允许|不得)",
+    re.I,
+)
+
+
+def _has_positive_file_change_intent(text: str) -> bool:
+    """Ignore file-change words used only to scope a negative safety constraint."""
+    normalized = " ".join(str(text or "").lower().split())
+    for match in _FILE_CHANGE_MARKER.finditer(normalized):
+        prefix = normalized[max(0, match.start() - 80):match.start()]
+        if not _NEGATED_FILE_CHANGE.search(prefix):
+            return True
+    return False
+
+
 def _contains_marker(text: str, marker: str) -> bool:
     """Match English intent markers as words so ``Windows`` is not ``window``."""
     if marker.isascii() and marker.isalnum():
@@ -91,8 +111,7 @@ class TaskContract:
         ))
         if message_intent and any(marker in text for marker in ("qq", "消息", "信息", "send", "发送", "发")):
             schemas.append("message_delivery")
-        if any(marker in text for marker in ("保存", "写入", "创建", "修改", "覆盖", "修复")) \
-                or re.search(r"\b(?:write|save|create|modify|overwrite|fix|repair)\b", text):
+        if _has_positive_file_change_intent(text):
             schemas.append("path_and_content_hash")
         # Browser page tasks commonly begin with “打开浏览器”.  Their
         # structured page snapshot is the authoritative evidence; requiring a
@@ -173,9 +192,11 @@ class TaskContract:
             # prose-only model response.  Pure question/answer tasks use a
             # contract with ``requires_verification=False`` and still pass.
             return False
-        if any(node.status is NodeStatus.FAILED for node in action_nodes):
-            # Later evidence cannot prove that a failed side effect occurred;
-            # the caller must classify and recover the failed node explicitly.
+        failed_nodes = [node for node in action_nodes if node.status is NodeStatus.FAILED]
+        if any(not self._failed_node_was_retried(node, nodes) for node in failed_nodes):
+            # Later evidence cannot prove that a failed side effect occurred.
+            # The one exception is a precondition-only desktop focus rejection:
+            # no input was sent, and the same tool must later succeed.
             return False
         evidence_nodes = [node for node in nodes if node.evidence and node.status is NodeStatus.SUCCEEDED]
         if not evidence_nodes:
@@ -188,6 +209,14 @@ class TaskContract:
         # successful sub-step hide an unfinished side effect.
         observed_schemas = {node.evidence_schema for node in evidence_nodes}
         return all(schema in observed_schemas for schema in self.required_evidence_schemas)
+
+    @staticmethod
+    def _failed_node_was_retried(node: WorkflowNode, nodes: list[WorkflowNode]) -> bool:
+        if node.failure_kind != "desktop_focus_failure":
+            return False
+        return any(later.node_id > node.node_id and later.label == node.label
+                   and later.status is NodeStatus.SUCCEEDED
+                   for later in nodes)
 
 
 class TaskWorkflow:
@@ -247,8 +276,10 @@ class TaskWorkflow:
         # Do not let a successful model response turn an unverified action
         # sequence into a completed task.  The runtime may later resume this
         # state after a fresh observation or an explicit verifier result.
-        failed_actions = any(node.status is NodeStatus.FAILED for node in self._nodes
-                             if node.kind in {"action", "verification"})
+        failed_actions = any(
+            node.status is NodeStatus.FAILED and not self.contract._failed_node_was_retried(node, self._nodes)
+            for node in self._nodes if node.kind in {"action", "verification"}
+        )
         if requested_terminal == "completed" and failed_actions:
             self._terminal = "failed"
         elif (requested_terminal == "completed" and self.contract.requires_verification

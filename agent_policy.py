@@ -76,6 +76,9 @@ class ToolPolicy:
         if not execution_requested:
             return PolicyDecision(DecisionKind.DENY, Risk.EXTERNAL_OR_ELEVATED,
                                   "The user did not explicitly request an action")
+        if tool_name in self.EXTERNAL_TOOLS and not task_authorized and not high_risk:
+            return PolicyDecision(DecisionKind.CONFIRM, Risk.EXTERNAL_OR_ELEVATED,
+                                  "The first external action in a task requires one task confirmation")
         if tool_name == "filesystem_delete" or (tool_name == "shell_run" and high_risk):
             return PolicyDecision(DecisionKind.CONFIRM, Risk.DESTRUCTIVE_LOCAL,
                                   "File deletion requires fresh confirmation")

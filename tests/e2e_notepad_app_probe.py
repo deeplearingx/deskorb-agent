@@ -92,6 +92,18 @@ def _edit_text(hwnd: int) -> str | None:
     return None
 
 
+def _same_top_level_window(user32: object, first: int, second: int) -> bool:
+    """Treat child/owned foreground handles as the same application window."""
+    try:
+        get_ancestor = getattr(user32, "GetAncestor", None)
+        if callable(get_ancestor):
+            first = int(get_ancestor(wintypes.HWND(first), 2) or first)
+            second = int(get_ancestor(wintypes.HWND(second), 2) or second)
+    except Exception:
+        pass
+    return int(first or 0) == int(second or 0)
+
+
 def _close_window(hwnd: int) -> None:
     try:
         import ctypes
@@ -137,25 +149,70 @@ def _activate_window(hwnd: int, tools: DesktopTools | None = None,
         except Exception:
             pass
         current = int(user32.GetForegroundWindow() or 0)
-        current_pid = wintypes.DWORD()
         target_pid = wintypes.DWORD()
-        current_thread = int(user32.GetWindowThreadProcessId(current, ctypes.byref(current_pid)) or 0)
         target_thread = int(user32.GetWindowThreadProcessId(target, ctypes.byref(target_pid)) or 0)
-        attached = bool(current_thread and target_thread and current_thread != target_thread and
-                        user32.AttachThreadInput(current_thread, target_thread, True))
-        try:
-            user32.SetForegroundWindow(wintypes.HWND(target))
-            user32.SetActiveWindow(wintypes.HWND(target))
-            user32.SetFocus(wintypes.HWND(target))
-        finally:
-            if attached:
-                user32.AttachThreadInput(current_thread, target_thread, False)
-        deadline = time.monotonic() + 0.75
-        while time.monotonic() < deadline:
-            if int(user32.GetForegroundWindow() or 0) == target:
+        if not target_thread:
+            return False
+        peek_message = getattr(user32, "PeekMessageW", None)
+        if callable(peek_message):
+            try:
+                peek_message.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT,
+                                         wintypes.UINT, wintypes.UINT]
+                peek_message.restype = wintypes.BOOL
+                peek_message(None, 0, 0, 0, 0)
+            except Exception:
+                pass
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_current_thread = kernel32.GetCurrentThreadId
+        get_current_thread.restype = wintypes.DWORD
+        current_thread = int(user32.GetWindowThreadProcessId(current, ctypes.byref(wintypes.DWORD())) or 0)
+        thread_candidates = [int(get_current_thread() or 0), current_thread]
+        seen: set[int] = set()
+        for source_thread in thread_candidates:
+            if not source_thread or source_thread in seen:
+                continue
+            seen.add(source_thread)
+            attached = bool(source_thread != target_thread and
+                            user32.AttachThreadInput(source_thread, target_thread, True))
+            if source_thread != target_thread and not attached:
+                continue
+            try:
+                bring_to_top = getattr(user32, "BringWindowToTop", None)
+                if callable(bring_to_top):
+                    bring_to_top(wintypes.HWND(target))
+                user32.SetForegroundWindow(wintypes.HWND(target))
+                user32.SetActiveWindow(wintypes.HWND(target))
+                user32.SetFocus(wintypes.HWND(target))
+            finally:
+                if attached:
+                    user32.AttachThreadInput(source_thread, target_thread, False)
+            deadline = time.monotonic() + 0.75
+            while time.monotonic() < deadline:
+                if _same_top_level_window(user32, int(user32.GetForegroundWindow() or 0), target):
+                    return True
+                time.sleep(0.02)
+            if _same_top_level_window(user32, int(user32.GetForegroundWindow() or 0), target):
                 return True
-            time.sleep(0.02)
-        return int(user32.GetForegroundWindow() or 0) == target
+        keybd_event = getattr(user32, "keybd_event", None)
+        set_foreground = getattr(user32, "SetForegroundWindow", None)
+        if callable(keybd_event) and callable(set_foreground):
+            try:
+                keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
+                keybd_event.restype = None
+                keybd_event(0x12, 0, 0, 0)       # VK_MENU down: wake the foreground permission.
+                keybd_event(0x12, 0, 0x0002, 0)  # VK_MENU up.
+                bring_to_top = getattr(user32, "BringWindowToTop", None)
+                if callable(bring_to_top):
+                    bring_to_top(wintypes.HWND(target))
+                set_foreground(wintypes.HWND(target))
+                deadline = time.monotonic() + 0.75
+                while time.monotonic() < deadline:
+                    if _same_top_level_window(user32, int(user32.GetForegroundWindow() or 0), target):
+                        return True
+                    time.sleep(0.02)
+            except Exception:
+                pass
+        return False
     except Exception:
         return False
 
@@ -213,7 +270,9 @@ def main() -> int:
             type_error = None
             activation_diagnostics: dict[str, object] = {}
             tools = DesktopTools()
-            tools.set_preferred_window(hwnd)
+            target_result = tools.set_target_window(hwnd)
+            if not target_result.get("ok"):
+                raise RuntimeError(str(target_result.get("error") or "desktop_target_window_invalid"))
             overlay = tk.Tk()
             overlay.title("DeskOrb Focus Harness")
             overlay.geometry("160x48+20+20")
@@ -229,7 +288,7 @@ def main() -> int:
             if not uia_value_readback:
                 activation_ok = _activate_window(hwnd, tools, activation_diagnostics)
                 time.sleep(0.2)
-                state = tools.capture_state(hwnd)
+                state = tools.capture_state()
                 capture_ok = bool(state.get("ok"))
                 if state.get("ok"):
                     typed = tools.type_text(state["snapshot_id"], marker)
@@ -240,7 +299,7 @@ def main() -> int:
             # directory after the probe.
             _activate_window(hwnd, tools)
             time.sleep(0.1)
-            save_state = tools.capture_state(hwnd)
+            save_state = tools.capture_state()
             if save_state.get("ok"):
                 tools.hotkey(save_state["snapshot_id"], ["ctrl", "s"])
             time.sleep(0.25)
@@ -273,7 +332,7 @@ def main() -> int:
         if tools is not None and "hwnd" in locals() and hwnd:
             try:
                 tools.user32.SetForegroundWindow(hwnd)
-                state = tools.capture_state(hwnd)
+                state = tools.capture_state()
                 if state.get("ok"):
                     tools.hotkey(state["snapshot_id"], ["ctrl", "s"])
             except Exception:

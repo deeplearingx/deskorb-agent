@@ -34,6 +34,13 @@ class TaskWorkflowTests(unittest.TestCase):
         contract = TaskContract.from_goal("检查项目文件并报告错误", requires_action=True)
         self.assertNotIn("path_and_content_hash", contract.required_evidence_schemas)
 
+    def test_negative_desktop_scope_does_not_create_file_change_contract(self):
+        contract = TaskContract.from_goal(
+            "A disposable Notepad window is open. Do not open or modify any other application.",
+            requires_action=True,
+        )
+        self.assertNotIn("path_and_content_hash", contract.required_evidence_schemas)
+
     def test_repair_task_requires_verified_file_change_evidence(self):
         contract = TaskContract.from_goal("诊断问题并修复安全修复的问题", requires_action=True)
         self.assertIn("path_and_content_hash", contract.required_evidence_schemas)
@@ -80,6 +87,22 @@ class TaskWorkflowTests(unittest.TestCase):
 
         self.assertFalse(progress["verified"])
         self.assertEqual(progress["terminal"], "failed")
+
+    def test_unexecuted_focus_failure_can_be_retried_before_verification(self):
+        contract = TaskContract.from_goal("在记事本中输入文本", requires_action=True)
+        workflow = TaskWorkflow("T-focus-retry", contract.goal, contract=contract)
+        workflow.record_tool_result("desktop_type", {
+            "ok": False, "error": "Active window changed since the snapshot; capture fresh state first.",
+        }, failure_kind="desktop_focus_failure")
+        workflow.record_tool_result("desktop_type", {"ok": True})
+        workflow.record_tool_result("desktop_verify_state", {
+            "ok": True, "screen_changed": True,
+        })
+
+        progress = workflow.finish("completed")
+
+        self.assertTrue(progress["verified"])
+        self.assertEqual(progress["terminal"], "completed")
 
     def test_verified_write_and_state_change_supply_evidence(self):
         workflow = TaskWorkflow("T2", "Write a file")

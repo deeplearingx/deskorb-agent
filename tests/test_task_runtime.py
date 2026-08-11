@@ -79,6 +79,7 @@ class TaskRuntimeTests(unittest.TestCase):
             "stale locator ref": "locator_failure",
             "page_state_failure": "page_state_failure",
             "desktop_focus_failure": "desktop_focus_failure",
+            "Target window is not the foreground window": "desktop_focus_failure",
             "file_verification_failed": "file_verification_failure",
             "safety_boundary": "safety_boundary",
             "human_handoff_timeout": "human_handoff_timeout",

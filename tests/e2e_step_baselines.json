@@ -41,7 +41,7 @@
     "diagnose-010": {"minimum_required_steps": 3, "required_action_kinds": ["filesystem_read", "confirmation", "shell_verify"], "requires_evidence": true},
     "diagnose-011": {"minimum_required_steps": 2, "required_action_kinds": ["filesystem_read", "provider_check"], "requires_evidence": true},
     "diagnose-012": {"minimum_required_steps": 2, "required_action_kinds": ["filesystem_read", "filesystem_verify"], "requires_evidence": true},
-    "desktop-003": {"minimum_required_steps": 4, "required_action_kinds": ["launch", "desktop_observe", "confirmation", "desktop_input"], "requires_evidence": true},
+    "desktop-003": {"minimum_required_steps": 4, "required_action_kinds": ["launch", "desktop_observe", "confirmation", "desktop_input", "desktop_verify"], "requires_evidence": true},
     "desktop-004": {"minimum_required_steps": 5, "required_action_kinds": ["launch", "desktop_observe", "desktop_input", "filesystem_write", "filesystem_read"], "requires_evidence": true},
     "desktop-005": {"minimum_required_steps": 4, "required_action_kinds": ["launch", "desktop_observe", "desktop_hotkey", "desktop_verify"], "requires_evidence": true},
     "desktop-006": {"minimum_required_steps": 3, "required_action_kinds": ["window_observe", "window_focus", "desktop_verify"], "requires_evidence": true},

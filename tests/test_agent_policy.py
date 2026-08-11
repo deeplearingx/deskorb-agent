@@ -42,24 +42,34 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(decision.risk, Risk.DESTRUCTIVE_LOCAL)
 
     def test_desktop_click_is_allowed_in_full_access(self):
-        decision = self.policy.decide("desktop_click", execution_requested=True, full_access=True)
+        decision = self.policy.decide("desktop_click", execution_requested=True, full_access=True,
+                                      task_authorized=True)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
     def test_keyboard_actions_are_allowed_in_full_access(self):
         for tool in ("desktop_type", "desktop_hotkey"):
             with self.subTest(tool=tool):
-                decision = self.policy.decide(tool, execution_requested=True, full_access=True)
+                decision = self.policy.decide(tool, execution_requested=True, full_access=True,
+                                              task_authorized=True)
                 self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
     def test_scroll_and_focus_are_allowed_in_full_access(self):
         for tool in ("desktop_scroll", "window_focus", "window_control", "desktop_clipboard_read_text"):
             with self.subTest(tool=tool):
-                decision = self.policy.decide(tool, execution_requested=True, full_access=True)
+                decision = self.policy.decide(tool, execution_requested=True, full_access=True,
+                                              task_authorized=True)
             self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
     def test_application_launch_is_allowed_in_full_access(self):
-        decision = self.policy.decide("application_launch", execution_requested=True, full_access=True)
+        decision = self.policy.decide("application_launch", execution_requested=True, full_access=True,
+                                      task_authorized=True)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
+
+    def test_first_external_action_requires_one_task_confirmation(self):
+        decision = self.policy.decide("desktop_type", execution_requested=True, full_access=True,
+                                      task_authorized=False)
+        self.assertEqual(decision.kind, DecisionKind.CONFIRM)
+        self.assertEqual(decision.risk, Risk.EXTERNAL_OR_ELEVATED)
 
     def test_task_authorization_allows_normal_desktop_steps(self):
         for tool in ("application_launch", "desktop_click", "desktop_type", "desktop_hotkey", "window_control"):
