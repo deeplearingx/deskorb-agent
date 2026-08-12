@@ -65,6 +65,14 @@ class ToolPolicyTests(unittest.TestCase):
                                       task_authorized=True)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
+    def test_semantic_browser_action_is_task_scoped(self):
+        decision = self.policy.decide("browser_action_batch", execution_requested=True,
+                                      full_access=True, task_authorized=False)
+        self.assertEqual(decision.kind, DecisionKind.CONFIRM)
+        authorized = self.policy.decide("browser_action_batch", execution_requested=True,
+                                        full_access=True, task_authorized=True)
+        self.assertEqual(authorized.kind, DecisionKind.ALLOW)
+
     def test_first_external_action_requires_one_task_confirmation(self):
         decision = self.policy.decide("desktop_type", execution_requested=True, full_access=True,
                                       task_authorized=False)

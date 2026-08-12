@@ -44,7 +44,7 @@
       "tier": "repeatable",
       "category": "learning_resource_search",
       "prompt": "搜索 Python asyncio 的入门学习资料，挑出最适合初学者的三个结果。每个结果给出标题、来源、链接和一句推荐理由。",
-      "setup": {"fixture": "mock_search", "query": "Python asyncio 入门", "results_page": "tests/fixtures/web/mock_search.html"},
+      "setup": {"fixture": "dynamic_search", "query": "Python asyncio 入门", "results_page": "tests/fixtures/web/dynamic_search.html"},
       "expected": {"must_use": ["mcp_playwright"], "answer_fields": ["title", "source", "url", "reason"], "required_sources": ["Python 官方文档", "Real Python", "Bilibili 教程"]},
       "success_assertions": ["Three distinct results are returned", "Each URL matches an inspected result", "Ranking favors official documentation and beginner-oriented material", "Recommendation reasons refer to visible evidence, not invented content"],
       "budgets": {"max_tool_rounds": 7, "max_elapsed_seconds": 40},

@@ -138,7 +138,7 @@ def _is_playwright_browser_tool(runtime: AgentRuntime | None, name: str) -> bool
         return True
     mcp = getattr(runtime, "mcp", None)
     if mcp and mcp.owns(name):
-        return getattr(mcp, "server_for", lambda _name: None)(name) == "playwright"
+        return getattr(mcp, "server_name", lambda _name: None)(name) == "playwright"
     return name.startswith("mcp_playwright_")
 
 
@@ -200,19 +200,35 @@ def _public_browser_policy_failure(runtime: AgentRuntime | None, scenario: Publi
     return None
 
 
-def _install_read_only_guard(runtime: AgentRuntime, scenario: PublicBrowserScenario) -> Any:
-    """Allow bounded Playwright calls before the runtime reaches any tool."""
-    original_dispatch = runtime._run_tool_with_recovery
+def _install_read_only_guard(runtime: AgentRuntime, scenario: PublicBrowserScenario,
+                             calls: list[tuple[str, dict[str, Any]]],
+                             extractions: list[dict[str, str]],
+                             policy_failures: list[str]) -> Any:
+    """Guard the production dispatcher and record only bounded in-memory metrics."""
+    original_dispatch = runtime._run_local_tool
 
     def guarded(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if not _is_playwright_browser_tool(runtime, name):
-            return {"ok": False, "error": "Public browser acceptance allows only bounded Playwright operations.",
+            result = {"ok": False, "error": "Public browser acceptance allows only bounded Playwright operations.",
                     "failure_kind": "forbidden_public_tool"}
+            calls.append((str(name), dict(arguments) if isinstance(arguments, dict) else {}))
+            policy_failures.append("forbidden_public_tool")
+            return result
         failure_kind = _public_browser_policy_failure(runtime, scenario, name, arguments)
         if failure_kind:
-            return {"ok": False, "error": "Public browser acceptance policy rejected this operation.",
+            result = {"ok": False, "error": "Public browser acceptance policy rejected this operation.",
                     "failure_kind": failure_kind}
+            calls.append((str(name), dict(arguments) if isinstance(arguments, dict) else {}))
+            policy_failures.append(failure_kind)
+            return result
+        calls.append((str(name), dict(arguments) if isinstance(arguments, dict) else {}))
         result = original_dispatch(name, arguments)
+        if isinstance(result, dict) and result.get("failure_kind"):
+            policy_failures.append(str(result["failure_kind"]))
+        attempts, untrusted = _collect_batch_evidence(result, extractions)
+        runtime._public_extraction_attempts = int(getattr(runtime, "_public_extraction_attempts", 0)) + attempts
+        runtime._public_untrusted_extractions = int(getattr(runtime, "_public_untrusted_extractions", 0)) + untrusted
+        runtime._public_candidate_count = _candidate_metrics(scenario, extractions)[0]
         observed_urls = _refresh_browser_url(runtime, result)
         if observed_urls and any(
                 not _read_only_navigation_allowed(url, scenario.allowed_domains)
@@ -222,7 +238,7 @@ def _install_read_only_guard(runtime: AgentRuntime, scenario: PublicBrowserScena
                     "failure_kind": "unapproved_navigation"}
         return result
 
-    runtime._run_tool_with_recovery = guarded
+    runtime._run_local_tool = guarded
     return original_dispatch
 
 
@@ -368,34 +384,53 @@ def run_case(scenario: PublicBrowserScenario, *, working_dir: Path, attempt: int
     extraction_attempts = 0
     untrusted_extractions = 0
     policy_failures: list[str] = []
-    original_record = getattr(runtime, "_record_tool_result", None)
-    original_dispatch = _install_read_only_guard(runtime, scenario)
+    original_dispatch = _install_read_only_guard(runtime, scenario, calls, extractions, policy_failures)
     runtime._public_candidate_count = 0
+    runtime._public_extraction_attempts = 0
+    runtime._public_untrusted_extractions = 0
 
-    def record(name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+    def record_probe_metrics(name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
         nonlocal extraction_attempts, untrusted_extractions
-        calls.append((str(name), dict(arguments) if isinstance(arguments, dict) else {}))
         if isinstance(result, dict) and result.get("failure_kind"):
             policy_failures.append(str(result["failure_kind"]))
         attempts, untrusted = _collect_batch_evidence(result, extractions)
         extraction_attempts += attempts
         untrusted_extractions += untrusted
         runtime._public_candidate_count = _candidate_metrics(scenario, extractions)[0]
-        if callable(original_record):
-            original_record(name, arguments, result)
+        runtime._public_extraction_attempts = extraction_attempts
+        runtime._public_untrusted_extractions = untrusted_extractions
+        calls_value = (str(name), dict(arguments) if isinstance(arguments, dict) else {})
+        if not calls or calls[-1] != calls_value:
+            calls.append(calls_value)
 
-    if callable(original_record):
-        runtime._record_tool_result = record
+    # The production probe wraps _run_local_tool. Fixture runtimes use this
+    # callback to emulate the production tool_result bookkeeping without
+    # requiring the removed legacy dispatcher methods.
+    runtime._probe_record = record_probe_metrics
+
+    def sync_metrics() -> None:
+        nonlocal extraction_attempts, untrusted_extractions
+        extraction_attempts = int(getattr(runtime, "_public_extraction_attempts", 0))
+        untrusted_extractions = int(getattr(runtime, "_public_untrusted_extractions", 0))
     observed: list[tuple[str, object]] = []
     handoff_index: int | None = None
     handoff_resumed = False
     failure_kind: str | None = None
     try:
-        if str(getattr(runtime, "browser_backend", "")) != "isolated-playwright":
+        mcp = getattr(runtime, "mcp", None)
+        if not mcp or not bool(getattr(mcp, "is_browser_isolated", lambda: False)()):
             failure_kind = "browser_not_isolated"
             return _public_result(_result(scenario, attempt, started, failure_kind=failure_kind, calls=calls))
-        ok, error_kind = _run_turn(runtime, scenario.prompt, timeout_seconds)
+        task_prompt = scenario.prompt + (
+            " 每次 browser_action_batch 只能包含一个语义动作；navigate、snapshot、wait、extract、verify"
+            " 必须分别调用，不能把 snapshot 放在 navigate 同一批次，也不能在同一批次连续提取多个 ref。"
+            " 先单独 navigate，下一轮单独 snapshot；若结果尚未出现，下一轮单独 wait，随后再单独 snapshot。"
+            " 只从最新 snapshot 中选择实际存在且位于结果条目根节点的 ref；extract 失败时不要重复同一 ref，"
+            " 应改用新的结果条目根 ref 或返回明确失败。无需点击即可完成证据收集时不要点击结果链接。"
+        )
+        ok, error_kind = _run_turn(runtime, task_prompt, timeout_seconds)
         observed.extend(_drain(events))
+        sync_metrics()
         if not ok:
             failure_kind = _turn_failure_kind(error_kind, calls, policy_failures)
             return _public_result(_result(scenario, attempt, started, failure_kind=failure_kind, calls=calls))
@@ -405,13 +440,14 @@ def run_case(scenario: PublicBrowserScenario, *, working_dir: Path, attempt: int
                                           failure_kind="approval_missing", calls=calls))
         ok, error_kind = _run_turn(runtime, "确认 " + token, timeout_seconds)
         observed.extend(_drain(events))
+        sync_metrics()
         if not ok:
             return _public_result(_result(scenario, attempt, started, observed,
                                           failure_kind=_turn_failure_kind(error_kind, calls, policy_failures), calls=calls,
                                           extraction_attempts=extraction_attempts,
                                           untrusted_extractions=untrusted_extractions))
         handoff_index = len(calls)
-        handoff_present = any(kind == "human_verification" for kind, _ in observed)
+        handoff_present = any(kind in {"human_verification", "human_handoff"} for kind, _ in observed)
         if handoff_present:
             if not interactive_handoff:
                 return _public_result(_result(scenario, attempt, started, observed,
@@ -420,6 +456,7 @@ def run_case(scenario: PublicBrowserScenario, *, working_dir: Path, attempt: int
             allowed_continuations = {
                 runtime.HUMAN_VERIFICATION_CONTINUE,
                 "我已完成验证，继续",
+                "我已完成选择，继续",
             }
             if continuation not in allowed_continuations:
                 return _public_result(_result(scenario, attempt, started, observed,
@@ -436,11 +473,13 @@ def run_case(scenario: PublicBrowserScenario, *, working_dir: Path, attempt: int
             event_count_before_resume = len(observed)
             ok, error_kind = _run_turn(runtime, continuation, timeout_seconds)
             observed.extend(_drain(events))
+            sync_metrics()
             if not ok:
                 return _public_result(_result(scenario, attempt, started, observed,
                                                handoff_resumed=True,
                                                failure_kind=_turn_failure_kind(error_kind, calls, policy_failures), calls=calls))
-            if any(kind == "human_verification" for kind, _ in observed[event_count_before_resume:]):
+            if any(kind in {"human_verification", "human_handoff"}
+                   for kind, _ in observed[event_count_before_resume:]):
                 return _public_result(_result(scenario, attempt, started, observed, handoff_resumed=True,
                                                failure_kind="human_verification_persisted", calls=calls))
         return _public_result(_evaluate(scenario, attempt, started, observed, calls, extractions,
@@ -452,9 +491,7 @@ def run_case(scenario: PublicBrowserScenario, *, working_dir: Path, attempt: int
                                       extraction_attempts=extraction_attempts,
                                       untrusted_extractions=untrusted_extractions))
     finally:
-        if callable(original_record):
-            runtime._record_tool_result = original_record
-        runtime._run_tool_with_recovery = original_dispatch
+        runtime._run_local_tool = original_dispatch
         if getattr(runtime, "mcp", None):
             try:
                 runtime.mcp.close()
@@ -501,7 +538,7 @@ def _result(scenario: PublicBrowserScenario, attempt: int, started: float,
             calls: list[tuple[str, dict[str, Any]]] | None = None,
             extraction_attempts: int = 0, untrusted_extractions: int = 0) -> dict[str, Any]:
     events = observed or []
-    handoff_present = any(kind == "human_verification" for kind, _ in events)
+    handoff_present = any(kind in {"human_verification", "human_handoff"} for kind, _ in events)
     approvals = sum(kind == "approval" for kind, _ in events)
     return {
         "case_id": scenario.case_id, "attempt": attempt,

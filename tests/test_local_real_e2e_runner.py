@@ -54,6 +54,12 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["failure_kind"], "human_handoff_timeout")
 
+    def test_dynamic_search_fixture_is_a_local_browser_case(self):
+        cases = load_matrix_cases()
+        case = next(item for item in cases if item["id"] == "research-001")
+        self.assertEqual((case.get("setup") or {}).get("fixture"), "dynamic_search")
+        self.assertTrue(_is_local_browser_case(case))
+
     def test_event_normalization_keeps_only_safe_action_metrics(self):
         events = [
             ("tool", ("desktop_type", {"text": "secret user input", "risk_level": "normal"})),
@@ -68,6 +74,18 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertTrue(result["completed"])
         self.assertTrue(result["verified"])
         self.assertNotIn("text", json.dumps(result))
+
+    def test_event_normalization_counts_semantic_actions_inside_browser_batch(self):
+        events = [
+            ("tool", ("Browser action", {"actions": [
+                {"action": "snapshot", "arguments": {}},
+                {"action": "fill_ref", "arguments": {"ref": "search", "value": "secret"}},
+            ]})),
+        ]
+        result = normalize_runtime_events(events, started_at=0.0, finished_at=1.0)
+        self.assertEqual(result["action_sequence"], ["browser_observe", "browser_input"])
+        self.assertEqual(result["action_steps"], 2)
+        self.assertNotIn("secret", json.dumps(result))
 
     def test_event_normalization_preserves_terminal_failure_category(self):
         result = normalize_runtime_events(
@@ -354,7 +372,6 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         class FakeRuntime:
             def __init__(self):
                 self.ui = Queue()
-                self._record_tool_result = None
 
             def interrupt(self):
                 return None

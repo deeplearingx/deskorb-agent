@@ -17,16 +17,22 @@ class FakeRuntime:
 
     def __init__(self, events, *_args, **kwargs):
         self.events = events
-        self.mcp = None
-        self.browser_backend = "isolated-playwright"
+        self.mcp = SimpleNamespace(
+            is_browser_isolated=lambda: True,
+            owns=lambda name: str(name).startswith("mcp_playwright_"),
+            server_name=lambda _name: "playwright",
+        )
         self.working_dir = Path(kwargs["working_dir"])
         self.turns = []
+        self._probe_record = None
         FakeRuntime.created.append(self)
 
-    def _record_tool_result(self, _name, _arguments, _result):
+    def _probe_record_result(self, _name, _arguments, _result):
+        if callable(self._probe_record):
+            self._probe_record(_name, _arguments, _result)
         return None
 
-    def _run_tool_with_recovery(self, name, arguments):
+    def _run_semantic_tool(self, name, arguments):
         return self._run_local_tool(name, arguments)
 
     def _run_local_tool(self, _name, _arguments):
@@ -44,7 +50,7 @@ class FakeRuntime:
                 {"title": "FastAPI 教程", "source": "FastAPI", "url": "https://fastapi.tiangolo.com/zh/two"},
                 {"title": "FastAPI 指南", "source": "FastAPI", "url": "https://fastapi.tiangolo.com/zh/three"},
             ]
-        self._record_tool_result("browser_action_batch", {"actions": [{"action": "extract", "arguments": {"ref": "card-1", "fields": ["title", "price", "source", "url"]}}]}, {
+        self._probe_record_result("browser_action_batch", {"actions": [{"action": "extract", "arguments": {"ref": "card-1", "fields": ["title", "price", "source", "url"]}}]}, {
             "ok": True,
             "observations": [{"action": "extract", "ref": f"card-{index}",
                               "extraction": {"ref": f"card-{index}", "trusted_ref": True, "fields": item}}
@@ -72,8 +78,8 @@ class ApprovedClickRuntime(FakeRuntime):
             # Bing's contract requires evidence before a public result click.
             self._complete(fastapi=True)
             arguments = {"actions": [{"action": "click_ref", "arguments": {"ref": "result-1"}}]}
-            result = self._run_tool_with_recovery("browser_action_batch", arguments)
-            self._record_tool_result("browser_action_batch", arguments, result)
+            result = self._run_semantic_tool("browser_action_batch", arguments)
+            self._probe_record_result("browser_action_batch", arguments, result)
         else:
             self.events.put(("approval", "Authorize task\n确认 ABCDEF"))
 
@@ -107,7 +113,7 @@ class UntrustedExtractionRuntime(FakeRuntime):
                 {"title": "男士 T 恤 二", "price": "¥130", "url": "https://item.taobao.com/item.htm?id=2"},
                 {"title": "男士 T 恤 三", "price": "¥131", "url": "https://item.taobao.com/item.htm?id=3"},
             ]
-            self._record_tool_result("browser_action_batch", {
+            self._probe_record_result("browser_action_batch", {
                 "actions": [{"action": "extract", "arguments": {"ref": "card-1", "fields": ["title", "price", "url"]}}],
             }, {
                 "ok": True,
@@ -129,7 +135,7 @@ class StaleEvidenceHandoffRuntime(FakeRuntime):
                 {"title": "FastAPI 教程", "source": "FastAPI", "url": "https://fastapi.tiangolo.com/zh/two"},
                 {"title": "FastAPI 指南", "source": "FastAPI", "url": "https://fastapi.tiangolo.com/zh/three"},
             ]
-            self._record_tool_result("browser_action_batch", {
+            self._probe_record_result("browser_action_batch", {
                 "actions": [{"action": "extract", "arguments": {"ref": "card-1", "fields": ["title", "source", "url"]}}],
             }, {
                 "ok": True,
@@ -141,7 +147,7 @@ class StaleEvidenceHandoffRuntime(FakeRuntime):
             self.events.put(("task_progress", {"terminal": None, "verified": False, "waiting_human": True}))
         elif text == self.HUMAN_VERIFICATION_CONTINUE:
             arguments = {"actions": [{"action": "snapshot", "arguments": {}}]}
-            self._record_tool_result("browser_action_batch", arguments, {"ok": True, "observations": [{"action": "snapshot"}]})
+            self._probe_record_result("browser_action_batch", arguments, {"ok": True, "observations": [{"action": "snapshot"}]})
             self.events.put(("task_progress", {"terminal": "completed", "verified": True}))
         else:
             self.events.put(("approval", "Authorize task\n确认 ABCDEF"))
@@ -165,7 +171,7 @@ class UnsafeRuntime(FakeRuntime):
     def run_turn(self, text, _images):
         self.turns.append(text)
         if text.startswith("确认 "):
-            self._record_tool_result("browser_action_batch", {"actions": [{"action": "fill_ref", "arguments": {"ref": "e1", "value": "unsafe"}}]}, {"ok": True})
+            self._probe_record_result("browser_action_batch", {"actions": [{"action": "fill_ref", "arguments": {"ref": "e1", "value": "unsafe"}}]}, {"ok": True})
             self.events.put(("tool", ("MCP browser tool", {"name": "browser_type"})))
             self.events.put(("task_progress", {"terminal": "completed", "verified": True}))
         else:
@@ -186,8 +192,8 @@ class GuardedUnsafeRuntime(FakeRuntime):
         self.turns.append(text)
         if text.startswith("确认 "):
             arguments = {"actions": [{"action": "fill_ref", "arguments": {"ref": "e1", "value": "unsafe"}}]}
-            result = self._run_tool_with_recovery("browser_action_batch", arguments)
-            self._record_tool_result("browser_action_batch", arguments, result)
+            result = self._run_semantic_tool("browser_action_batch", arguments)
+            self._probe_record_result("browser_action_batch", arguments, result)
             self.events.put(("task_progress", {"terminal": "completed", "verified": True}))
         else:
             self.events.put(("approval", "Authorize task\n确认 ABCDEF"))
@@ -206,8 +212,8 @@ class NonBrowserRuntime(FakeRuntime):
         self.turns.append(text)
         if text.startswith("确认 "):
             arguments = {"path": "outside-scope.txt", "content": "untrusted"}
-            result = self._run_tool_with_recovery("filesystem_write", arguments)
-            self._record_tool_result("filesystem_write", arguments, result)
+            result = self._run_semantic_tool("filesystem_write", arguments)
+            self._probe_record_result("filesystem_write", arguments, result)
             self.events.put(("task_progress", {"terminal": "completed", "verified": True}))
         else:
             self.events.put(("approval", "Authorize task\n确认 ABCDEF"))
@@ -432,15 +438,20 @@ class PublicBrowserProbeTests(unittest.TestCase):
             def __init__(self):
                 self._browser_current_url = "https://www.bing.com/search?q=FastAPI"
                 self._public_candidate_count = 3
+                self.mcp = SimpleNamespace(
+                    owns=lambda name: str(name).startswith("mcp_playwright_"),
+                    server_name=lambda _name: "playwright",
+                )
 
-            def _run_tool_with_recovery(self, _name, _arguments):
+            def _run_local_tool(self, _name, _arguments):
                 return {"ok": True, "observations": [{
                     "action": "snapshot", "content": "- Page URL: https://ads.example.test/redirect\n",
                 }]}
 
         runtime = RedirectingRuntime()
-        probe._install_read_only_guard(runtime, probe.SCENARIOS["bing-fastapi"])
-        result = runtime._run_tool_with_recovery(
+        calls, extractions, failures = [], [], []
+        probe._install_read_only_guard(runtime, probe.SCENARIOS["bing-fastapi"], calls, extractions, failures)
+        result = runtime._run_local_tool(
             "browser_action_batch", {
                 "actions": [{"action": "click_ref", "arguments": {"ref": "result-1"}}],
             })

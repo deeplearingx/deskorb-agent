@@ -104,6 +104,20 @@ class TaskWorkflowTests(unittest.TestCase):
         self.assertTrue(progress["verified"])
         self.assertEqual(progress["terminal"], "completed")
 
+    def test_browser_protocol_rejection_can_be_retried_without_false_failure(self):
+        contract = TaskContract.from_goal("浏览器搜索结果", requires_action=True)
+        workflow = TaskWorkflow("T-browser-retry", contract.goal, contract=contract)
+        workflow.record_tool_result("browser_action_batch", {
+            "ok": False, "failure_kind": "invalid_browser_action_batch",
+        })
+        workflow.record_tool_result("browser_action_batch", {
+            "ok": True,
+            "verification": {"passed": True, "kind": "browser_structured_verification"},
+        })
+        progress = workflow.finish("completed")
+        self.assertTrue(progress["verified"])
+        self.assertEqual(progress["terminal"], "completed")
+
     def test_verified_write_and_state_change_supply_evidence(self):
         workflow = TaskWorkflow("T2", "Write a file")
         workflow.record_tool_result("filesystem_write", {"ok": True, "verified": True})
@@ -181,6 +195,20 @@ class TaskWorkflowTests(unittest.TestCase):
             requires_action=True,
         )
         self.assertIn("browser_structured_verification", contract.required_evidence_schemas)
+        self.assertNotIn("desktop_state_delta", contract.required_evidence_schemas)
+
+    def test_browser_contract_uses_requested_source_field_without_forcing_url(self):
+        contract = TaskContract.from_goal(
+            "浏览器搜索结果，返回标题和来源",
+            requires_action=True,
+        )
+        self.assertEqual(contract.browser_postconditions()["required_fields"], ["title", "source"])
+
+    def test_negative_browser_desktop_fallback_language_does_not_add_desktop_contract(self):
+        contract = TaskContract.from_goal(
+            "浏览器搜索结果并返回来源，不要使用地址栏或桌面坐标",
+            requires_action=True,
+        )
         self.assertNotIn("desktop_state_delta", contract.required_evidence_schemas)
 
     def test_message_task_requires_delivery_evidence_not_just_draft(self):

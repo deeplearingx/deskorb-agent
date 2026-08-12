@@ -101,7 +101,18 @@ class TaskContract:
                     predicates.append({"type": "origin", "value": origin})
                     break
             if any(marker in text for marker in ("搜索", "资料", "商品", "结果", "search", "research")):
-                predicates.append({"type": "required_fields", "fields": ["title", "url"]})
+                # Derive the evidence contract from the fields the user asks
+                # to report. A source-only research result must not be blocked
+                # by an unrelated URL requirement, while an unspecified
+                # browser search keeps the conservative title+URL default.
+                fields = ["title"]
+                if any(marker in text for marker in ("来源", "source")):
+                    fields.append("source")
+                if any(marker in text for marker in ("链接", "网址", "url", "link", "详情")):
+                    fields.append("url")
+                if len(fields) == 1:
+                    fields.append("url")
+                predicates.append({"type": "required_fields", "fields": fields})
         # Message delivery is a separate evidence domain from editing a draft:
         # typing text or dispatching a send button is not proof that the target
         # application delivered it.  QQ's UIA profile emits a bounded delivery
@@ -120,7 +131,17 @@ class TaskContract:
         # goal explicitly names a desktop/window/control/application concern.
         desktop_markers = ("窗口", "记事本", "桌面", "应用", "qq", "计算器",
                            "window", "desktop", "notepad", "calculator", "application")
-        explicit_desktop = any(_contains_marker(text, marker) for marker in desktop_markers)
+        def positive_marker(marker: str) -> bool:
+            pattern = (r"(?<![a-z0-9])" + re.escape(marker) + r"(?![a-z0-9])"
+                       if marker.isascii() and marker.isalnum() else re.escape(marker))
+            for match in re.finditer(pattern, text):
+                prefix = text[max(0, match.start() - 18):match.start()]
+                if re.search(r"不要|禁止|不使用|不操作|不切换|never|don't|do not|without|not use", prefix):
+                    continue
+                return True
+            return False
+
+        explicit_desktop = any(positive_marker(marker) for marker in desktop_markers)
         # Browser prompts often mention that the agent must not type into a
         # search box.  That is a browser policy constraint, not a desktop UI
         # action.  Keep the generic input marker only for non-browser tasks;
@@ -212,11 +233,25 @@ class TaskContract:
 
     @staticmethod
     def _failed_node_was_retried(node: WorkflowNode, nodes: list[WorkflowNode]) -> bool:
-        if node.failure_kind != "desktop_focus_failure":
+        failure_kind = str(node.failure_kind or "")
+        retryable = failure_kind == "desktop_focus_failure" or failure_kind.startswith("browser_") \
+            or failure_kind.startswith("multiple_browser_") \
+            or failure_kind == "invalid_browser_action_batch"
+        if not retryable:
             return False
-        return any(later.node_id > node.node_id and later.label == node.label
-                   and later.status is NodeStatus.SUCCEEDED
-                   for later in nodes)
+        later_success = [later for later in nodes
+                         if later.node_id > node.node_id
+                         and later.label == node.label
+                         and later.status is NodeStatus.SUCCEEDED]
+        if failure_kind == "desktop_focus_failure":
+            # Focus rejection is a precondition failure: the action itself was
+            # not sent, so a later successful same action is sufficient.
+            return bool(later_success)
+        # Browser protocol failures do not perform a page side effect. They
+        # are cleared only when the same semantic entry later supplies
+        # structured browser evidence, avoiding a false success from a later
+        # prose-only response.
+        return any(later.evidence for later in later_success)
 
 
 class TaskWorkflow:
@@ -243,6 +278,8 @@ class TaskWorkflow:
                            precondition: dict[str, Any] | None = None,
                            retry_policy: dict[str, Any] | None = None) -> WorkflowNode:
         ok = bool(result.get("ok")) if isinstance(result, dict) else False
+        if failure_kind is None and not ok and isinstance(result, dict):
+            failure_kind = str(result.get("failure_kind") or "").strip() or None
         evidence = ok and self._has_verifiable_evidence(str(tool_name), result)
         return self._append("verification" if evidence else "action", str(tool_name),
                             NodeStatus.SUCCEEDED if ok else NodeStatus.FAILED,

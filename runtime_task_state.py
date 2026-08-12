@@ -39,6 +39,9 @@ def _tool_failure_kind(result: dict[str, Any]) -> str | None:
     """Normalize an unsuccessful tool result to a non-empty stable category."""
     if bool(result.get("ok")):
         return None
+    explicit = str(result.get("failure_kind") or "").strip()
+    if explicit:
+        return explicit[:80]
     category = classify_failure(result.get("error"))
     return "tool_failure" if category == "unknown" else category
 
@@ -82,7 +85,15 @@ class RuntimeTaskState:
         if failure:
             self.last_failure_kind = failure
         node = self.workflow.record_tool_result(str(tool_name), safe_result, failure_kind=failure)
-        if node.kind in {"action", "verification"}:
+        if str(tool_name) == "browser_action_batch":
+            # A batch is one model tool call but contains multiple semantic
+            # browser actions. Metrics use the latter so step efficiency does
+            # not improve artificially merely by packing actions together.
+            try:
+                self.action_steps += max(1, int(safe_result.get("batch_action_steps") or 1))
+            except (TypeError, ValueError):
+                self.action_steps += 1
+        elif node.kind in {"action", "verification"}:
             self.action_steps += 1
         self.journal.event(self.task_id, "workflow_node", _node_data(node))
         self.journal.event(self.task_id, "tool_result", {

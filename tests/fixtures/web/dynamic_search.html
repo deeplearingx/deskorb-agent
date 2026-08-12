@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>DeskOrb 动态搜索夹具</title></head>
+<body>
+  <main>
+    <label for="search">搜索学习资料</label>
+    <input id="search" role="combobox" autocomplete="off" aria-expanded="false">
+    <div id="suggestions" role="listbox" hidden></div>
+    <section id="result" aria-live="polite">
+      <p>尚未选择结果</p>
+    </section>
+  </main>
+  <script>
+    const input = document.querySelector('#search');
+    const list = document.querySelector('#suggestions');
+    const result = document.querySelector('#result');
+    const options = [
+      ['Python asyncio 入门', '官方文档'],
+      ['Python asyncio 实战', 'Real Python']
+    ];
+    input.addEventListener('input', () => {
+      list.replaceChildren();
+      input.setAttribute('aria-expanded', 'false');
+      list.hidden = true;
+      window.setTimeout(() => {
+        if (!input.value.trim()) return;
+        for (const [label, source] of options) {
+          const option = document.createElement('button');
+          option.type = 'button';
+          option.setAttribute('role', 'option');
+          option.textContent = label;
+          option.dataset.source = source;
+          option.addEventListener('click', () => {
+            input.value = label;
+            input.setAttribute('aria-expanded', 'false');
+            list.hidden = true;
+            result.replaceChildren();
+            const title = document.createElement('h2');
+            title.textContent = label;
+            const sourceLine = document.createElement('p');
+            sourceLine.textContent = `来源：${source}`;
+            result.append(title, sourceLine);
+            result.dataset.selected = label;
+          });
+          list.append(option);
+        }
+        input.setAttribute('aria-expanded', 'true');
+        list.hidden = false;
+      }, 120);
+    });
+  </script>
+</body>
+</html>

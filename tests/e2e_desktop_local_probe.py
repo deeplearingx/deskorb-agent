@@ -223,9 +223,12 @@ def main() -> int:
             scripted = ScriptedDesktopModel(root, entry, target_hwnd)
             runtime._request = scripted
             tool_results: list[dict[str, object]] = []
-            original_record = runtime._record_tool_result
+            # The production runtime publishes bounded tool telemetry through
+            # _publish_tool_result.  Keep the desktop probe on that stable
+            # interface instead of the removed browser-era dispatcher hook.
+            original_publish = runtime._publish_tool_result
 
-            def record_tool_result(name, arguments, result):
+            def publish_tool_result(name, arguments, result):
                 if isinstance(result, dict):
                     tool_results.append({
                         "tool": str(name)[:48], "ok": bool(result.get("ok")),
@@ -234,9 +237,9 @@ def main() -> int:
                         "active_window_changed": result.get("active_window_changed"),
                         "error": str(result.get("error") or "")[:120],
                     })
-                return original_record(name, arguments, result)
+                return original_publish(name, arguments, result)
 
-            runtime._record_tool_result = record_tool_result
+            runtime._publish_tool_result = publish_tool_result
             with patch("agent_runtime.get_api_key", return_value="fixture-key"):
                 runtime.run_turn("在当前隔离测试窗口输入 DESKORB_DESKTOP_E2E 并验证桌面变化", [])
                 first = drain(events)

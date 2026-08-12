@@ -29,6 +29,9 @@ from mcp_client import MCPError, MCPToolBridge
 from model_adapter import ModelAdapter
 from conversation_context import ConversationContext
 from credential_store import get_api_key
+from desktop_activity_indicator import ACTIVITY_TOOLS, BROWSER_ACTIVITY_TOOLS, DesktopActivityEvent, DESKTOP_ACTIVITY_TOOLS
+from browser_actions import STATE_CHANGING_ACTIONS
+from browser_runtime import BrowserExecutionSession, PlaywrightMCPBackend
 from responses_tool_protocol import continue_input, function_call_output, function_calls
 from runtime_task_state import RuntimeTaskState
 from task_runtime import InMemoryTaskJournal, classify_failure
@@ -330,6 +333,7 @@ class AgentRuntime:
     TASK_AUTHORIZATION_SECONDS = 600
     TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
     HUMAN_VERIFICATION_TIMEOUT_SECONDS = 900
+    BROWSER_HANDOFF_TIMEOUT_SECONDS = 120
     HUMAN_VERIFICATION_CONTINUE = "__deskorb_human_verification_complete__"
     HUMAN_VERIFICATION_CANCEL = "__deskorb_human_verification_cancel__"
     CAPTCHA_MARKERS = (
@@ -338,6 +342,10 @@ class AgentRuntime:
     )
     DESKTOP_ACTION_TOOLS = {"application_launch", "desktop_click", "desktop_type",
                             "desktop_hotkey", "desktop_scroll", "window_focus", "window_control"}
+    BROWSER_TASK_MARKERS = (
+        "浏览器", "网页", "网站", "搜索", "淘宝", "京东", "百度", "google", "browser",
+        "website", "web page", "search", "http://", "https://",
+    )
 
     def __init__(self, ui_queue, model: str, api_base_url: str, api_proxy_url: str = "",
                  working_dir: str | Path = WORKING_DIR, full_access: bool = True,
@@ -374,6 +382,7 @@ class AgentRuntime:
         # The transcript is kept in memory only while the user completes a CAPTCHA in
         # the already-open, local MCP browser.  It never contains CAPTCHA answers.
         self._pending_human_verification: dict[str, Any] | None = None
+        self._human_handoff_timer: threading.Timer | None = None
         self._task_authorized_until = 0.0
         self._task_mcp_servers: set[str] = set()
         self.task_journal = task_journal if task_journal is not None else InMemoryTaskJournal()
@@ -381,6 +390,9 @@ class AgentRuntime:
         self._desktop_target_launches = 0
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
+        self._browser_session: BrowserExecutionSession | None = None
+        self._browser_activity_ids: dict[str, int] = {}
+        self._next_desktop_activity_id = 0
 
     def configure(self, model: str, api_base_url: str, api_proxy_url: str = "",
                   model_provider: str | None = None):
@@ -394,12 +406,15 @@ class AgentRuntime:
         self.approvals.pending = None
         self._pending_execution = None
         self._pending_human_verification = None
+        self._cancel_human_handoff_timer()
         self._task_authorized_until = 0.0
         self._task_mcp_servers.clear()
         self._task_state = None
         self._desktop_target_launches = 0
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
+        self._browser_session = None
+        self._browser_activity_ids.clear()
         self.desktop.clear_target_window()
 
     def reset(self):
@@ -407,12 +422,15 @@ class AgentRuntime:
         self.approvals.pending = None
         self._pending_execution = None
         self._pending_human_verification = None
+        self._cancel_human_handoff_timer()
         self._task_authorized_until = 0.0
         self._task_mcp_servers.clear()
         self._task_state = None
         self._desktop_target_launches = 0
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
+        self._browser_session = None
+        self._browser_activity_ids.clear()
         self.desktop.clear_target_window()
 
     def compact(self, force: bool = True) -> dict[str, int] | None:
@@ -439,6 +457,8 @@ class AgentRuntime:
     def interrupt(self):
         self._cancelled.set()
         self._pending_human_verification = None
+        self._cancel_human_handoff_timer()
+        self._browser_activity_ids.clear()
         self._task_authorized_until = 0.0
         with self._response_lock:
             response = self._active_response
@@ -556,10 +576,30 @@ class AgentRuntime:
             "high_risk": bool(self._high_risk_call(name, arguments)),
         }
         if not payload["ok"]:
-            category = classify_failure(result.get("error") if isinstance(result, dict) else None)
-            payload["failure_kind"] = "tool_failure" if category == "unknown" else category
+            explicit = str(result.get("failure_kind") or "").strip() if isinstance(result, dict) else ""
+            if explicit:
+                payload["failure_kind"] = explicit[:80]
+            else:
+                category = classify_failure(result.get("error") if isinstance(result, dict) else None)
+                payload["failure_kind"] = "tool_failure" if category == "unknown" else category
         if isinstance(result, dict) and isinstance(result.get("exit_code"), int):
             payload["exit_code"] = int(result["exit_code"])
+        if name == "browser_action_batch":
+            actions = arguments.get("actions") if isinstance(arguments, dict) else []
+            payload.update({
+                "action_types": [str(item.get("action") or "") for item in actions
+                                if isinstance(item, dict)],
+                "state_changed": bool(isinstance(result, dict) and result.get("state_changed")),
+                "extraction_count": int(bool(isinstance(result, dict) and result.get("extraction"))),
+                "verification_passed": bool(
+                    isinstance(result, dict)
+                    and isinstance(result.get("verification"), dict)
+                    and result["verification"].get("passed")
+                ),
+                "failure_kind": (str(result.get("failure_kind")) if isinstance(result, dict)
+                                  and result.get("failure_kind") else payload.get("failure_kind")),
+                "action_steps": int(result.get("action_steps") or 0) if isinstance(result, dict) else 0,
+            })
         self.ui.put(("tool_result", payload))
 
     def _block_empty_input(self) -> None:
@@ -589,26 +629,45 @@ class AgentRuntime:
         verification_status, continuation = self._resolve_human_verification(text)
         if verification_status == "cancelled":
             self._task_authorized_until = 0.0
-            self.ui.put(("system", "Captcha handoff cancelled. The browser was left unchanged."))
+            self.ui.put(("system", "Browser handoff cancelled. The browser was left unchanged."
+                        if continuation and continuation.get("kind") == "browser_no_progress"
+                        else "Captcha handoff cancelled. The browser was left unchanged."))
             return
         if verification_status == "expired":
             self._task_authorized_until = 0.0
-            self.ui.put(("system", "Captcha handoff expired. Please start the task again."))
+            if continuation and continuation.get("kind") == "browser_no_progress":
+                self.ui.put(("system", "Browser handoff expired. Please start the task again."))
+                self._finish_task("blocked", failure_kind="browser_handoff_timeout")
+            else:
+                self.ui.put(("system", "Captcha handoff expired. Please start the task again."))
             return
         if verification_status == "waiting":
-            self.ui.put(("system", "A CAPTCHA handoff is waiting. Complete it in the browser, then click ‘我已完成验证，继续’."))
+            self.ui.put(("system", "A browser handoff is waiting. Complete the current page selection, then click ‘我已完成选择，继续’."
+                        if continuation and continuation.get("kind") == "browser_no_progress"
+                        else "A CAPTCHA handoff is waiting. Complete it in the browser, then click ‘我已完成验证，继续’.") )
             return
         if verification_status == "resume" and continuation:
             if self._task_state is not None:
                 self._task_state.resumed_by_human()
             transcript = list(continuation["transcript"])
-            transcript.append({"role": "user", "content": [{
-                "type": "input_text",
-                "text": ("The user states that they completed the CAPTCHA manually in the existing browser. "
-                         "Do not assume success: first take a fresh page snapshot, then continue the original task. "
-                         "Never ask for or reproduce a CAPTCHA solution."),
-            }]})
-            self.ui.put(("system", "✓ Manual verification acknowledged. Rechecking the page and continuing the task."))
+            if continuation.get("kind") == "browser_no_progress":
+                if self._browser_session is not None:
+                    self._browser_session.resume_after_handoff()
+                transcript.append({"role": "user", "content": [{
+                    "type": "input_text",
+                    "text": ("The user states that they completed the current page selection manually. "
+                             "Do not assume success: first call browser_action_batch with a fresh snapshot. "
+                             "All previous browser refs and evidence are invalid; do not use desktop coordinates."),
+                }]})
+                self.ui.put(("system", "✓ Browser handoff acknowledged. Rechecking the page and continuing the task."))
+            else:
+                transcript.append({"role": "user", "content": [{
+                    "type": "input_text",
+                    "text": ("The user states that they completed the CAPTCHA manually in the existing browser. "
+                             "Do not assume success: first take a fresh page snapshot, then continue the original task. "
+                             "Never ask for or reproduce a CAPTCHA solution."),
+                }]})
+                self.ui.put(("system", "✓ Manual verification acknowledged. Rechecking the page and continuing the task."))
             return self._run_task_loop(api_key, transcript, str(continuation["original_text"]),
                                        bool(continuation["ephemeral"]))
         approval_status, approval = self.approvals.resolve(text)
@@ -626,6 +685,7 @@ class AgentRuntime:
             self._task_mcp_servers.clear()
             self._browser_recovery_attempts = 0
             self._browser_reobservation_required = False
+            self._browser_session = None
             if self._task_state is None:
                 self._desktop_target_launches = 0
         if not ephemeral:
@@ -655,7 +715,7 @@ class AgentRuntime:
                 arguments = json.loads(call.arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError("arguments must be an object")
-                result = self._run_local_tool(call.name, arguments)
+                result = self._run_desktop_action(call.name, arguments)
             except (json.JSONDecodeError, ValueError) as exc:
                 result = {"ok": False, "error": f"Invalid confirmed function call: {exc}"}
             self._task_state.record_tool_result(call.name, result)
@@ -691,7 +751,7 @@ class AgentRuntime:
             "\nYou are the independent DeskOrb Agent Runtime. You may inspect the active window and files below the configured working directory. "
             "When Full access is enabled and the user explicitly asks for a local change, filesystem_write may be used and its result is verified by rereading the file. "
             "When the user asks to open or launch Chrome, Edge, Firefox, QQ, Explorer, Notepad, or Calculator, call application_launch immediately with the matching application name. Never substitute a different application, claim you cannot open it, or tell the user to click its desktop icon. When the user explicitly asks to run a shell command, call shell_run immediately; never ask for confirmation in prose, because the runtime itself handles confirmation. To manage windows, first call desktop_list_windows and then use window_control with the returned short-lived window_id; prefer this over guessing coordinates. Before the first coordinate or keyboard action, call desktop_capture_state and use its snapshot ID. After every desktop action, the runtime automatically supplies a fresh screenshot and snapshot ID so you can inspect the result and continue the whole task. "
-            "When local MCP browser tools are available, use their structured page snapshots and actions instead of screen coordinates for web tasks. If mcp_enable_server is available and the request matches a listed integration, call it before attempting that integration; it only enables schemas for one trusted local server and does not perform the user's action. A single task authorization covers normal application launch, clicking, typing, hotkeys, scrolling, window focus, and normal MCP browser actions for that task. Mark desktop_click, desktop_type, desktop_hotkey, and action MCP tools with risk_level=high only when the specific step sends or publishes content, purchases or transfers value, exposes secrets or personal data, deletes data, changes permissions/security, uploads private data, or accepts an irreversible prompt; give a concise risk_reason. High-risk steps and every shell command require a fresh confirmation. Use risk_level=normal with a short reason for ordinary navigation and search. If an MCP page snapshot or result shows a CAPTCHA, ‘快速验证身份’, ‘我是人类’, or similar human-verification screen, do not solve, bypass, or repeatedly retry it. The runtime will pause and request a manual handoff. Continue autonomously until the requested outcome is verified, then answer concisely with what you completed."
+            "For browser tasks, use only browser_action_batch. It exposes a bounded semantic contract over the isolated local Playwright MCP backend; raw mcp_playwright_* tools are internal and unavailable. Start with a separate snapshot, then use the returned observation_id and ref for one state action at a time. A state action is automatically followed by a fresh snapshot. If the page does not change, relocate once from the fresh snapshot; do not repeat the same input or fall back to screen coordinates, the address bar, or desktop tools. Use extract followed by verify for structured completion evidence. If the runtime requests human handoff, ask the user to complete the current page selection and then continue only after a fresh snapshot. If mcp_enable_server is available and the request matches a listed integration, call it before attempting that integration; it only enables schemas for one trusted local server and does not perform the user's action. A single task authorization covers normal application launch, clicking, typing, hotkeys, scrolling, window focus, and normal browser actions for that task. High-risk steps and every shell command require a fresh confirmation. If a browser snapshot or result shows a CAPTCHA, ‘快速验证身份’, ‘我是人类’, or similar human-verification screen, do not solve, bypass, or repeatedly retry it. The runtime will pause and request a manual handoff. Continue autonomously until the requested outcome is verified, then answer concisely with what you completed."
             "Maintain a compact action ledger from tool results. Do not repeat an identical successful observation or verification command unless a state-changing action occurred; never loop on verification. Once the required postcondition and evidence are satisfied, stop calling tools and return the final answer."
             "If the task or evaluation names required semantic steps, treat them as hard acceptance conditions: map filesystem_write to an actual filesystem_write call and shell_verify to one non-destructive shell_run verification command; do not substitute a file reread for shell verification."
             "In Full access, execute requested actions automatically. Ask for confirmation only before deleting files; the runtime detects common deletion commands inside shell_run. Do not ask for confirmation in prose. "
@@ -718,6 +778,7 @@ class AgentRuntime:
                     self._finish_task("completed")
                 return
             outputs = []
+            state_action_seen = False
             for call in calls:
                 arguments: dict[str, Any] = {}
                 try:
@@ -725,8 +786,28 @@ class AgentRuntime:
                     if not isinstance(arguments, dict):
                         raise ValueError("arguments must be an object")
                     self.ui.put(("tool", (self._tool_label(call.name), arguments)))
+                    if call.name == "browser_action_batch":
+                        batch_actions = arguments.get("actions") or []
+                        state_actions = [
+                            item for item in batch_actions
+                            if isinstance(item, dict) and str(item.get("action") or "") in STATE_CHANGING_ACTIONS
+                        ]
+                        if state_action_seen or len(state_actions) > 1:
+                            result = {
+                                "ok": False,
+                                "failure_kind": "multiple_browser_state_actions",
+                                "error": ("Only one browser state-changing action is allowed per model response. "
+                                          "Retry immediately with a fresh snapshot in its own batch, then "
+                                          "perform exactly one final state action in a later batch."),
+                                "requires_reobservation": True,
+                            }
+                            self._task_state.record_tool_result(call.name, result) if self._task_state else None
+                            self._publish_tool_result(call.name, arguments, result)
+                            outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
+                            continue
+                        state_action_seen = bool(state_actions)
                     if self._officecli_auto_approval(call.name, arguments):
-                        result = self._run_local_tool(call.name, arguments)
+                        result = self._run_desktop_action(call.name, arguments)
                     else:
                         high_risk = self._high_risk_call(call.name, arguments)
                         decision = self.policy.decide(
@@ -748,13 +829,22 @@ class AgentRuntime:
                             self._pending_execution = (call, continue_input(transcript, response, []), original_text)
                             return
                         else:
-                            result = self._run_local_tool(call.name, arguments)
+                            result = self._run_desktop_action(call.name, arguments)
                 except (json.JSONDecodeError, ValueError) as exc:
                     result = {"ok": False, "error": f"Invalid function call: {exc}"}
                 if not ephemeral and self._task_state is not None:
                     self._task_state.record_tool_result(call.name, result)
                     self._publish_tool_result(call.name, arguments, result)
                 outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
+                browser_handoff = self._browser_handoff_reason(call.name, result)
+                if browser_handoff:
+                    if not ephemeral and self._task_state is not None:
+                        self._task_state.waiting_for_human(browser_handoff)
+                    continuation = continue_input(transcript, response, outputs)
+                    self._pause_for_human_handoff(
+                        continuation, original_text, ephemeral, browser_handoff, arguments,
+                    )
+                    return
                 captcha_marker = self._captcha_marker(call.name, result)
                 if captcha_marker:
                     if not ephemeral and self._task_state is not None:
@@ -782,25 +872,31 @@ class AgentRuntime:
             return "none", None
         if time.monotonic() > float(pending["expires_at"]):
             self._pending_human_verification = None
+            self._cancel_human_handoff_timer()
             return "expired", pending
         normalized = str(text or "").strip().lower()
         if normalized in {self.HUMAN_VERIFICATION_CANCEL, "取消", "cancel"}:
             self._pending_human_verification = None
+            self._cancel_human_handoff_timer()
             return "cancelled", pending
         if normalized in {
             self.HUMAN_VERIFICATION_CONTINUE, "我已完成验证", "验证完成", "已完成验证",
+            "我已完成选择，继续",
             "captcha complete", "verification complete",
         }:
             self._pending_human_verification = None
+            self._cancel_human_handoff_timer()
             return "resume", pending
         return "waiting", pending
 
     def _pause_for_human_verification(self, transcript: list[dict[str, Any]], original_text: str,
                                       ephemeral: bool, marker: str, arguments: dict[str, Any]) -> None:
+        self._cancel_human_handoff_timer()
         self._pending_human_verification = {
             "transcript": transcript,
             "original_text": original_text,
             "ephemeral": ephemeral,
+            "kind": "captcha",
             "expires_at": time.monotonic() + self.HUMAN_VERIFICATION_TIMEOUT_SECONDS,
         }
         url = str(arguments.get("url") or arguments.get("target") or "当前浏览器页面")[:240]
@@ -810,9 +906,59 @@ class AgentRuntime:
             "timeout_seconds": self.HUMAN_VERIFICATION_TIMEOUT_SECONDS,
         }))
 
+    def _pause_for_human_handoff(self, transcript: list[dict[str, Any]], original_text: str,
+                                 ephemeral: bool, reason: str, arguments: dict[str, Any]) -> None:
+        """Pause a browser task for a bounded, non-CAPTCHA manual handoff."""
+        timeout = self.BROWSER_HANDOFF_TIMEOUT_SECONDS
+        self._cancel_human_handoff_timer()
+        pending = {
+            "transcript": transcript,
+            "original_text": original_text,
+            "ephemeral": ephemeral,
+            "kind": "browser_no_progress",
+            "reason": reason,
+            "expires_at": time.monotonic() + timeout,
+        }
+        self._pending_human_verification = pending
+        page = str(arguments.get("url") or arguments.get("target") or "当前浏览器页面")[:240]
+        self.ui.put(("human_handoff", {
+            "reason": reason,
+            "page": page,
+            "timeout_seconds": timeout,
+        }))
+        timer = threading.Timer(timeout, self._expire_browser_handoff, args=(pending,))
+        timer.daemon = True
+        self._human_handoff_timer = timer
+        timer.start()
+
+    def _expire_browser_handoff(self, pending: dict[str, Any]) -> None:
+        if self._pending_human_verification is not pending:
+            return
+        self._pending_human_verification = None
+        self._human_handoff_timer = None
+        self._task_authorized_until = 0.0
+        self.ui.put(("human_handoff_timeout", {"reason": "browser_no_progress", "terminal": "blocked"}))
+        self._finish_task("blocked", failure_kind="browser_handoff_timeout")
+
+    def _cancel_human_handoff_timer(self) -> None:
+        timer = self._human_handoff_timer
+        self._human_handoff_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    @staticmethod
+    def _browser_handoff_reason(tool_name: str, result: dict[str, Any]) -> str | None:
+        if tool_name != "browser_action_batch" or not isinstance(result, dict):
+            return None
+        if result.get("handoff_required"):
+            return str(result.get("failure_kind") or "browser_no_progress")
+        return None
+
     def _captcha_marker(self, tool_name: str, result: dict[str, Any]) -> str | None:
         """Return a detected CAPTCHA marker only from a successful MCP browser result."""
-        if not (self.mcp and self.mcp.owns(tool_name)) or not isinstance(result, dict) or not result.get("ok"):
+        is_semantic_browser = tool_name == "browser_action_batch"
+        if not ((self.mcp and self.mcp.owns(tool_name)) or is_semantic_browser) \
+                or not isinstance(result, dict) or not result.get("ok"):
             return None
         try:
             evidence = json.dumps(result.get("content", result), ensure_ascii=False).lower()
@@ -883,14 +1029,159 @@ class AgentRuntime:
 
     def _available_schemas(self, task_text: str) -> list[dict[str, Any]]:
         schemas = self.tools.schemas()
+        browser_task = self._browser_task_requested(task_text)
+        if browser_task:
+            # A browser task must not give the model a second path through
+            # desktop coordinates, address-bar typing, or generic filesystem
+            # tools. The isolated browser backend owns startup and navigation.
+            schemas = []
+            # Keep a fail-closed semantic entry available even if the local MCP
+            # installation is missing; the dispatcher then returns a bounded
+            # backend-unavailable result instead of allowing coordinate fallback.
+            schemas.append(self._browser_action_batch_schema())
         if self.mcp:
             servers = set(self._mcp_servers_for_task(task_text)) | self._task_mcp_servers
-            if servers:
-                schemas.extend(self.mcp.schemas(servers))
+            if "playwright" in servers:
+                # Discover the trusted raw backend, but never put its
+                # overlapping Playwright functions in the model prompt.  The
+                # semantic runtime below is the only browser entry point.
+                self.mcp.schemas(("playwright",))
+                schemas = [item for item in schemas if item.get("name") != "browser_action_batch"]
+                schemas.append(self._browser_action_batch_schema())
+            other_servers = servers - {"playwright"}
+            if other_servers:
+                schemas.extend(self.mcp.schemas(other_servers))
             discovery = self._mcp_discovery_schema()
             if discovery:
                 schemas.append(discovery)
         return schemas
+
+    @classmethod
+    def _browser_task_requested(cls, text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(marker in lowered for marker in cls.BROWSER_TASK_MARKERS)
+
+    @staticmethod
+    def _browser_action_batch_schema() -> dict[str, Any]:
+        common = {
+            "observation_id": {"type": "string", "description": "Latest opaque observation token."},
+            "ref": {"type": "string", "description": "Current accessibility ref from that observation."},
+        }
+        action_variants = [
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["navigate"]},
+                    "arguments": {"type": "object", "properties": {
+                        "url": {"type": "string"},
+                    }, "required": ["url"], "additionalProperties": False},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["snapshot"]},
+                    "arguments": {"type": "object", "additionalProperties": False},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["fill_ref"]},
+                    "arguments": {"type": "object", "properties": {
+                        **common, "value": {"type": "string"}, "text": {"type": "string"},
+                    }, "required": ["ref", "observation_id", "value"], "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["click_ref"]},
+                    "arguments": {"type": "object", "properties": {
+                        **common,
+                    }, "required": ["ref", "observation_id"], "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["select_ref"]},
+                    "arguments": {"type": "object", "properties": {
+                        **common, "values": {"type": "array", "items": {"type": "string"}},
+                    }, "required": ["ref", "observation_id", "values"], "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["wait"]},
+                    "arguments": {"type": "object", "properties": {
+                        "seconds": {"type": "number", "minimum": 0, "maximum": 30},
+                        "time": {"type": "number", "minimum": 0, "maximum": 30},
+                        "ms": {"type": "number", "minimum": 0, "maximum": 30000},
+                        "duration_ms": {"type": "number", "minimum": 0, "maximum": 30000},
+                    }, "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["switch_tab"]},
+                    "arguments": {"type": "object", "properties": {
+                        **common, "index": {"type": "integer", "minimum": 0},
+                    }, "required": ["observation_id", "index"], "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["extract"]},
+                    "arguments": {"type": "object", "properties": {
+                        **common,
+                        "fields": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "selectors": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    }, "required": ["ref", "observation_id", "fields"], "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["verify"]},
+                    "arguments": {"type": "object", "properties": {
+                        "required_fields": {"type": "array", "items": {"type": "string"}},
+                        "contains": {"type": ["string", "array"], "items": {"type": "string"}},
+                        "expected": {}, "price_min": {"type": "number"}, "price_max": {"type": "number"},
+                    }, "required": ["required_fields"], "additionalProperties": True},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+        ]
+        return {
+            "type": "function",
+            "name": "browser_action_batch",
+            "strict": False,
+                                "description": (
+                "Perform one bounded semantic browser batch through the isolated local browser. "
+                "Use a separate snapshot call first and bind click_ref, fill_ref, select_ref, "
+                "and extract to its current observation_id. A batch may contain at most one "
+                "state-changing action, and that action must be last; never put a state action "
+                "before another state action such as wait. After it, the runtime "
+                "automatically observes the page. Use extract and then verify for completion "
+                "evidence; never use screen coordinates or an address-bar fallback."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {"oneOf": action_variants},
+                    },
+                },
+                "required": ["actions"],
+                "additionalProperties": False,
+            },
+        }
 
     def _mcp_servers_for_task(self, text: str) -> tuple[str, ...]:
         """Route a task to its minimum MCP set before any process is spawned."""
@@ -898,9 +1189,7 @@ class AgentRuntime:
             return ()
         lowered = str(text or "").lower()
         selected: list[str] = []
-        browser_markers = (
-            "浏览器", "网页", "网站", "搜索", "淘宝", "京东", "百度", "google", "browser", "website", "web page", "search", "http://", "https://",
-        )
+        browser_markers = self.BROWSER_TASK_MARKERS
         powertoys_markers = (
             "powertoys", "保持唤醒", "不休眠", "置顶", "always on top", "awake", "fancyzones", "键盘管理器",
         )
@@ -1107,6 +1396,8 @@ class AgentRuntime:
     def _tool_label(self, name: str) -> str:
         if name == "mcp_enable_server":
             return "Select MCP integration"
+        if name == "browser_action_batch":
+            return "Browser action"
         if name.startswith("mcp_"):
             server_name = getattr(self.mcp, "server_name", lambda _name: None) if self.mcp else None
             if server_name and server_name(name) == "officecli":
@@ -1155,6 +1446,8 @@ class AgentRuntime:
             self._task_mcp_servers.add(server)
             return {"ok": True, "server": server,
                     "message": "Integration selected. Its tool schemas are available on the next step."}
+        if name == "browser_action_batch":
+            return self._run_browser_action_batch(arguments)
         if self.mcp and self.mcp.owns(name):
             is_browser = self._is_browser_mcp_tool(name)
             if is_browser and self._browser_reobservation_required \
@@ -1224,6 +1517,85 @@ class AgentRuntime:
         if name == "desktop_verify_state":
             return self.desktop.verify_state(str(arguments.get("snapshot_id", "")))
         return self.tools.call(name, arguments)
+
+    def _run_browser_action_batch(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run the single model-facing browser contract on the trusted MCP backend."""
+        if not self.mcp:
+            return {"ok": False, "failure_kind": "browser_backend_unavailable",
+                    "error": self._mcp_configuration_error or "The local browser backend is unavailable."}
+        isolated_check = getattr(self.mcp, "is_browser_isolated", None)
+        if callable(isolated_check) and not isolated_check():
+            return {"ok": False, "failure_kind": "browser_not_isolated",
+                    "error": "The browser backend must use an isolated Chromium profile."}
+        try:
+            # Direct callers and focused tests may invoke the dispatcher
+            # without first asking for schemas. Discovery remains scoped to
+            # Playwright and does not expose raw tools to the model.
+            self.mcp.schemas(("playwright",))
+        except Exception as exc:
+            return {"ok": False, "failure_kind": "browser_backend_unavailable",
+                    "error": f"The local browser backend could not be prepared: {exc}"}
+        if self._browser_session is None:
+            self._browser_session = BrowserExecutionSession(
+                PlaywrightMCPBackend(self.mcp),
+                max_action_steps=20,
+                handoff_timeout_seconds=self.BROWSER_HANDOFF_TIMEOUT_SECONDS,
+                on_state_action=self._publish_browser_activity,
+            )
+        return self._browser_session.execute(arguments.get("actions"))
+
+    def _publish_browser_activity(self, phase: str, action: str) -> None:
+        labels = {
+            "navigate": "browser_navigate",
+            "click_ref": "browser_click",
+            "fill_ref": "browser_input",
+            "select_ref": "browser_select",
+        }
+        tool = labels.get(action)
+        if tool not in BROWSER_ACTIVITY_TOOLS:
+            return
+        if phase == "begin":
+            self._next_desktop_activity_id += 1
+            self._browser_activity_ids[action] = self._next_desktop_activity_id
+            activity_id = self._next_desktop_activity_id
+        else:
+            activity_id = self._browser_activity_ids.pop(action, None)
+            if activity_id is None:
+                return
+        self._publish_activity_event(phase, tool, activity_id)
+
+    def _run_desktop_action(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run one tool and publish a privacy-bounded desktop activity lifecycle.
+
+        Only the seven local desktop actions get UI activity events.  The event
+        publisher is best effort so an unavailable indicator can never change the
+        tool's execution or result semantics.
+        """
+        if name not in DESKTOP_ACTIVITY_TOOLS:
+            return self._run_local_tool(name, arguments)
+
+        self._next_desktop_activity_id += 1
+        activity_id = self._next_desktop_activity_id
+        self._publish_desktop_activity("begin", name, activity_id)
+        try:
+            return self._run_local_tool(name, arguments)
+        finally:
+            self._publish_desktop_activity("end", name, activity_id)
+
+    def _publish_desktop_activity(self, phase: str, tool: str, activity_id: int) -> None:
+        """Publish only the safe fields needed by the local UI indicator."""
+        self._publish_activity_event(phase, tool, activity_id)
+
+    def _publish_activity_event(self, phase: str, tool: str, activity_id: int) -> None:
+        """Publish the shared bounded activity lifecycle for desktop or browser actions."""
+        try:
+            event = DesktopActivityEvent(phase, tool, activity_id)
+            if phase not in {"begin", "end"} or tool not in ACTIVITY_TOOLS:
+                return
+            self.ui.put(("desktop_activity", event.to_payload()))
+        except Exception:
+            # The indicator is advisory and must never block a real desktop action.
+            return
 
     @staticmethod
     def _execution_requested(text: str) -> bool:

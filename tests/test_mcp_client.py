@@ -26,12 +26,12 @@ class MCPClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mcp.json"
             path.write_text(json.dumps({"mcpServers": {
-                "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
+                "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@0.0.79", "--isolated"]},
                 "disabled": {"command": "ignore", "enabled": False},
             }}), encoding="utf-8")
             specs = load_mcp_servers(path)
         self.assertEqual([spec.name for spec in specs], ["playwright"])
-        self.assertEqual(specs[0].args[-1], "@playwright/mcp@latest")
+        self.assertIn("@playwright/mcp@0.0.79", specs[0].args)
 
     def test_custom_intent_metadata_is_available_without_starting_server(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -66,6 +66,10 @@ class MCPClientTests(unittest.TestCase):
         self.assertIn("powertoys", names)
         powertoys = next(spec for spec in specs if spec.name == "powertoys")
         self.assertTrue(powertoys.args[-1].endswith("powertoys_mcp.py"))
+
+    def test_default_playwright_backend_requires_isolated_profile(self):
+        bridge = MCPToolBridge(None, enable_playwright=True)
+        self.assertTrue(bridge.is_browser_isolated())
 
     def test_default_servers_include_officecli_when_binary_exists(self):
         with tempfile.TemporaryDirectory() as directory:

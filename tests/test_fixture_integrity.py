@@ -20,6 +20,7 @@ class FixtureIntegrityTests(unittest.TestCase):
         required = {
             "mock_store": Path("tests/fixtures/web/mock_store.html"),
             "mock_search": Path("tests/fixtures/web/mock_search.html"),
+            "dynamic_search": Path("tests/fixtures/web/dynamic_search.html"),
             "broken_python_project": Path("tests/fixtures/broken_python_project"),
             "network_failure": Path("tests/fixtures/network_failure"),
             "desktop_sandbox": Path("tests/fixtures/desktop_sandbox"),

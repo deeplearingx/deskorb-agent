@@ -37,7 +37,8 @@ class PublicBrowserScenarioTests(unittest.TestCase):
     def test_bing_prompt_allows_bounded_public_result_clicks(self):
         prompt = SCENARIOS["bing-fastapi"].prompt
         self.assertIn("https://www.bing.com/search", prompt)
-        self.assertIn("可以点击公开搜索结果链接", prompt)
+        self.assertIn("必须从最新快照中定位", prompt)
+        self.assertIn("点击确认官方资料", prompt)
         self.assertIn("点击前先", prompt)
         self.assertIn("提取三条", prompt)
         self.assertIn("不要点击广告", prompt)

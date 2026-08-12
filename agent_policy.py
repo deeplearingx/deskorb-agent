@@ -61,7 +61,8 @@ class ToolPolicy:
     DESTRUCTIVE_TOOLS = {"filesystem_delete"}
     AUTOMATIC_TOOLS = {"shell_run", "filesystem_move", "process_stop"}
     EXTERNAL_TOOLS = {"desktop_click", "desktop_type", "desktop_hotkey", "desktop_scroll", "window_focus",
-                      "window_control", "desktop_clipboard_read_text", "process_start", "application_launch"}
+                      "window_control", "desktop_clipboard_read_text", "process_start", "application_launch",
+                      "browser_action_batch"}
     TASK_SCOPED_TOOLS = EXTERNAL_TOOLS
 
     def decide(self, tool_name: str, *, execution_requested: bool, full_access: bool,

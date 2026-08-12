@@ -35,6 +35,7 @@ from PIL import Image, ImageGrab, ImageDraw, ImageChops, ImageFilter, ImageTk
 
 from config import *
 from config import __version__
+from desktop_activity_indicator import DesktopActivityIndicator
 from credential_store import delete_api_key, has_api_key, set_api_key
 from debuglog import dbg, DEBUG_LOG
 from win32utils import *
@@ -301,6 +302,7 @@ class Overlay:
         self._office_operation_sequence = 0
 
         self._build()
+        self.desktop_activity_indicator = DesktopActivityIndicator(self.root)
         self._register_hotkey()
         self.root.after(60, self._poll)
 
@@ -3057,6 +3059,62 @@ class Overlay:
             self.chat.see("end")
         self._prune_chat()
 
+    def add_human_handoff(self, payload):
+        """Render a generic browser recovery handoff, distinct from CAPTCHA UI."""
+        info = payload if isinstance(payload, dict) else {}
+        reason = str(info.get("reason") or "browser_no_progress")
+        page = str(info.get("page") or "当前浏览器页面")
+        timeout = max(1, int(info.get("timeout_seconds") or 120)) // 60
+        self._md_finalize()
+        at_bottom = self.chat.yview()[1] > 0.999
+        card = tk.Frame(self.chat, bg=T["field"], highlightbackground=T["accent"],
+                        highlightthickness=1, padx=self.px(12), pady=self.px(9))
+        title = tk.Label(card, text="需要你完成页面选择", bg=T["field"], fg=T["accent"],
+                         font=self.f_chip, anchor="w")
+        title.pack(fill="x")
+        detail = tk.Label(
+            card,
+            text=("浏览器页面没有继续变化，DeskOrb 已暂停，避免重复输入或误点。"
+                  "\n请在受控浏览器中完成当前页面选择；继续后会先获取新快照，旧目标不会复用。"
+                  f"\n页面：{page}\n此接管将在约 {timeout} 分钟后过期。"),
+            bg=T["field"], fg=T["text"], font=self.f_small, justify="left", anchor="w",
+            wraplength=self.px(300),
+        )
+        detail.pack(fill="x", pady=(self.px(3), self.px(9)))
+        actions = tk.Frame(card, bg=T["field"])
+        actions.pack(fill="x")
+
+        def respond(continue_task):
+            if getattr(card, "_resolved", False) or self.busy:
+                return
+            card._resolved = True
+            resume.configure(state="disabled")
+            cancel.configure(state="disabled")
+            self.add_user("? 我已完成选择，继续任务" if continue_task else "? 已取消浏览器接管")
+            command = ("__deskorb_human_verification_complete__" if continue_task
+                       else "__deskorb_human_verification_cancel__")
+            self.worker.ask(command, [])
+            self._set_busy(True)
+
+        resume = tk.Button(actions, text="我已完成选择，继续", command=lambda: respond(True),
+                           bg=T["accent"], fg=T["on_accent"], activebackground=T["accent"],
+                           activeforeground=T["on_accent"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        resume.pack(side="left")
+        cancel = tk.Button(actions, text="取消任务", command=lambda: respond(False),
+                           bg=T["field"], fg=T["muted"], activebackground=T["hover"],
+                           activeforeground=T["text"], relief="flat", bd=0,
+                           font=self.f_small, cursor="hand2", padx=self.px(10), pady=self.px(4))
+        cancel.pack(side="left", padx=(self.px(6), 0))
+        for child in (card, title, detail, actions, resume, cancel):
+            child.bind("<MouseWheel>", self._fwd_wheel)
+        self.chat.insert("end", "\n")
+        self.chat.window_create("end", window=card, padx=self.px(16), pady=self.px(5))
+        self.chat.insert("end", "\n")
+        if at_bottom:
+            self.chat.see("end")
+        self._prune_chat()
+
     def add_err(self, text):
         self._md_finalize()
         self._ins("\n⚠  " + ("" if text is None else str(text)) + "\n", "err")
@@ -3235,6 +3293,7 @@ class Overlay:
 
     def _send_or_stop(self):
         if self.busy:
+            self._force_hide_desktop_activity()
             self.worker.interrupt()
             self._set_status("stopping…")
             return
@@ -3855,6 +3914,7 @@ class Overlay:
         # receive_response() and the reset just queues behind it — meanwhile the tail
         # of the old reply keeps streaming deltas into the chat we just cleared.
         self.worker.interrupt()
+        self._force_hide_desktop_activity()
         self._clear_chat_word_attachment(cancel_read=True)
         self._word_attachment_history = []
         self._active_word_attachment_question = None
@@ -4007,6 +4067,15 @@ class Overlay:
         self._refresh_send()
         self._refresh_chat_word_attachment()
         self.busy_lbl.configure(text="thinking…" if busy else "")
+
+    def _force_hide_desktop_activity(self):
+        indicator = getattr(self, "desktop_activity_indicator", None)
+        if indicator is None:
+            return
+        try:
+            indicator.force_hide()
+        except Exception:
+            pass
 
     def _refresh_statusline(self):
         p = f"{self._ctx_pct:.0f}%" if isinstance(self._ctx_pct, (int, float)) else "—"
@@ -4315,6 +4384,9 @@ class Overlay:
                 if sig is not None:
                     if self._vscreen_sig is not None and sig != self._vscreen_sig:
                         self._ensure_on_screen()
+                        indicator = getattr(self, "desktop_activity_indicator", None)
+                        if indicator is not None:
+                            indicator.refresh_layout()
                     self._vscreen_sig = sig
             except Exception:
                 pass
@@ -4401,6 +4473,7 @@ class Overlay:
             self.busy_lbl.configure(text="")
             self._refresh_statusline()
         elif kind == "reset_done":
+            self._force_hide_desktop_activity()
             self.add_sys("🔄 new conversation.")
             # Don't null _ctx_pct here: reset() already cleared it on click, and the worker's
             # post-_open _emit_usage has (just before this) pushed the NEW session's real
@@ -4444,6 +4517,7 @@ class Overlay:
             self._ctx_pct = payload
             self._refresh_statusline()
         elif kind == "turn_done":
+            self._force_hide_desktop_activity()
             self._remember_word_attachment_turn()
             self._md_finalize()          # the turn ended → give the last line full block styling
             self._finish_turn_copy()     # then a Copy button under the reply
@@ -4458,6 +4532,7 @@ class Overlay:
         elif kind == "compact_done":
             self._stop_compact_anim(payload)
         elif kind == "error":
+            self._force_hide_desktop_activity()
             # A failed API/agent turn still emits its normal *_done marker from
             # the worker.  Do not let that marker parse an empty Office-plan
             # buffer and report a misleading JSON error after the real failure.
@@ -4474,6 +4549,7 @@ class Overlay:
             self.add_err(str(payload))
             self._set_busy(False)
         elif kind == "result":
+            self._force_hide_desktop_activity()
             self._md_finalize()          # finalize before any error line is appended
             self._finish_turn_copy()     # Copy button under whatever reply text we did get
             # the SDK reports a turn that ended in error here even when no exception was raised on
@@ -4532,9 +4608,21 @@ class Overlay:
         elif kind == "diagnostic":
             self.add_sys(str(payload))
         elif kind == "approval":
+            self._force_hide_desktop_activity()
             self.add_approval(str(payload))
         elif kind == "human_verification":
+            self._force_hide_desktop_activity()
             self.add_human_verification(payload)
+        elif kind == "human_handoff":
+            self._force_hide_desktop_activity()
+            self.add_human_handoff(payload)
+        elif kind == "human_handoff_timeout":
+            self._force_hide_desktop_activity()
+            self.add_err("浏览器人工接管超时，任务已阻断。")
+        elif kind == "desktop_activity":
+            indicator = getattr(self, "desktop_activity_indicator", None)
+            if indicator is not None and isinstance(payload, dict):
+                indicator.handle_event(payload)
         elif kind == "update":
             self._update_available = str(payload)
             self.add_sys(f"🔔 Update available: v{payload} (you have v{__version__}). "
@@ -4558,6 +4646,12 @@ class Overlay:
         if self._quitting:        # idempotent: a rapid double-close must not destroy() twice
             return
         self._quitting = True
+        try:
+            indicator = getattr(self, "desktop_activity_indicator", None)
+            if indicator is not None:
+                indicator.destroy()
+        except Exception:
+            pass
         try:
             if getattr(self, "meeting_recorder", None) is not None:
                 self.meeting_recorder.abort()

@@ -446,17 +446,17 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
     for kind, value in events:
         if kind == "approval":
             confirmation_count += 1
-        elif kind == "human_verification":
+        elif kind in {"human_verification", "human_handoff"}:
             handoff_count += 1
         elif kind == "error":
             runtime_error = True
-        if first_response_ms is None and kind in {"delta", "approval", "tool", "human_verification"}:
+        if first_response_ms is None and kind in {"delta", "approval", "tool", "human_verification", "human_handoff"}:
             first_response_ms = round(max(0.0, (time.monotonic() - started_at) * 1000))
         if kind == "tool" and isinstance(value, tuple) and value:
             tool_rounds += 1
             name = str(value[0] or "")
             arguments = value[1] if len(value) > 1 else {}
-            if name == "browser_action_batch":
+            if name.casefold() in {"browser_action_batch", "browser action"}:
                 if isinstance(arguments, dict):
                     batch = arguments.get("actions") or []
                 else:
@@ -646,8 +646,10 @@ def _run_local_browser_case(case: Mapping[str, Any], attempt: int, working_dir: 
                             handoff_timeout_seconds: int, interactive_handoff: bool,
                             timeout_seconds: int) -> dict[str, Any]:
     fixture = str((case.get("setup") or {}).get("fixture") or "mock_store")
-    page = "mock_search.html" if fixture == "mock_search" else (
-        "human-verification.html" if fixture == "captcha_search" else "mock_store.html"
+    page = "dynamic_search.html" if fixture == "dynamic_search" else (
+        "mock_search.html" if fixture == "mock_search" else (
+            "human-verification.html" if fixture == "captcha_search" else "mock_store.html"
+        )
     )
     task = str(case.get("prompt") or "Complete the isolated local browser task.")
     task = task + f"\nUse only the isolated local fixture at {base_url}/{page}. Do not leave it or perform any external action."
@@ -940,7 +942,7 @@ def _run_runtime_task(runtime: AgentRuntime, task: str, timeout_seconds: int,
             if terminal_completed:
                 failure = None
             break
-        if any(kind == "human_verification" for kind, _ in new_events):
+        if any(kind in {"human_verification", "human_handoff"} for kind, _ in new_events):
             resume_event = threading.Event()
             if interactive_handoff:
                 _start_handoff_reader(resume_event)
@@ -959,7 +961,7 @@ def _run_runtime_task(runtime: AgentRuntime, task: str, timeout_seconds: int,
             if resumed_token and allow_automatic_confirmation:
                 prompt = "确认 " + resumed_token
                 continue
-            if any(kind == "human_verification" for kind, _ in resumed_events):
+            if any(kind in {"human_verification", "human_handoff"} for kind, _ in resumed_events):
                 failure = "human_verification_required"
             break
         token = _approval_token(new_events)
@@ -973,7 +975,7 @@ def _run_runtime_task(runtime: AgentRuntime, task: str, timeout_seconds: int,
             if next_token:
                 prompt = "确认 " + next_token
                 continue
-            if any(kind == "human_verification" for kind, _ in confirmation_events):
+            if any(kind in {"human_verification", "human_handoff"} for kind, _ in confirmation_events):
                 failure = "human_verification_required"
             break
         break
@@ -1197,7 +1199,7 @@ def _drain(events: Queue) -> list[tuple[str, object]]:
 def _fresh_observation_after_handoff(events: list[tuple[str, object]]) -> bool:
     seen_handoff = False
     for kind, value in events:
-        if kind == "human_verification":
+        if kind in {"human_verification", "human_handoff"}:
             seen_handoff = True
             continue
         if seen_handoff and kind == "tool" and isinstance(value, tuple):
@@ -1280,7 +1282,7 @@ def _is_local_browser_case(case: Mapping[str, Any]) -> bool:
     category = str(case.get("category") or "")
     fixture = str((case.get("setup") or {}).get("fixture") or "")
     return (category.startswith("browser_") or category == "learning_resource_search"
-            or fixture in {"captcha_search"}) and not _is_public_case(case)
+            or fixture in {"captcha_search", "dynamic_search"}) and not _is_public_case(case)
 
 
 def _is_desktop_case(case: Mapping[str, Any]) -> bool:

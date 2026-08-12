@@ -131,6 +131,107 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("mcp_knowledge_search", [item["name"] for item in runtime._available_schemas("帮我找内部文档")])
 
+    def test_browser_tasks_expose_only_semantic_browser_entry(self):
+        class FakePlaywright:
+            available_servers = ("playwright",)
+
+            @staticmethod
+            def server_catalog():
+                return []
+
+            def schemas(self, servers):
+                self.selected = tuple(servers)
+                return [
+                    {"type": "function", "name": "mcp_playwright_browser_snapshot", "parameters": {}},
+                    {"type": "function", "name": "mcp_playwright_browser_click", "parameters": {}},
+                ]
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakePlaywright()
+        schemas = runtime._available_schemas("打开浏览器搜索动态结果")
+        names = [item["name"] for item in schemas]
+        self.assertIn("browser_action_batch", names)
+        self.assertNotIn("mcp_playwright_browser_snapshot", names)
+        self.assertNotIn("mcp_playwright_browser_click", names)
+
+    def test_semantic_browser_dispatch_keeps_raw_tools_internal(self):
+        class FakePlaywright:
+            available_servers = ("playwright",)
+
+            def schemas(self, servers):
+                return []
+
+            def call(self, name, arguments):
+                return {"ok": True, "content": [{"type": "text", "text": "### Page\n- textbox [ref=search]: Python"}]}
+
+            def owns(self, name):
+                return name == "mcp_playwright_browser_snapshot"
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakePlaywright()
+        result = runtime._run_local_tool("browser_action_batch", {
+            "actions": [{"action": "snapshot", "arguments": {}}],
+        })
+        self.assertTrue(result["ok"])
+        self.assertEqual(runtime._browser_session.action_steps, 1)
+
+    def test_browser_no_progress_publishes_generic_handoff_not_captcha(self):
+        class FakePlaywright:
+            available_servers = ("playwright",)
+
+            def schemas(self, servers):
+                return []
+
+            def call(self, name, arguments):
+                return {"ok": True, "content": [{"type": "text", "text": "### Page\n- textbox [ref=search]: Python"}]}
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakePlaywright()
+        runtime._browser_session = __import__("browser_runtime").BrowserExecutionSession(
+            __import__("browser_runtime").PlaywrightMCPBackend(runtime.mcp), handoff_timeout_seconds=120,
+        )
+        result = runtime._run_local_tool("browser_action_batch", {
+            "actions": [{"action": "snapshot", "arguments": {}}],
+        })
+        self.assertTrue(result["ok"])
+
+    def test_browser_task_schemas_do_not_expose_desktop_fallback(self):
+        class FakePlaywright:
+            available_servers = ("playwright",)
+
+            def schemas(self, servers):
+                return []
+
+            @staticmethod
+            def server_catalog():
+                return []
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakePlaywright()
+        names = {item["name"] for item in runtime._available_schemas("打开浏览器并搜索 Python")}
+        self.assertEqual(names, {"browser_action_batch"})
+
+    def test_browser_activity_indicator_covers_state_actions_only(self):
+        class FakePlaywright:
+            available_servers = ("playwright",)
+
+            def schemas(self, servers):
+                return []
+
+            def call(self, name, arguments):
+                text = "### Page\n- option [ref=option-1]: Python asyncio 入门"
+                return {"ok": True, "content": [{"type": "text", "text": text}]}
+
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
+        runtime.mcp = FakePlaywright()
+        runtime._run_local_tool("browser_action_batch", {
+            "actions": [{"action": "navigate", "arguments": {"url": "http://127.0.0.1/"}}],
+        })
+        activity = [payload for kind, payload in list(events.queue) if kind == "desktop_activity"]
+        self.assertEqual([item["phase"] for item in activity], ["begin", "end"])
+        self.assertEqual(activity[0]["tool"], "browser_navigate")
+
     def test_attachment_note_is_removed_from_task_summary(self):
         text = "[Attached: a live screenshot of my screen — monitor 1 (primary).]\n\n打开QQ，发送消息"
         self.assertEqual(AgentRuntime._clean_task_text(text), "打开QQ，发送消息")
@@ -293,6 +394,42 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(transcript[-1]["content"][-1]["type"], "input_image")
         self.assertIn("NEXT", transcript[-1]["content"][0]["text"])
 
+    def test_desktop_action_events_pair_for_success_failure_and_exception(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
+
+        with patch.object(runtime, "_run_local_tool", return_value={"ok": True}):
+            self.assertEqual(runtime._run_desktop_action("desktop_click", {"x": 10}), {"ok": True})
+        with patch.object(runtime, "_run_local_tool", return_value={"ok": False, "error": "fixture"}):
+            self.assertEqual(runtime._run_desktop_action("desktop_type", {"text": "secret"}),
+                             {"ok": False, "error": "fixture"})
+        with patch.object(runtime, "_run_local_tool", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                runtime._run_desktop_action("desktop_hotkey", {"keys": ["ctrl", "s"]})
+
+        activity_events = []
+        while not events.empty():
+            kind, payload = events.get_nowait()
+            self.assertEqual(kind, "desktop_activity")
+            self.assertEqual(set(payload), {"phase", "tool", "activity_id"})
+            activity_events.append(payload)
+
+        self.assertEqual([(item["phase"], item["tool"]) for item in activity_events], [
+            ("begin", "desktop_click"), ("end", "desktop_click"),
+            ("begin", "desktop_type"), ("end", "desktop_type"),
+            ("begin", "desktop_hotkey"), ("end", "desktop_hotkey"),
+        ])
+        self.assertEqual([item["activity_id"] for item in activity_events], [1, 1, 2, 2, 3, 3])
+
+    def test_non_desktop_action_does_not_publish_activity_event(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
+        with patch.object(runtime, "_run_local_tool", return_value={"ok": True}) as run_local:
+            self.assertEqual(runtime._run_desktop_action("filesystem_read_text", {"path": "x"}),
+                             {"ok": True})
+        run_local.assert_called_once_with("filesystem_read_text", {"path": "x"})
+        self.assertTrue(events.empty())
+
     def test_normal_desktop_steps_use_one_task_confirmation_then_continue(self):
         events = Queue()
         runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
@@ -320,6 +457,11 @@ class ReadOnlyToolsTests(unittest.TestCase):
             all_events.append(events.get_nowait())
         self.assertEqual(sum(1 for kind, _ in all_events if kind == "approval"), 1)
         self.assertTrue(any(kind == "delta" and payload == "TASK_DONE" for kind, payload in all_events))
+        activity_events = [payload for kind, payload in all_events if kind == "desktop_activity"]
+        self.assertEqual([(item["phase"], item["tool"]) for item in activity_events], [
+            ("begin", "application_launch"), ("end", "application_launch"),
+            ("begin", "desktop_hotkey"), ("end", "desktop_hotkey"),
+        ])
         self.assertFalse(runtime._task_authorized())
 
     def test_targeted_notepad_launch_reuses_the_locked_desktop_fixture(self):

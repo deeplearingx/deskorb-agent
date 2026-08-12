@@ -31,6 +31,24 @@ class BrowserProbeMatrixTests(unittest.TestCase):
         )
         self.assertFalse(probe._verification_evidence_passed(verification_results))
 
+    def test_probe_wraps_production_two_argument_dispatcher(self):
+        calls = []
+
+        class FakeRuntime:
+            def __init__(self, *_args, **_kwargs):
+                self.mcp = None
+
+            def _run_local_tool(self, name, arguments):
+                calls.append((name, arguments))
+                return {"ok": True}
+
+        runtime = FakeRuntime()
+        original = runtime._run_local_tool
+        runtime._run_local_tool = lambda name, arguments: original(name, arguments)
+        result = runtime._run_local_tool("browser_action_batch", {"actions": []})
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls[0][0], "browser_action_batch")
+
     def test_real_probe_uses_an_isolated_working_directory(self):
         working_directories = []
 
@@ -39,7 +57,7 @@ class BrowserProbeMatrixTests(unittest.TestCase):
                 working_directories.append(Path(kwargs["working_dir"]))
                 self.mcp = None
 
-        def fake_case(case_id, _base_url, _runtime, _events):
+        def fake_case(case_id, _base_url, _runtime, _events, **_kwargs):
             return {"id": case_id, "ok": True, "approval_used": True,
                     "mcp_tool_calls": 1, "terminal": "completed", "verified": True,
                     "evidence_passed": True, "verification_results": [{"passed": True}],
@@ -81,7 +99,7 @@ class BrowserProbeMatrixTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 self.mcp = None
 
-        def fake_case(case_id, _base_url, _runtime, _events):
+        def fake_case(case_id, _base_url, _runtime, _events, **_kwargs):
             return {
                 "id": case_id, "ok": True, "approval_used": True,
                 "mcp_tool_calls": 1, "terminal": "completed", "verified": True,
@@ -97,8 +115,8 @@ class BrowserProbeMatrixTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["repetitions"], 2)
-        self.assertEqual([item["runs"] for item in payload["cases"]], [2, 2])
-        self.assertEqual([item["passed"] for item in payload["cases"]], [2, 2])
+        self.assertEqual([item["runs"] for item in payload["cases"]], [2, 2, 2])
+        self.assertEqual([item["passed"] for item in payload["cases"]], [2, 2, 2])
         self.assertNotIn("answer", payload["runs"][0])
         self.assertEqual(payload["runs"][0]["case_id"], "web-001")
         self.assertEqual(payload["runs"][0]["outcome"], "passed")
@@ -108,7 +126,7 @@ class BrowserProbeMatrixTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 self.mcp = None
 
-        def fake_case(case_id, _base_url, _runtime, _events):
+        def fake_case(case_id, _base_url, _runtime, _events, **_kwargs):
             return {"id": case_id, "ok": True, "terminal": "completed", "verified": True,
                     "evidence_passed": True, "elapsed_ms": 10}
 
@@ -128,7 +146,7 @@ class BrowserProbeMatrixTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 self.mcp = None
 
-        def fake_case(case_id, _base_url, _runtime, _events):
+        def fake_case(case_id, _base_url, _runtime, _events, **_kwargs):
             return {"id": case_id, "ok": True, "approval_used": True,
                     "mcp_tool_calls": 1, "terminal": "completed", "verified": True,
                     "evidence_passed": True, "elapsed_ms": 10}
@@ -142,7 +160,8 @@ class BrowserProbeMatrixTests(unittest.TestCase):
             path = Path(directory) / "browser-agent-matrix.json"
             path.write_text(output.getvalue(), encoding="utf-8")
             runs = load_normalized_report(path)
-        self.assertEqual([item["case_id"] for item in runs], ["web-001", "research-001"])
+        self.assertEqual([item["case_id"] for item in runs],
+                         ["web-001", "research-001", "dynamic-search-no-progress"])
         self.assertTrue(all(item["outcome"] == "passed" for item in runs))
         self.assertTrue(all(item["completed"] and item["verified"] for item in runs))
         self.assertTrue(all(item["evidence_passed"] for item in runs))

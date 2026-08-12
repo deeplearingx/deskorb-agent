@@ -334,9 +334,24 @@ _user32.GetWindowLongW.restype = ctypes.c_long
 _user32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
 _user32.SetWindowLongW.restype = ctypes.c_long
 _user32.SetWindowLongW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_long]
+try:
+    _user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    _user32.SetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_void_p]
+    _user32.CallWindowProcW.restype = ctypes.c_ssize_t
+    _user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wt.HWND, wt.UINT,
+                                        wt.WPARAM, wt.LPARAM]
+except Exception:
+    pass
 GWL_EXSTYLE      = -20
 WS_EX_TOOLWINDOW = 0x00000080   # no taskbar button (what an overrideredirect popup effectively is)
 WS_EX_APPWINDOW  = 0x00040000   # force a taskbar button even on a tool/popup window
+WS_EX_TRANSPARENT = 0x00000020  # paint after siblings; paired with WM_NCHITTEST below
+WS_EX_NOACTIVATE = 0x08000000   # never activate when shown or clicked
+GWLP_WNDPROC = -4
+WM_NCHITTEST = 0x0084
+WM_MOUSEACTIVATE = 0x0021
+HTTRANSPARENT = -1
+MA_NOACTIVATE = 3
 # Z-order raise + forced activation — used when the taskbar button / alt-tab / hotkey asks for
 # the overlay: the OS activates it but does NOT re-order it above other always-on-top windows,
 # so a click could leave it buried under another topmost window (or just unfocused). These do
@@ -392,6 +407,116 @@ CF_TEXT, CF_UNICODETEXT = 1, 13   # so a text copy (which many apps ALSO put a b
 # Teams/Zoom/OBS screen shares); the "shareable" status-bar toggle flips between them.
 WDA_NONE = 0x00
 WDA_EXCLUDEFROMCAPTURE = 0x11
+
+
+_indicator_wndprocs = {}
+
+
+def _indicator_top_level_hwnd(hwnd, api):
+    """Resolve a Tk child HWND to the owned top-level window when possible.
+
+    ``Toplevel.winfo_id()`` commonly returns the Tk child window rather than the
+    actual top-level HWND.  Window display affinity is a top-level-only API, so
+    passing the child produces ``ERROR_INVALID_PARAMETER`` (87) even though the
+    window is otherwise valid.  Test doubles do not need ``GetAncestor`` and
+    therefore keep the supplied handle unchanged.
+    """
+    if not hwnd:
+        return hwnd
+    try:
+        get_ancestor = getattr(api, "GetAncestor", None)
+        if callable(get_ancestor):
+            return get_ancestor(hwnd, GA_ROOT) or hwnd
+    except Exception:
+        pass
+    return hwnd
+
+
+def install_indicator_hit_test(hwnd, api=None):
+    """Make an indicator HWND return HTTRANSPARENT and never activate on mouse input."""
+    api = api or _user32
+    if sys.platform != "win32" or not hwnd:
+        return False
+    hwnd = _indicator_top_level_hwnd(hwnd, api)
+    try:
+        set_proc = getattr(api, "SetWindowLongPtrW")
+        call_proc = getattr(api, "CallWindowProcW")
+    except AttributeError:
+        return False
+    try:
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM,
+        )
+
+        original = ctypes.c_void_p()
+
+        @callback_type
+        def wnd_proc(window, message, wparam, lparam):
+            if message == WM_NCHITTEST:
+                return HTTRANSPARENT
+            if message == WM_MOUSEACTIVATE:
+                return MA_NOACTIVATE
+            return call_proc(original, window, message, wparam, lparam)
+
+        old_proc = set_proc(hwnd, GWLP_WNDPROC, ctypes.cast(wnd_proc, ctypes.c_void_p))
+        if not old_proc:
+            return False
+        original.value = int(old_proc)
+        _indicator_wndprocs[int(hwnd)] = (original, wnd_proc)
+        return True
+    except Exception:
+        return False
+
+
+def uninstall_indicator_hit_test(hwnd, api=None):
+    """Restore a previously subclassed indicator HWND before destroying it."""
+    api = api or _user32
+    hwnd = _indicator_top_level_hwnd(hwnd, api)
+    record = _indicator_wndprocs.pop(int(hwnd), None) if hwnd else None
+    if record is None:
+        return True
+    try:
+        api.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, record[0])
+        return True
+    except Exception:
+        return False
+
+
+def configure_indicator_window(
+    hwnd,
+    *,
+    api=None,
+    capture_excluded=True,
+    hit_test_installer=None,
+):
+    """Configure an indicator HWND before showing it; return False on any safety failure."""
+    api = api or _user32
+    if sys.platform != "win32" or not hwnd:
+        return False
+    installer = hit_test_installer or install_indicator_hit_test
+    try:
+        hwnd = _indicator_top_level_hwnd(hwnd, api)
+        style = api.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        required = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        api.SetWindowLongW(hwnd, GWL_EXSTYLE, style | required)
+        if api.GetWindowLongW(hwnd, GWL_EXSTYLE) & required != required:
+            return False
+        if not installer(hwnd, api):
+            return False
+        if capture_excluded and not api.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE):
+            uninstall_indicator_hit_test(hwnd, api)
+            return False
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+        if not api.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags):
+            uninstall_indicator_hit_test(hwnd, api)
+            return False
+        return True
+    except Exception:
+        try:
+            uninstall_indicator_hit_test(hwnd, api)
+        except Exception:
+            pass
+        return False
 
 class _MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT),

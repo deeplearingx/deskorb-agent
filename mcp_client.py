@@ -140,8 +140,14 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                 allow_safe_tools=True,
             ))
         else:
-            result.append(MCPServerSpec("playwright", "npx", ("-y", "@playwright/mcp@latest"), {}, None,
-                                        allow_safe_tools=True))
+            # Keep the fallback aligned with the checked-in local release.
+            # ``latest`` can silently change tool schemas and invalidate the
+            # semantic adapter's ref/observation contract.
+            result.append(MCPServerSpec(
+                "playwright", "npx",
+                ("-y", "@playwright/mcp@0.0.79", "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated"),
+                {}, None, allow_safe_tools=True,
+            ))
     result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root),
                                 allow_safe_tools=True))
     if enable_officecli:
@@ -397,6 +403,13 @@ class MCPToolBridge:
     def available_servers(self) -> tuple[str, ...]:
         """Configured trusted server names, without starting any process."""
         return tuple(self.clients)
+
+    def is_browser_isolated(self) -> bool:
+        """Report whether the configured Playwright backend uses an isolated profile."""
+        for spec in self.specs:
+            if spec.name == "playwright":
+                return "--isolated" in spec.args
+        return False
 
     def schemas(self, server_names: Iterable[str] | None = None) -> list[dict[str, Any]]:
         """Return schemas for selected servers, starting only those servers.
