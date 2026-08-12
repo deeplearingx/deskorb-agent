@@ -40,3 +40,14 @@
 - [x] 测试目录职责和真实 runner 的 fail-closed 边界已写入 `tests/README.md`。
 - [x] 结构回归覆盖共享路径、60 条唯一性和两个 runner 的一致性。
 - [ ] 后续正式授权矩阵：代码整理完成后再单独执行，不与结构重构混在同一提交中。
+
+## 桌面操作提示层（2026-08-12）
+
+- [ ] Task 1：实现 `DesktopActivityLifecycle`、事件结构和纯单元测试。
+- [ ] Task 2：为 AgentRuntime 实际桌面动作接入 `desktop_activity begin/end`。
+- [ ] Task 3：实现 Win32 click-through/no-activate/capture-excluded 适配和多显示器几何。
+- [ ] Task 4：实现四边羽化、顶部提示胶囊和自然动画。
+- [ ] 检查点：运行时契约与渲染器 focused pytest 全部通过。
+- [ ] Task 5：接入 Tk Overlay 事件泵、停止/错误/退出强制清理。
+- [ ] Task 6：完成真实临时 Notepad、截图排除和异常收尾验收。
+- [ ] 检查点：完整 pytest、代码审查和实现提交。

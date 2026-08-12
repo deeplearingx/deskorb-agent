@@ -130,3 +130,227 @@
 - [x] 两个 E2E runner 仍提供原有函数和脚本入口，同时委托共享矩阵 loader。
 - [x] 已补充 `tests/README.md`，说明单测、确定性控制组、真实 runner、探针和质量门禁的资源边界。
 - [ ] 后续可在单独切片中拆分大 runner 文件；本轮不改生产 Tk UI 单体，也不改变测试判定逻辑。
+
+## 2026-08-12 DeskOrb 桌面操作提示层实施计划（当前功能）
+
+### 概览
+
+为真实 Windows 桌面动作增加一个不抢焦点、不拦截输入、不污染模型截图的操作提示层。提示层只在安全策略允许且本机桌面动作真正开始执行时显示；通过专用 `desktop_activity` 事件连接 `AgentRuntime` 和 Tk `Overlay`，用进程内 `activity_id` 配对动作，使用独立的生命周期状态机实现连续动作合并和自然淡入淡出。
+
+### 架构决策
+
+- 使用 `AgentRuntime` 的专用开始/结束事件，不从普通工具文案或模型回复推断 UI 状态。
+- 把状态机和 Tk/Win32 绘制隔离：纯逻辑可在无桌面环境中测试，渲染层只在 Tk 主线程通过 `after` 更新。
+- 每台显示器使用四个边缘窗口和一个顶部提示胶囊；窗口通过 `WS_EX_TRANSPARENT`、`WS_EX_NOACTIVATE`、`WS_EX_TOOLWINDOW` 和 `HWND_TOPMOST/SWP_NOACTIVATE` 实现鼠标穿透与不激活。
+- 每个提示窗口必须设置并验证 `WDA_EXCLUDEFROMCAPTURE`。关键 Win32 能力失败时 fail closed，销毁已创建窗口并禁用本次进程的提示层。
+- 优先使用 DWM 背景虚化；不支持时使用低透明度羽化暗边，保持几何范围、输入安全和截图排除不变。
+- 不增加用户输入、工具参数、坐标、窗口标题、网址或原始文本到提示事件、日志或 UI 文案。
+
+### 依赖图
+
+```text
+DesktopActivityLifecycle + 事件契约
+             │
+             ├── AgentRuntime 桌面动作包装器
+             │       │
+             │       └── desktop_activity begin/end
+             │
+             ├── Win32 安全窗口适配器
+             │       │
+             │       └── Tk 提示层渲染器
+             │                       │
+             │                       └── Overlay._poll / stop / quit
+             │
+             └── 无桌面单元测试 → 真实临时 Notepad 验收
+```
+
+## 任务清单
+
+### 阶段 1：纯逻辑和运行时事件契约
+
+#### Task 1：实现桌面活动事件和纯生命周期状态机
+
+**描述：** 新增 `desktop_activity_indicator.py` 的无 UI 逻辑部分，定义七种桌面动作集合、`desktop_activity` 事件结构、活动编号配对和 `hidden/entering/visible/exiting` 状态。状态机接受假的单调时钟和调度器，支持最短可见 450ms、结束后 300ms 空闲窗口、280ms 淡出、连续动作合并、迟到事件忽略和强制隐藏。
+
+**验收标准：**
+
+- [ ] 只有 `DESKTOP_ACTION_TOOLS` 中的七种动作可创建活动，观察、文件、Shell、浏览器只读和策略拒绝不会创建活动。
+- [ ] `begin/end` 通过 `activity_id` 正确配对；未知、重复或迟到的 `end` 不会关闭新活动。
+- [ ] 连续动作不会闪烁；旧定时器回调不能改变新一代状态；`force_hide/destroy` 幂等。
+
+**验证：**
+
+- [ ] 先运行 `D:\tool\envs\marketmind\python.exe -m pytest tests/test_desktop_activity_indicator.py -q`。
+- [ ] 覆盖正常、失败、异常、连续动作和时间边界的纯单元测试。
+
+**依赖：** 无。
+
+**可能修改文件：**
+
+- `desktop_activity_indicator.py`
+- `tests/test_desktop_activity_indicator.py`
+
+**预计范围：** Medium（2 个文件）。
+
+#### Task 2：在 AgentRuntime 的所有实际桌面执行路径发布事件
+
+**描述：** 在 `agent_runtime.py` 增加进程内活动编号和 `_run_desktop_action` 包装器。普通工具循环、确认后继续执行和 OfficeCLI 自动批准路径仅在真正调用 `_run_local_tool` 前后使用包装器；策略拒绝、等待确认、模型思考和非桌面工具不触发事件。结束事件必须放在 `finally` 中，事件发布异常不能阻断原工具结果。
+
+**验收标准：**
+
+- [ ] 成功返回、`ok=false` 返回和抛出异常都发布配对的 `begin/end`，且 `activity_id` 唯一递增。
+- [ ] 高风险动作在用户确认前无活动事件，确认后真正执行时有事件。
+- [ ] 现有工具结果、任务状态、截图观察和审批行为保持不变；事件不包含参数或自由文本。
+
+**验证：**
+
+- [ ] 先增加失败测试，再运行 `D:\tool\envs\marketmind\python.exe -m pytest tests/test_agent_runtime.py -q`。
+- [ ] 检查已有桌面任务协议、审批和浏览器回归测试未退化。
+
+**依赖：** Task 1。
+
+**可能修改文件：**
+
+- `agent_runtime.py`
+- `tests/test_agent_runtime.py`
+
+**预计范围：** Medium（2 个文件）。
+
+### 检查点：运行时契约
+
+- [ ] Task 1–2 的 focused pytest 全部通过。
+- [ ] 非桌面工具没有新增 `desktop_activity` 事件。
+- [ ] 异常路径的结束事件已经由测试证明。
+- [ ] 通过人工复核后进入 Tk/Win32 窗口实现。
+
+### 阶段 2：Win32 安全渲染器
+
+#### Task 3：实现 Win32 安全窗口适配和多显示器几何布局
+
+**描述：** 在 `win32utils.py` 增加可复用的小型窗口样式与截图排除助手，复用现有 `enumerate_monitors` 和 DPI 约定。实现层要能读取并验证扩展样式、设置不激活置顶、设置 `WDA_EXCLUDEFROMCAPTURE`，并把失败明确返回给渲染器；非 Windows 环境返回不可用而不是模拟成功。
+
+**验收标准：**
+
+- [ ] 关键样式和截图排除均有可检查的布尔结果，失败不会留下“看似可用”的窗口。
+- [ ] 每台显示器返回四个边缘矩形和顶部胶囊矩形，负坐标、不同 DPI 和显示器增删均能正确处理。
+- [ ] 样式设置不会调用激活 API，不改变当前前台窗口。
+
+**验证：**
+
+- [ ] 用假的 Win32 API 覆盖成功、部分失败和非 Windows 分支。
+- [ ] 运行 `D:\tool\envs\marketmind\python.exe -m pytest tests/test_desktop_activity_indicator.py -q` 和相关 Win32/桌面测试。
+
+**依赖：** Task 1。
+
+**可能修改文件：**
+
+- `win32utils.py`
+- `desktop_activity_indicator.py`
+- `tests/test_desktop_activity_indicator.py`
+
+**预计范围：** Medium（3 个文件）。
+
+#### Task 4：实现边缘羽化、顶部胶囊和自然动画
+
+**描述：** 在 `desktop_activity_indicator.py` 完成 Tk 渲染器。为每台显示器创建四个窄边缘 `Toplevel` 和一个顶部胶囊，设置透明/虚化视觉、固定中文提示、呼吸点和单调时钟动画。所有 Tk 调用限定在主线程；创建或关键能力验证失败时销毁全部窗口并进入会话级禁用状态。
+
+**验收标准：**
+
+- [ ] 淡入 200ms、最短显示 450ms、空闲 300ms、淡出 280ms 的过渡无阻塞、无跳变。
+- [ ] 连续动作从退出状态平滑恢复，不重建造成闪烁；布局更新不会覆盖屏幕中心。
+- [ ] 胶囊和边缘窗口都是 click-through/no-activate/topmost/capture-excluded，显示失败 fail closed。
+
+**验证：**
+
+- [ ] 使用假的 Tk 窗口、调度器和 Win32 适配器测试创建、动画、重建、隐藏和销毁。
+- [ ] 运行 `D:\tool\envs\marketmind\python.exe -m pytest tests/test_desktop_activity_indicator.py -q`。
+
+**依赖：** Task 3。
+
+**可能修改文件：**
+
+- `desktop_activity_indicator.py`
+- `tests/test_desktop_activity_indicator.py`
+
+**预计范围：** Medium（2 个文件）。
+
+### 检查点：渲染器安全
+
+- [ ] 所有纯逻辑和渲染器测试通过。
+- [ ] 失败注入证明不会残留可见顶层窗口。
+- [ ] 代码审查确认没有 `sleep`、线程 Tk 调用或激活前台窗口的路径。
+
+### 阶段 3：Overlay 集成与真实验收
+
+#### Task 5：接入 Overlay 事件泵和强制收尾路径
+
+**描述：** 在 `deskorb_agent.py` 初始化提示器并在 `_poll` 消费 `desktop_activity` 事件；把 `turn_done`、运行时错误、停止、等待授权、人工验证和退出统一接到幂等的 `force_hide/destroy`。保持聊天 Overlay 自身的截图排除、任务栏、拓扑 watchdog 和焦点恢复逻辑不变。
+
+**验收标准：**
+
+- [ ] 只有收到有效开始事件才显示固定提示，结束事件触发自然隐藏；无效 payload 被安全忽略。
+- [ ] 任务完成、失败、停止、授权/人工交接和关闭窗口后不残留提示窗口或定时器。
+- [ ] Overlay 的原有焦点、截图、缩放、显示器拓扑和聊天渲染测试保持通过。
+
+**验证：**
+
+- [ ] 增加 fake indicator 的 `_poll` 事件测试，不启动真实 Tk 主循环。
+- [ ] 运行 `D:\tool\envs\marketmind\python.exe -m pytest tests/test_agent_runtime.py tests/test_desktop_activity_indicator.py -q`。
+
+**依赖：** Task 2、Task 4。
+
+**可能修改文件：**
+
+- `deskorb_agent.py`
+- `tests/test_desktop_activity_indicator.py`
+- `tests/test_agent_runtime.py`
+
+**预计范围：** Medium（3 个文件）。
+
+#### Task 6：完成真实 Windows 桌面验收和回归
+
+**描述：** 在当前登录的真实 Administrator 桌面中，用临时 Notepad 和临时目录执行启动、聚焦、点击、Unicode 输入、快捷键、滚动、状态验证和异常停止；同时验证截图排除、多显示器布局和应用退出清理。不操作用户现有文件，不执行购买、发送、登录、上传、删除重要文件或验证码绕过。
+
+**验收标准：**
+
+- [ ] 用户能看到“DeskOrb 正在操作你的电脑”，边缘效果自然淡入/淡出，连续动作无闪烁。
+- [ ] Notepad 始终保持目标焦点，提示层不截获鼠标键盘，模型截图不包含提示层。
+- [ ] 工具失败、用户停止、UAC/安全桌面边界和进程退出后没有残留窗口；不满足真实桌面预检时记录 blocked，不伪报通过。
+
+**验证：**
+
+- [ ] 运行 focused pytest、完整 pytest 和现有桌面预检。
+- [ ] 运行现有临时 Notepad/桌面 E2E 探针，保存脱敏结果和失败分类。
+- [ ] 复核 `git diff --check`、进程窗口和前台 HWND，确认无用户数据副作用。
+
+**依赖：** Task 5。
+
+**可能修改文件：**
+
+- `tests/e2e_desktop_local_probe.py`（仅在需要补充验收钩子时）
+- `tests/test_desktop_activity_indicator.py`（仅在发现回归时）
+- `docs/` 或 `artifacts/`（仅保存脱敏验收结果）
+
+**预计范围：** Medium（2–3 个文件，主要为验证和报告）。
+
+### 检查点：完成
+
+- [ ] 新增测试、相关桌面/运行时测试和完整 pytest 全部通过。
+- [ ] 真实桌面满足时完成 Notepad 验收；不满足时明确记录预检阻塞原因。
+- [ ] 安全通过率和证据准确率不下降，提示层不改变现有安全策略。
+- [ ] 代码审查通过，提交实现和测试变更。
+
+## 风险与缓解
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| Tk `Toplevel` 在部分 Windows 版本不支持预期透明/虚化 | 高 | 把 DWM 仅作为视觉增强；关键样式和截图排除失败时 fail closed，不显示不安全窗口 |
+| 提示层抢焦点或阻塞目标应用输入 | 高 | `NOACTIVATE + TRANSPARENT + SWP_NOACTIVATE`，真实 Notepad 点击/输入验收，禁止调用前台激活 |
+| 提示层进入模型截图导致坐标/证据污染 | 高 | 每个窗口验证 `WDA_EXCLUDEFROMCAPTURE`；失败时禁用提示层，截图测试覆盖可见期间 |
+| 连续动作产生闪烁或退出定时器误关新动作 | 中 | `activity_id` 配对、独立动画代次、假的单调时钟和连续动作回归测试 |
+| 真实桌面处于 UAC/安全桌面或 Codex 非同一会话 | 中 | 遵守 Windows 安全边界；预检失败记录 `blocked`，不把不可操作场景算成功 |
+| 修改 Tk 单体引入既有 UI 回归 | 中 | Overlay 只增加独立提示器适配；每个任务后 focused pytest，最后跑完整套件 |
+
+## 开放问题
+
+- 无。提示文案、触发范围、动画时序、截图策略和失败关闭策略已在设计规格中确认。
