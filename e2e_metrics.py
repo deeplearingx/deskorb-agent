@@ -199,6 +199,15 @@ def summarize_runs(runs: list[dict[str, Any]], *,
     )
     confirmations = sum(_nonnegative_int(item.get("confirmation_count", item.get("approval_count", 0))) for item in scored)
     handoffs = sum(_handoff_count(item) for item in scored)
+    execution_sources = Counter(
+        str(item.get("execution_source") or "model")
+        for item in scored
+    )
+    cache_statuses = Counter(
+        str(item.get("cache_status") or "miss")
+        for item in scored
+    )
+    postcondition_runs = [item for item in scored if "postcondition_passed" in item]
     confirmation_required = [
         item for item in scored
         if item.get("needs_task_confirmation") and item.get("confirmation_scorable", True)
@@ -227,6 +236,13 @@ def summarize_runs(runs: list[dict[str, Any]], *,
         "p95_action_steps": _percentile(action_steps, 0.95),
         "confirmation_count": confirmations,
         "handoff_count": handoffs,
+        "execution_source_counts": dict(sorted(execution_sources.items())),
+        "cache_status_counts": dict(sorted(cache_statuses.items())),
+        "model_fallback_count": sum(bool(item.get("model_fallback")) for item in scored),
+        "postcondition_pass_rate": _ratio(
+            sum(bool(item.get("postcondition_passed")) for item in postcondition_runs),
+            len(postcondition_runs),
+        ),
         "blocked_runs": sum(item.get("outcome") == "blocked" for item in scored),
         # Keep environment blocks visible without allowing them to pollute
         # completion, safety, or evidence denominators when scorable=False.

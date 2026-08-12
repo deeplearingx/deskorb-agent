@@ -83,7 +83,7 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         backend = FakeBackend([snapshot("search", "")])
         session = BrowserExecutionSession(backend)
         result = session.execute([{"action": "navigate", "arguments": {"url": "http://127.0.0.1/"}}])
-        self.assertTrue(result["ok"])
+        self.assertTrue(result["ok"], result)
         self.assertEqual([item[0] for item in backend.calls], ["navigate", "snapshot"])
 
     def test_state_action_is_followed_by_observation_and_reports_progress(self):
@@ -99,7 +99,7 @@ class BrowserExecutionSessionTests(unittest.TestCase):
             "ref": "search", "value": "Python", "observation_id": observation_id,
         }}])
 
-        self.assertTrue(result["ok"])
+        self.assertTrue(result["ok"], result)
         self.assertTrue(result["state_changed"])
         self.assertEqual([item[0] for item in backend.calls], ["snapshot", "fill_ref", "snapshot"])
         self.assertNotEqual(observation_id, result["observation_id"])
@@ -113,6 +113,31 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         }}])
         self.assertTrue(result["ok"])
         self.assertEqual(backend.calls[1], ("wait", {"observation_id": observation_id, "ms": 250}))
+
+    def test_plain_text_field_is_not_locked_as_autocomplete(self):
+        content = [{"type": "text", "text": """### Snapshot
+- textbox [ref=plain]: ""
+"""}]
+        after_first = [{"type": "text", "text": """### Snapshot
+- textbox [ref=plain]: "first"
+"""}]
+        after_second = [{"type": "text", "text": """### Snapshot
+- textbox [ref=plain]: "second"
+"""}]
+        backend = FakeBackend([content, after_first, after_second])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        first = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "plain", "value": "first", "observation_id": observation_id,
+        }}])
+        second = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "plain", "value": "second", "observation_id": first["observation_id"],
+        }}])
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertNotIn("wait", [item[0] for item in backend.calls])
 
     def test_identical_no_progress_input_is_handed_off_before_replay(self):
         backend = FakeBackend([snapshot("search", ""), snapshot("search", "")])
@@ -217,6 +242,7 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertTrue(extracted["verification"]["passed"])
         self.assertTrue(verified["ok"])
         self.assertTrue(verified["verification"]["passed"])
+        self.assertTrue(verified["postcondition_passed"])
 
     def test_extract_observation_contains_provenance_for_reporters(self):
         content = [{"type": "text", "text": """### Page
@@ -372,6 +398,123 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertFalse(repeated["ok"])
         self.assertEqual(repeated["failure_kind"], "browser_repeated_state_action")
         self.assertEqual([item[0] for item in backend.calls], ["snapshot", "fill_ref", "snapshot"])
+
+    def test_dynamic_search_locks_input_until_options_are_observed(self):
+        initial = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search]: ""
+"""}]
+        after_fill = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search]: "Python asyncio"
+"""}]
+        with_options = snapshot("search-new", "Python asyncio", selected="Python asyncio 入门")
+        backend = FakeBackend([initial, after_fill, with_options])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        first = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search", "value": "Python asyncio", "observation_id": observation_id,
+        }}])
+        repeated = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search", "value": "Python typing", "observation_id": first["observation_id"],
+        }}])
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["interaction_stage"], "ready_to_choose")
+        self.assertFalse(repeated["ok"])
+        self.assertEqual(repeated["failure_kind"], "browser_input_stage_locked")
+        self.assertEqual([item[0] for item in backend.calls], [
+            "snapshot", "fill_ref", "snapshot", "wait", "snapshot",
+        ])
+
+    def test_handoff_resume_clears_input_stage_before_fresh_observation(self):
+        initial = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search]: ""
+"""}]
+        options = snapshot("search", "Python asyncio", selected="Python asyncio 入门")
+        backend = FakeBackend([initial, options, options, options])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+        filled = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search", "value": "Python asyncio", "observation_id": observation_id,
+        }}])
+        self.assertEqual(filled["interaction_stage"], "ready_to_choose")
+        session._handoff_required = True
+
+        session.resume_after_handoff()
+        fresh = session.execute([{"action": "snapshot", "arguments": {}}])
+        allowed = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search", "value": "Python asyncio", "observation_id": fresh["observation_id"],
+        }}])
+
+        self.assertNotEqual(allowed.get("failure_kind"), "browser_input_stage_locked")
+
+    def test_dynamic_search_lock_survives_input_ref_rerender(self):
+        initial = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search-old]: ""
+"""}]
+        after_fill = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search-new]: "Python asyncio"
+"""}]
+        with_options = snapshot("search-new", "Python asyncio", selected="Python asyncio 入门")
+        backend = FakeBackend([initial, after_fill, with_options])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        first = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search-old", "value": "Python asyncio", "observation_id": observation_id,
+        }}])
+        repeated = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search-new", "value": "Python asyncio", "observation_id": first["observation_id"],
+        }}])
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["interaction_stage"], "ready_to_choose")
+        self.assertFalse(repeated["ok"])
+        self.assertEqual(repeated["failure_kind"], "browser_input_stage_locked")
+        self.assertEqual([item[0] for item in backend.calls], [
+            "snapshot", "fill_ref", "snapshot", "wait", "snapshot",
+        ])
+
+    def test_cached_search_rebinds_changed_refs_and_requires_verified_evidence(self):
+        initial = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search-a]: ""
+"""}]
+        after_fill = snapshot("search-b", "Python asyncio", selected="Python asyncio 入门")
+        after_click = [{"type": "text", "text": """### Snapshot
+- article [ref=card-new]:
+  - heading [ref=title-new]: "Python asyncio 入门"
+  - paragraph [ref=source-new]: "来源：官方文档"
+"""}]
+        extracted = after_click
+        backend = FakeBackend([initial, initial, after_fill, after_click, extracted])
+        session = BrowserExecutionSession(backend, locator_key=b"runtime-cache-key-0123456789")
+        template = {
+            "version": 1,
+            "kind": "read_only_search",
+            "read_only": True,
+            "steps": [
+                {"action": "navigate", "url": "$start_url"},
+                {"action": "snapshot"},
+                {"action": "fill_ref", "locator": {"role": "combobox", "placeholder": "$query"}, "value": "$query"},
+                {"action": "click_ref", "locator": {"role": "option", "placeholder": "$target_label"}},
+                {"action": "extract", "locator": {"role": "article", "placeholder": "$result_root"},
+                 "fields": ["title", "source"]},
+                {"action": "verify", "required_fields": ["title", "source"]},
+            ],
+        }
+        from browser_cache import parse_browser_task_intent
+        intent = parse_browser_task_intent(
+            "打开 http://127.0.0.1/search，在搜索框中输入 Python asyncio，"
+            "点击名为‘Python asyncio 入门’的下拉选项，提取标题和来源。",
+            key=b"runtime-cache-key-0123456789",
+        )
+
+        result = session.execute_cached_search(intent, template)
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["postcondition_passed"])
+        self.assertEqual(result["execution_source"], "cache")
+        self.assertIn(("click_ref", {"ref": "option-1", "observation_id": "obs-3"}), backend.calls)
 
     def test_action_budget_is_bounded(self):
         backend = FakeBackend([snapshot("search", "")])

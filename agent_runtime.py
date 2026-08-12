@@ -31,6 +31,7 @@ from conversation_context import ConversationContext
 from credential_store import get_api_key
 from desktop_activity_indicator import ACTIVITY_TOOLS, BROWSER_ACTIVITY_TOOLS, DesktopActivityEvent, DESKTOP_ACTIVITY_TOOLS
 from browser_actions import STATE_CHANGING_ACTIONS
+from browser_cache import BrowserActionCache, parse_browser_task_intent
 from browser_runtime import BrowserExecutionSession, PlaywrightMCPBackend
 from responses_tool_protocol import continue_input, function_call_output, function_calls
 from runtime_task_state import RuntimeTaskState
@@ -352,7 +353,8 @@ class AgentRuntime:
                  context_tokens: int = API_CONTEXT_TOKEN_BUDGET,
                  recent_turns: int = API_CONTEXT_RECENT_TURNS,
                  model_provider: str | None = None,
-                 task_journal: Any | None = None):
+                 task_journal: Any | None = None,
+                 browser_cache: BrowserActionCache | None = None):
         self.ui = ui_queue
         self.model = model
         self.model_provider = model_provider or MODEL_PROVIDER
@@ -363,6 +365,7 @@ class AgentRuntime:
         self.tools = ControlledTools(working_dir)
         self.policy = ToolPolicy()
         self.approvals = ApprovalManager()
+        self.browser_cache = browser_cache if browser_cache is not None else BrowserActionCache.default()
         self.desktop = DesktopTools()
         try:
             self.mcp = MCPToolBridge(MCP_CONFIG_PATH, enable_playwright=PLAYWRIGHT_MCP_ENABLED,
@@ -379,6 +382,8 @@ class AgentRuntime:
         self._active_response = None
         self._response_lock = threading.Lock()
         self._pending_execution: tuple[Any, list[dict[str, Any]], str] | None = None
+        self._pending_cached_browser: dict[str, Any] | None = None
+        self._browser_cache_status = "miss"
         # The transcript is kept in memory only while the user completes a CAPTCHA in
         # the already-open, local MCP browser.  It never contains CAPTCHA answers.
         self._pending_human_verification: dict[str, Any] | None = None
@@ -405,6 +410,8 @@ class AgentRuntime:
         self.context.clear()
         self.approvals.pending = None
         self._pending_execution = None
+        self._pending_cached_browser = None
+        self._browser_cache_status = "miss"
         self._pending_human_verification = None
         self._cancel_human_handoff_timer()
         self._task_authorized_until = 0.0
@@ -421,6 +428,8 @@ class AgentRuntime:
         self.context.clear()
         self.approvals.pending = None
         self._pending_execution = None
+        self._pending_cached_browser = None
+        self._browser_cache_status = "miss"
         self._pending_human_verification = None
         self._cancel_human_handoff_timer()
         self._task_authorized_until = 0.0
@@ -599,8 +608,22 @@ class AgentRuntime:
                 "failure_kind": (str(result.get("failure_kind")) if isinstance(result, dict)
                                   and result.get("failure_kind") else payload.get("failure_kind")),
                 "action_steps": int(result.get("action_steps") or 0) if isinstance(result, dict) else 0,
+                "execution_source": str(result.get("execution_source") or "model") if isinstance(result, dict) else "model",
+                "cache_status": str(result.get("cache_status") or "miss") if isinstance(result, dict) else "miss",
+                "postcondition_passed": bool(result.get("postcondition_passed")) if isinstance(result, dict) else False,
+                "model_fallback": bool(result.get("model_fallback")) if isinstance(result, dict) else False,
+                "model_planning_requests": int(result.get("model_planning_requests") or 0) if isinstance(result, dict) else 0,
+                "deterministic_steps": int(result.get("deterministic_steps") or 0) if isinstance(result, dict) else 0,
             })
         self.ui.put(("tool_result", payload))
+
+    def _browser_cache_lookup(self, text: str):
+        """Look up only the narrow read-only search workflow cache."""
+        intent = parse_browser_task_intent(text, key=self.browser_cache.key)
+        return self.browser_cache.lookup(intent)
+
+    def _browser_cache_intent(self, text: str):
+        return parse_browser_task_intent(text, key=self.browser_cache.key)
 
     def _block_empty_input(self) -> None:
         state = RuntimeTaskState.start(self.task_journal, "Desktop task", requires_action=False)
@@ -688,6 +711,7 @@ class AgentRuntime:
             self._browser_session = None
             if self._task_state is None:
                 self._desktop_target_launches = 0
+            self._pending_cached_browser = None
         if not ephemeral:
             self._maybe_compact_context(api_key)
         self.ui.put(("status", "agent inspecting…"))
@@ -703,6 +727,26 @@ class AgentRuntime:
         original_text = "Answer the attached Word question" if ephemeral else self._clean_task_text(text)
         if not ephemeral:
             self._ensure_task_state(original_text)
+        if not ephemeral and approval_status == "none":
+            intent = self._browser_cache_intent(original_text)
+            lookup = self.browser_cache.lookup(intent)
+            self._browser_cache_status = lookup.status
+            if intent is not None and lookup.status in {"exact_hit", "template_hit"} and lookup.entry:
+                request = self.request_approval(
+                    "browser_action_batch",
+                    {"cache_status": lookup.status},
+                    Risk.EXTERNAL_OR_ELEVATED,
+                    "Authorize the verified read-only browser workflow for this task",
+                )
+                if self._task_state is not None:
+                    self._task_state.record_confirmation()
+                self._pending_cached_browser = {
+                    "intent": intent,
+                    "entry": lookup.entry,
+                    "original_text": original_text,
+                }
+                self.ui.put(("status", "verified browser workflow ready…"))
+                return
         if approval_status == "approved" and self._pending_execution:
             call, transcript, original_text = self._pending_execution
             self._pending_execution = None
@@ -722,6 +766,28 @@ class AgentRuntime:
             self._publish_tool_result(call.name, arguments if isinstance(arguments, dict) else {}, result)
             transcript.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
             transcript = self._append_desktop_observation(transcript, call.name)
+        if approval_status == "approved" and self._pending_cached_browser:
+            pending = self._pending_cached_browser
+            self._pending_cached_browser = None
+            self._task_authorized_until = time.monotonic() + self.TASK_AUTHORIZATION_SECONDS
+            self.ui.put(("system", "? Task authorized. Replaying the verified browser workflow."))
+            result = self._run_cached_browser_task(pending["intent"], pending["entry"], ephemeral=ephemeral)
+            if result.get("ok"):
+                self._task_authorized_until = 0.0
+                self.ui.put(("delta", self._cached_browser_delta(result)))
+                if not ephemeral:
+                    self._finish_task("completed")
+            else:
+                self.ui.put(("system", "缓存步骤未通过当前页面验证，已交回模型重新规划。"))
+                self._browser_cache_status = "fallback"
+                fallback_content = [{"role": "user", "content": [{
+                    "type": "input_text",
+                    "text": (str(pending.get("original_text") or original_text)
+                             + "\nThe deterministic browser workflow could not prove the current page state. "
+                             "Re-plan with a fresh browser snapshot."),
+                }]}]
+                return self._run_task_loop(api_key, fallback_content, str(pending.get("original_text") or original_text), ephemeral)
+            return
         return self._run_task_loop(api_key, transcript, original_text, ephemeral)
 
     def _run_no_tools_ephemeral_turn(self, api_key: str, text: str) -> None:
@@ -774,6 +840,7 @@ class AgentRuntime:
                 self._task_authorized_until = 0.0
                 self.ui.put(("delta", answer))
                 if not ephemeral:
+                    self._record_browser_cache_success(original_text)
                     self.ui.put(("ctx", self.context.usage_percent()))
                     self._finish_task("completed")
                 return
@@ -1541,8 +1608,90 @@ class AgentRuntime:
                 max_action_steps=20,
                 handoff_timeout_seconds=self.BROWSER_HANDOFF_TIMEOUT_SECONDS,
                 on_state_action=self._publish_browser_activity,
+                locator_key=self.browser_cache.key,
             )
         return self._browser_session.execute(arguments.get("actions"))
+
+    def _run_cached_browser_task(self, intent: Any, entry: Any, *, ephemeral: bool = False) -> dict[str, Any]:
+        """Replay one persisted, read-only browser workflow through the same backend."""
+        if not self.full_access:
+            return {"ok": False, "failure_kind": "browser_cache_not_authorized",
+                    "execution_source": "cache", "cache_status": "fallback",
+                    "model_fallback": True, "postcondition_passed": False}
+        if not self.mcp:
+            return {"ok": False, "failure_kind": "browser_backend_unavailable",
+                    "execution_source": "cache", "cache_status": "fallback",
+                    "model_fallback": True, "postcondition_passed": False}
+        isolated_check = getattr(self.mcp, "is_browser_isolated", None)
+        if callable(isolated_check) and not isolated_check():
+            return {"ok": False, "failure_kind": "browser_not_isolated",
+                    "execution_source": "cache", "cache_status": "fallback",
+                    "model_fallback": True, "postcondition_passed": False}
+        try:
+            self.mcp.schemas(("playwright",))
+        except Exception:
+            return {"ok": False, "failure_kind": "browser_backend_unavailable",
+                    "execution_source": "cache", "cache_status": "fallback",
+                    "model_fallback": True, "postcondition_passed": False}
+        self._browser_session = BrowserExecutionSession(
+            PlaywrightMCPBackend(self.mcp),
+            max_action_steps=20,
+            handoff_timeout_seconds=self.BROWSER_HANDOFF_TIMEOUT_SECONDS,
+            on_state_action=self._publish_browser_activity,
+            locator_key=self.browser_cache.key,
+        )
+        status = self._browser_cache_status if self._browser_cache_status in {"exact_hit", "template_hit"} else "hit"
+        result = self._browser_session.execute_cached_search(intent, entry.template, cache_status=status)
+        safe_arguments = {"actions": [
+            {"action": str(step.get("action") or "")}
+            for step in entry.template.get("steps", [])
+            if isinstance(step, dict) and step.get("action") not in {"wait_for_options"}
+        ]}
+        if not result.get("ok"):
+            try:
+                self.browser_cache.record_failure(entry.entry_id)
+            except Exception:
+                pass
+        if not ephemeral and self._task_state is not None:
+            # Keep the same bounded tool lifecycle as a model-planned browser
+            # action, while exposing only action types (never cached locators,
+            # URLs, query text, or extracted page data).
+            self.ui.put(("tool", ("Browser action", safe_arguments)))
+            self._task_state.record_tool_result("browser_action_batch", result)
+            self._publish_tool_result("browser_action_batch", safe_arguments, result)
+        return result
+
+    @staticmethod
+    def _cached_browser_delta(result: dict[str, Any]) -> str:
+        """Render verified cached fields for the user without telemetry reuse."""
+        extraction = result.get("extraction") if isinstance(result, dict) else None
+        fields = extraction.get("fields") if isinstance(extraction, dict) else None
+        if not isinstance(fields, dict):
+            return "已按已验证的浏览器步骤完成任务。"
+        rendered = [f"{key}：{str(value).strip()}" for key, value in fields.items()
+                    if str(key) in {"title", "source", "price", "url"}
+                    and str(value).strip()]
+        if not rendered:
+            return "已按已验证的浏览器步骤完成任务。"
+        return "已按已验证的浏览器步骤完成任务。结果：" + "；".join(rendered)
+
+    def _record_browser_cache_success(self, original_text: str) -> None:
+        session = self._browser_session
+        if session is None or not session.cacheable_workflow():
+            return
+        intent = self._browser_cache_intent(original_text)
+        if intent is None:
+            return
+        try:
+            self.browser_cache.record_success(
+                intent,
+                session.cached_workflow_template(fields=intent.fields),
+            )
+            self._browser_cache_status = "stored"
+        except Exception:
+            # Caching is an optimization. A local storage failure must never
+            # change the verified result of the current model-driven task.
+            self._browser_cache_status = "storage_unavailable"
 
     def _publish_browser_activity(self, phase: str, action: str) -> None:
         labels = {

@@ -13,6 +13,14 @@ import time
 from typing import Any, Callable, Protocol
 
 from browser_actions import STATE_CHANGING_ACTIONS, BrowserAction, validate_browser_action_batch
+from browser_cache import (
+    BrowserTaskIntent,
+    LocatorDescriptor,
+    build_parameterized_search_template,
+    locator_for_candidate,
+    parse_snapshot_candidates,
+    resolve_locator,
+)
 from browser_ref_extractor import TrustedBrowserRefExtractor, parse_ref_snapshot
 
 
@@ -107,12 +115,14 @@ class BrowserExecutionSession:
 
     def __init__(self, backend: BrowserBackend, *, max_action_steps: int = 20,
                  handoff_timeout_seconds: int = 120, clock=time.monotonic,
-                 on_state_action: Callable[[str, str], None] | None = None):
+                 on_state_action: Callable[[str, str], None] | None = None,
+                 locator_key: bytes | None = None):
         self.backend = backend
         self.max_action_steps = max(1, int(max_action_steps))
         self.handoff_timeout_seconds = max(1, int(handoff_timeout_seconds))
         self.clock = clock
         self.on_state_action = on_state_action
+        self.locator_key = bytes(locator_key or b"deskorb-process-locator-key")
         self.reset()
 
     def reset(self) -> None:
@@ -135,6 +145,11 @@ class BrowserExecutionSession:
         self._last_verify_observation_id = ""
         self._evidence_failure_count = 0
         self._trusted_extractor = TrustedBrowserRefExtractor()
+        self._interaction_stage = "unknown"
+        self._last_fill_value = ""
+        self._action_log: list[dict[str, Any]] = []
+        self._learned_locators: dict[str, LocatorDescriptor] = {}
+        self._cache_verified = False
 
     @property
     def observation_id(self) -> str:
@@ -175,6 +190,11 @@ class BrowserExecutionSession:
             else:
                 final = self._state_action(action, initial_observation)
             self._action_steps += 1
+            self._action_log.append({
+                "action": action.action,
+                "ok": bool(final.get("ok")),
+                "state_changed": bool(final.get("state_changed")),
+            })
             observations.append({
                 "action": action.action,
                 "ok": bool(final.get("ok")),
@@ -197,6 +217,7 @@ class BrowserExecutionSession:
         result["batch_action_steps"] = len(actions)
         result["action_steps"] = self._action_steps
         result["observation_id"] = self._observation_id
+        result["interaction_stage"] = self._interaction_stage
         return result
 
     def _observe(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -221,11 +242,14 @@ class BrowserExecutionSession:
         self._observation_id = f"obs-{self._observation_counter}"
         self._state_fingerprint = self._fingerprint(content)
         self._last_snapshot = content
+        if self._interaction_stage == "waiting_for_options" and self._has_options(content):
+            self._interaction_stage = "ready_to_choose"
         self._reobservation_required = False
         # A new observation invalidates all ref-bound evidence and any
         # observation-only retry signature.  State actions already do this
         # through _observe(); explicit snapshots must obey the same rule.
         self._extractions.clear()
+        self._cache_verified = False
         self._last_extract_signature = None
         self._last_extract_observation_id = ""
         self._last_verify_signature = None
@@ -279,7 +303,24 @@ class BrowserExecutionSession:
                                  "Fresh browser observation is required before retrying this action.",
                                  requires_reobservation=True)
 
+        if action.action == "fill_ref" and self._interaction_stage in {
+            "waiting_for_options", "ready_to_choose",
+        }:
+            return self._failure(
+                "browser_input_stage_locked",
+                "The search input has already been filled. Observe or choose the current option; "
+                "do not fill the same search field again.",
+                interaction_stage=self._interaction_stage,
+                requires_reobservation=self._interaction_stage == "waiting_for_options",
+            )
+
+        # Capture the semantic role before the action.  Autocomplete widgets
+        # commonly re-render and replace the input ref immediately after the
+        # fill call, so checking only the post-action snapshot can miss the
+        # stage lock and permit a repeated search.
+        autocomplete_input = self._is_autocomplete_input(action)
         before = self._state_fingerprint
+        self._remember_locator(action)
         if action.action in {"click_ref", "fill_ref", "select_ref"} and self._is_high_risk_action(action):
             return self._failure("browser_high_risk_confirmation_required",
                                  "This browser action is outside the bounded read-only contract.")
@@ -303,6 +344,31 @@ class BrowserExecutionSession:
         after = self._observe({})
         if not after.get("ok"):
             return {**after, "requires_reobservation": True}
+
+        # Dynamic autocomplete controls frequently render their listbox after
+        # the input call returns.  Wait inside the trusted runtime so the model
+        # cannot respond by typing into the same search field again.  The wait
+        # is bounded and is not counted as another model semantic action.
+        if autocomplete_input:
+            self._last_fill_value = str(action.arguments.get("value", action.arguments.get("text", "")))
+            self._interaction_stage = "waiting_for_options"
+            for _ in range(8):
+                if self._has_options(after.get("content")):
+                    self._interaction_stage = "ready_to_choose"
+                    break
+                try:
+                    waited = self.backend.call("wait", {"seconds": 0.15})
+                except Exception:
+                    break
+                if not isinstance(waited, dict) or not waited.get("ok"):
+                    break
+                refreshed = self._observe({})
+                if not refreshed.get("ok"):
+                    break
+                after = refreshed
+                if self._has_options(after.get("content")):
+                    self._interaction_stage = "ready_to_choose"
+                    break
         changed = bool(after.get("observation_id") and self._state_fingerprint != before)
         if changed:
             self._last_no_progress_signature = None
@@ -314,7 +380,8 @@ class BrowserExecutionSession:
             self._evidence_failure_count = 0
             return {**result, "ok": True, "state_changed": True,
                     "observation_id": self._observation_id,
-                    "content": after.get("content")}
+                    "content": after.get("content"),
+                    "interaction_stage": self._interaction_stage}
 
         self._no_progress_count += 1
         if self._no_progress_count >= 2:
@@ -328,7 +395,21 @@ class BrowserExecutionSession:
                 "error": "The browser action completed without an observable page change.",
                 "requires_reobservation": True,
                 "observation_id": self._observation_id,
-                "content": after.get("content")}
+                "content": after.get("content"),
+                "interaction_stage": self._interaction_stage}
+
+    @staticmethod
+    def _has_options(content: Any) -> bool:
+        return any(candidate.role in {"option", "listbox"}
+                   for candidate in parse_snapshot_candidates(content))
+
+    def _is_autocomplete_input(self, action: BrowserAction) -> bool:
+        if action.action != "fill_ref":
+            return False
+        ref = str(action.arguments.get("ref") or "")
+        candidate = next((item for item in parse_snapshot_candidates(self._last_snapshot)
+                          if item.ref == ref), None)
+        return bool(candidate and candidate.role in {"combobox", "searchbox"})
 
     def _emit_state_activity(self, phase: str, action: str) -> None:
         if self.on_state_action is None:
@@ -363,6 +444,7 @@ class BrowserExecutionSession:
             )
         self._last_extract_signature = signature
         self._last_extract_observation_id = self._observation_id
+        self._remember_locator(BrowserAction("extract", arguments))
         try:
             result = self.backend.call("extract", arguments)
         except Exception:
@@ -472,7 +554,9 @@ class BrowserExecutionSession:
         verification = {"passed": bool(passed), "kind": "browser_structured_verification",
                         "matched_fields": sum(bool(value) for value in fields.values()),
                         "required_fields": len(required)}
+        self._cache_verified = bool(passed)
         return {"ok": True, "verified": bool(passed), "verification": verification,
+                "postcondition_passed": bool(passed),
                 "observation_id": self._observation_id, "state_changed": False}
 
     def _evidence_failure(self, failure_kind: str, error: str, **extra: Any) -> dict[str, Any]:
@@ -502,6 +586,11 @@ class BrowserExecutionSession:
         self._last_verify_signature = None
         self._last_verify_observation_id = ""
         self._evidence_failure_count = 0
+        self._interaction_stage = "unknown"
+        self._last_fill_value = ""
+        self._learned_locators.clear()
+        self._action_log.clear()
+        self._cache_verified = False
         self._trusted_extractor.invalidate()
         return {"ok": False, "failure_kind": self._handoff_reason,
                 "error": "Browser interaction made no progress; manual handoff is required.",
@@ -526,11 +615,174 @@ class BrowserExecutionSession:
         self._last_verify_signature = None
         self._last_verify_observation_id = ""
         self._evidence_failure_count = 0
+        self._interaction_stage = "unknown"
+        self._last_fill_value = ""
+        self._learned_locators.clear()
+        self._action_log.clear()
+        self._cache_verified = False
         self._trusted_extractor.invalidate()
 
     def _failure(self, failure_kind: str, error: str, **extra: Any) -> dict[str, Any]:
         return {"ok": False, "failure_kind": failure_kind, "error": error,
                 "observation_id": self._observation_id, **extra}
+
+    @property
+    def interaction_stage(self) -> str:
+        return self._interaction_stage
+
+    @property
+    def cache_verified(self) -> bool:
+        return self._cache_verified
+
+    def cacheable_workflow(self) -> bool:
+        actions = {item.get("action") for item in self._action_log if item.get("ok")}
+        return self._cache_verified and {"fill_ref", "click_ref", "extract", "verify"}.issubset(actions)
+
+    def cached_workflow_template(self, fields: tuple[str, ...] = ("title", "source")) -> dict[str, Any]:
+        template = build_parameterized_search_template(fields=fields)
+        for step in template.get("steps", []):
+            if not isinstance(step, dict):
+                continue
+            action = str(step.get("action") or "")
+            descriptor = self._learned_locators.get(action)
+            if descriptor:
+                step["locator"] = descriptor.safe_dict()
+        return template
+
+    def resolve_semantic_locator(self, descriptor: LocatorDescriptor,
+                                 variables: dict[str, str] | None = None) -> str | None:
+        return resolve_locator(
+            descriptor,
+            parse_snapshot_candidates(self._last_snapshot),
+            variables,
+            key=self.locator_key,
+        )
+
+    def execute_cached_search(self, intent: BrowserTaskIntent,
+                              template: dict[str, Any], *, cache_status: str = "hit") -> dict[str, Any]:
+        """Replay the bounded read-only search chain without a model request."""
+        if str(template.get("kind") or "") != "read_only_search":
+            return self._cache_failure("browser_cache_template_invalid", cache_status)
+        self.reset()
+
+        def run(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            result = self.execute([{"action": action, "arguments": arguments}])
+            if not result.get("ok"):
+                return {
+                    **result,
+                    "execution_source": "cache",
+                    "cache_status": cache_status,
+                    "model_fallback": True,
+                    "postcondition_passed": False,
+                }
+            return result
+
+        navigated = run("navigate", {"url": intent.start_url})
+        if not navigated.get("ok"):
+            return navigated
+        observed = run("snapshot", {})
+        if not observed.get("ok"):
+            return observed
+        fill_ref = self._cached_ref(template, "fill_ref", {"query": intent.query})
+        if not fill_ref:
+            return self._cache_failure("browser_cache_locator_ambiguous", cache_status)
+        filled = run("fill_ref", {"ref": fill_ref, "value": intent.query,
+                                   "observation_id": self.observation_id})
+        if not filled.get("ok"):
+            return filled
+        click_ref = self._cached_ref(template, "click_ref", {"target_label": intent.target_label})
+        if not click_ref:
+            return self._cache_failure("browser_cache_locator_ambiguous", cache_status)
+        clicked = run("click_ref", {"ref": click_ref, "observation_id": self.observation_id})
+        if not clicked.get("ok"):
+            return clicked
+        extract_ref = self._cached_ref(template, "extract", {})
+        if not extract_ref:
+            return self._cache_failure("browser_cache_result_not_found", cache_status)
+        extracted = run("extract", {"ref": extract_ref, "fields": list(intent.fields),
+                                     "observation_id": self.observation_id})
+        if not extracted.get("ok"):
+            return extracted
+        verified = run("verify", {"required_fields": list(intent.fields)})
+        if not verified.get("ok") or not verified.get("verification", {}).get("passed"):
+            return self._cache_failure("browser_cache_postcondition_failed", cache_status, **verified)
+        return {
+            **verified,
+            "ok": True,
+            "verified": True,
+            "execution_source": "cache",
+            "cache_status": cache_status,
+            "model_fallback": False,
+            "model_planning_requests": 0,
+            "deterministic_steps": self._action_steps,
+            "postcondition_passed": True,
+            "extraction": extracted.get("extraction"),
+        }
+
+    def _cached_ref(self, template: dict[str, Any], action: str,
+                    variables: dict[str, str]) -> str | None:
+        locator_data: dict[str, Any] = {}
+        for step in template.get("steps", []):
+            if isinstance(step, dict) and step.get("action") == action:
+                if isinstance(step.get("locator"), dict):
+                    locator_data = step["locator"]
+                break
+        role = str(locator_data.get("role") or ("combobox" if action == "fill_ref" else "option"))
+        descriptor = LocatorDescriptor(
+            role=role,
+            # The accessible name/value of a combobox can include the current
+            # query. Parameterized replay must rely on its role and current
+            # observation, not on the previous query's digest.
+            name_digest=("" if action == "fill_ref"
+                         else str(locator_data.get("name_digest") or "")),
+            placeholder=str(locator_data.get("placeholder") or ""),
+            parent_roles=tuple(str(item) for item in locator_data.get("parent_roles") or []),
+            state_tokens=tuple(str(item) for item in locator_data.get("state_tokens") or []),
+            relative_position=(int(locator_data["relative_position"])
+                              if locator_data.get("relative_position") is not None else None),
+        )
+        ref = self.resolve_semantic_locator(
+            descriptor,
+            {} if action == "fill_ref" else variables,
+        )
+        if ref:
+            return ref
+        if action == "extract":
+            for fallback_role in ("article", "region", "main", "section", "group"):
+                ref = self.resolve_semantic_locator(LocatorDescriptor(role=fallback_role), {})
+                if ref:
+                    return ref
+        return None
+
+    @staticmethod
+    def _cache_failure(failure_kind: str, cache_status: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "failure_kind": failure_kind,
+            "execution_source": "cache",
+            "cache_status": cache_status,
+            "model_fallback": True,
+            "model_planning_requests": 0,
+            "postcondition_passed": False,
+            **extra,
+        }
+
+    def _remember_locator(self, action: BrowserAction) -> None:
+        if action.action not in {"fill_ref", "click_ref", "extract"}:
+            return
+        ref = str(action.arguments.get("ref") or "")
+        if not ref:
+            return
+        candidate = next((item for item in parse_snapshot_candidates(self._last_snapshot)
+                          if item.ref == ref), None)
+        if candidate is None:
+            return
+        placeholder = {
+            "fill_ref": "$query", "click_ref": "$target_label", "extract": "$result_root",
+        }[action.action]
+        self._learned_locators[action.action] = locator_for_candidate(
+            candidate, key=self.locator_key, placeholder=placeholder
+        )
 
     @staticmethod
     def _recovery_hint(error: str) -> str:

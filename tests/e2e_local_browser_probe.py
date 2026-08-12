@@ -132,13 +132,42 @@ def _run_turn_bounded(runtime: AgentRuntime, text: str, timeout_seconds: int | N
     return True, None
 
 
+def _classify_probe_timeout(failure_kind: str | None,
+                            browser_trace: list[dict[str, object]]) -> str | None:
+    """Separate model-planning stalls from a browser action stall.
+
+    A successful browser tool result followed by no next model response is a
+    provider/planner timeout, not evidence that the browser action failed.
+    """
+    if failure_kind != "provider_or_tool_timeout":
+        return failure_kind
+    if not browser_trace:
+        return failure_kind
+    latest = browser_trace[-1]
+    if latest.get("ok") and latest.get("action_types"):
+        return "model_planning_timeout"
+    if latest.get("started") and not latest.get("ok"):
+        return "browser_action_timeout"
+    return failure_kind
+
+
 def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
              timeout_seconds: int | None = None) -> dict[str, object]:
     started = time.perf_counter()
     verification_results: list[dict[str, object]] = []
+    browser_trace: list[dict[str, object]] = []
     original_dispatch = runtime._run_local_tool
 
     def record_with_verification(name, arguments):
+        if name == "browser_action_batch" and isinstance(arguments, dict):
+            browser_trace.append({
+                "started": True,
+                "action_types": [
+                    str(item.get("action") or "")[:32]
+                    for item in arguments.get("actions") or []
+                    if isinstance(item, dict)
+                ][:8],
+            })
         result = original_dispatch(name, arguments)
         if isinstance(result, dict) and isinstance(result.get("verification"), dict):
             verification = result["verification"]
@@ -162,6 +191,29 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
                     "observed_chars": verification.get("observed_chars"),
                     "observed_numbers": verification.get("observed_numbers"),
                 })
+        if name == "browser_action_batch" and isinstance(result, dict):
+            completed_trace = {
+                "ok": bool(result.get("ok")),
+                "failure_kind": str(result.get("failure_kind") or "")[:80] or None,
+                "state_changed": bool(result.get("state_changed")),
+                "action_steps": int(result.get("action_steps") or 0),
+                "interaction_stage": str(result.get("interaction_stage") or "")[:32] or None,
+                "execution_source": str(result.get("execution_source") or "model")[:16],
+                "cache_status": str(result.get("cache_status") or "miss")[:16],
+                "model_fallback": bool(result.get("model_fallback")),
+                "postcondition_passed": bool(result.get("postcondition_passed")),
+                "observations": [
+                    {
+                        "action": str(observation.get("action") or "")[:32],
+                        "ok": bool(observation.get("ok")),
+                        "state_changed": bool(observation.get("state_changed")),
+                        "failure_kind": str(observation.get("failure_kind") or "")[:80] or None,
+                    }
+                    for observation in result.get("observations") or []
+                    if isinstance(observation, dict)
+                ][:8],
+            }
+            browser_trace[-1].update(completed_trace)
         return result
 
     runtime._run_local_tool = record_with_verification
@@ -182,14 +234,35 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
     failure_kind = None
     try:
         first_ok, first_failure = _run_turn_bounded(runtime, task, timeout_seconds)
-        failure_kind = first_failure
+        failure_kind = _classify_probe_timeout(first_failure, browser_trace)
         first = drain(events)
         token = approval_token(first)
         if first_ok and token:
             second_ok, second_failure = _run_turn_bounded(runtime, "确认 " + token, timeout_seconds)
             if not second_ok:
-                failure_kind = second_failure
+                failure_kind = _classify_probe_timeout(second_failure, browser_trace)
         all_events = [*first, *drain(events)]
+        # A cache replay publishes its bounded tool_result directly from the
+        # approval continuation, so it does not pass through the model-tool
+        # dispatcher wrapper above. Add only cache-sourced results here; model
+        # results are already represented by the wrapper trace.
+        for kind, value in all_events:
+            if (kind != "tool_result" or not isinstance(value, dict)
+                    or value.get("tool") != "browser_action_batch"
+                    or value.get("execution_source") != "cache"):
+                continue
+            browser_trace.append({
+                "started": False,
+                "action_types": [str(item)[:32] for item in value.get("action_types") or []][:8],
+                "ok": bool(value.get("ok")),
+                "failure_kind": str(value.get("failure_kind") or "")[:80] or None,
+                "state_changed": bool(value.get("state_changed")),
+                "action_steps": int(value.get("action_steps") or 0),
+                "execution_source": "cache",
+                "cache_status": str(value.get("cache_status") or "miss")[:16],
+                "model_fallback": bool(value.get("model_fallback")),
+                "postcondition_passed": bool(value.get("postcondition_passed")),
+            })
         tool_calls = [value for kind, value in all_events if kind == "tool"]
         mcp_calls = sum(1 for value in tool_calls if isinstance(value, tuple)
                         and (value[0] in {"MCP browser tool", "Browser action", "browser_action_batch"}
@@ -207,10 +280,12 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
                 "evidence_passed": evidence_passed,
                 "failure_kind": failure_kind,
                 "verification_results": verification_results,
+                "browser_trace": browser_trace,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000)}
     except Exception as exc:
         return {"id": case_id, "ok": False, "error_type": type(exc).__name__,
                 "failure_kind": type(exc).__name__.lower(),
+                "browser_trace": browser_trace,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000)}
     finally:
         runtime._run_local_tool = original_dispatch
@@ -238,6 +313,30 @@ def _normalized_run(item: dict[str, object]) -> dict[str, object]:
     verified = bool(item.get("verified"))
     evidence_passed = bool(item.get("evidence_passed"))
     passed = bool(item.get("ok")) and completed and verified and evidence_passed
+    traces = [trace for trace in item.get("browser_trace") or [] if isinstance(trace, dict)]
+    action_sequence: list[str] = []
+    execution_source_counts: dict[str, int] = {}
+    cache_status_counts: dict[str, int] = {}
+    model_fallback_count = 0
+    postcondition_seen = False
+    postcondition_passed = False
+    action_steps = 0
+    for trace in traces:
+        action_sequence.extend(
+            str(action) for action in trace.get("action_types") or [] if str(action)
+        )
+        source = str(trace.get("execution_source") or "model")
+        status = str(trace.get("cache_status") or "miss")
+        execution_source_counts[source] = execution_source_counts.get(source, 0) + 1
+        cache_status_counts[status] = cache_status_counts.get(status, 0) + 1
+        model_fallback_count += int(bool(trace.get("model_fallback")))
+        if "postcondition_passed" in trace:
+            postcondition_seen = True
+            postcondition_passed = postcondition_passed or bool(trace.get("postcondition_passed"))
+        try:
+            action_steps = max(action_steps, int(trace.get("action_steps") or 0))
+        except (TypeError, ValueError):
+            pass
     return {
         "case_id": str(item.get("id") or "unknown"),
         "attempt": int(item.get("attempt") or 1),
@@ -245,6 +344,8 @@ def _normalized_run(item: dict[str, object]) -> dict[str, object]:
         "failure_kind": None if passed else (str(item.get("failure_kind") or "unverified_terminal_state")),
         "total_latency_ms": item.get("elapsed_ms"),
         "tool_rounds": int(item.get("mcp_tool_calls") or 0),
+        "action_sequence": action_sequence[:64],
+        "action_steps": action_steps,
         "approval_used": bool(item.get("approval_used")),
         "needs_task_confirmation": True,
         "task_confirmation_once": bool(item.get("approval_used")),
@@ -253,6 +354,10 @@ def _normalized_run(item: dict[str, object]) -> dict[str, object]:
         "safety_passed": True,
         "requires_evidence": True,
         "evidence_passed": evidence_passed,
+        "execution_source_counts": execution_source_counts,
+        "cache_status_counts": cache_status_counts,
+        "model_fallback_count": model_fallback_count,
+        "postcondition_passed": postcondition_passed if postcondition_seen else None,
     }
 
 
@@ -298,10 +403,12 @@ def main(argv: list[str] | None = None) -> int:
         for case_id, items in grouped.items():
             elapsed = [int(item["elapsed_ms"]) for item in items if isinstance(item.get("elapsed_ms"), int)]
             passed = sum(1 for item in items if item.get("ok"))
+            normalized_items = [_normalized_run(item) for item in items]
+            last = normalized_items[-1] if normalized_items else None
             case_summary.append({"id": case_id, "runs": len(items), "passed": passed,
                                  "success_rate": round(passed / len(items), 4) if items else 0.0,
                                  "p50_elapsed_ms": _p50(elapsed), "p95_elapsed_ms": _p95(elapsed),
-                                 "last": items[-1] if items else None})
+                                 "last": last})
         runs = [_normalized_run(item) for item in reports]
         payload = {"ok": bool(runs) and all(item["outcome"] == "passed" for item in runs),
                    "repetitions": repetitions, "runs": runs, "cases": case_summary}

@@ -438,6 +438,11 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
     completed = False
     verified = False
     runtime_error = False
+    execution_source_counts: dict[str, int] = {}
+    cache_status_counts: dict[str, int] = {}
+    model_fallback_count = 0
+    postcondition_passed = False
+    postcondition_seen = False
     terminal: str | None = None
     failure_kind: str | None = None
     failed_tool: str | None = None
@@ -481,6 +486,15 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
             tool_failure_kind = str(value.get("failure_kind") or "tool_failure")
             if isinstance(value.get("exit_code"), int):
                 failed_exit_code = int(value["exit_code"])
+        if kind == "tool_result" and isinstance(value, dict):
+            source = str(value.get("execution_source") or "model")
+            status = str(value.get("cache_status") or "miss")
+            execution_source_counts[source] = execution_source_counts.get(source, 0) + 1
+            cache_status_counts[status] = cache_status_counts.get(status, 0) + 1
+            model_fallback_count += int(bool(value.get("model_fallback")))
+            if "postcondition_passed" in value:
+                postcondition_seen = True
+                postcondition_passed = postcondition_passed or bool(value.get("postcondition_passed"))
     return {
         "total_latency_ms": round(max(0.0, (finished_at - started_at) * 1000), 2),
         "first_response_ms": first_response_ms,
@@ -497,6 +511,10 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
         "failed_tool": failed_tool,
         "tool_failure_kind": tool_failure_kind,
         "failed_exit_code": failed_exit_code,
+        "execution_source_counts": execution_source_counts,
+        "cache_status_counts": cache_status_counts,
+        "model_fallback_count": model_fallback_count,
+        "postcondition_passed": postcondition_passed if postcondition_seen else None,
     }
 
 
@@ -1123,6 +1141,10 @@ def _finish_record(case: Mapping[str, Any], attempt: int,
         "failed_tool": metrics.get("failed_tool"),
         "tool_failure_kind": metrics.get("tool_failure_kind"),
         "failed_exit_code": metrics.get("failed_exit_code"),
+        "execution_source_counts": dict(metrics.get("execution_source_counts") or {}),
+        "cache_status_counts": dict(metrics.get("cache_status_counts") or {}),
+        "model_fallback_count": int(metrics.get("model_fallback_count") or 0),
+        "postcondition_passed": metrics.get("postcondition_passed"),
     })
     return result
 
@@ -1167,6 +1189,10 @@ def _record_base(case: Mapping[str, Any], attempt: int, outcome: str,
         "failure_category": failure_kind,
         "minimum_required_steps": int(baseline.get("minimum_required_steps") or 0),
         "missing_required_action_kinds": list(baseline.get("required_action_kinds") or ()),
+        "execution_source_counts": {},
+        "cache_status_counts": {},
+        "model_fallback_count": 0,
+        "postcondition_passed": None,
     }
 
 

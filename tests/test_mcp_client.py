@@ -71,6 +71,23 @@ class MCPClientTests(unittest.TestCase):
         bridge = MCPToolBridge(None, enable_playwright=True)
         self.assertTrue(bridge.is_browser_isolated())
 
+    def test_playwright_output_dir_is_private_and_cleaned_with_bridge(self):
+        bridge = MCPToolBridge(None, enable_playwright=True, enable_officecli=False)
+        spec = next(item for item in bridge.specs if item.name == "playwright")
+        output_index = spec.args.index("--output-dir")
+        output_dir = Path(spec.args[output_index + 1])
+
+        # The path is reserved at bridge construction, but the directory is
+        # created only when the Playwright process actually starts.
+        self.assertFalse(output_dir.exists())
+        self.assertNotEqual(output_dir.parent.resolve(), Path(__file__).resolve().parents[1])
+        self.assertTrue(output_dir.name.startswith("deskorb-playwright-output-"))
+
+        output_dir.mkdir()
+        bridge.close()
+
+        self.assertFalse(output_dir.exists())
+
     def test_default_servers_include_officecli_when_binary_exists(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "officecli.exe"

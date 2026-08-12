@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import re
+import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
@@ -107,7 +109,8 @@ def resolve_officecli_binary(explicit: str | Path | None = None) -> str | None:
 
 def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool = True,
                      enable_officecli: bool = True,
-                     officecli_binary: str | Path | None = None) -> list[MCPServerSpec]:
+                     officecli_binary: str | Path | None = None,
+                     playwright_output_dir: str | Path | None = None) -> list[MCPServerSpec]:
     """Load trusted local servers from a standard ``mcpServers`` JSON file."""
     value = str(config_path or "").strip()
     if value:
@@ -122,6 +125,8 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
         if not isinstance(servers, dict):
             raise MCPError("MCP config must contain an object named mcpServers.")
         result = [_parse_server(name, spec, path.parent) for name, spec in servers.items()]
+        if playwright_output_dir:
+            result = [_with_playwright_output_dir(spec, playwright_output_dir) for spec in result]
         return [spec for spec in result if spec is not None]
     root = Path(__file__).resolve().parent
     interpreter = Path(sys.executable)
@@ -134,8 +139,11 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
     if enable_playwright:
         local = default_playwright_paths()
         if not local_playwright_diagnostics():
+            args = (str(local["cli"]), "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated")
+            if playwright_output_dir:
+                args += ("--output-dir", str(Path(playwright_output_dir).resolve()))
             result.append(MCPServerSpec(
-                "playwright", "node", (str(local["cli"]), "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated"),
+                "playwright", "node", args,
                 {"PLAYWRIGHT_BROWSERS_PATH": str(local["browsers"])}, str(root),
                 allow_safe_tools=True,
             ))
@@ -143,9 +151,12 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
             # Keep the fallback aligned with the checked-in local release.
             # ``latest`` can silently change tool schemas and invalidate the
             # semantic adapter's ref/observation contract.
+            args = ("-y", "@playwright/mcp@0.0.79", "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated")
+            if playwright_output_dir:
+                args += ("--output-dir", str(Path(playwright_output_dir).resolve()))
             result.append(MCPServerSpec(
                 "playwright", "npx",
-                ("-y", "@playwright/mcp@0.0.79", "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated"),
+                args,
                 {}, None, allow_safe_tools=True,
             ))
     result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root),
@@ -179,6 +190,41 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                 allow_safe_tools=True,
             ))
     return result
+
+
+def _with_playwright_output_dir(spec: MCPServerSpec | None,
+                                output_dir: str | Path) -> MCPServerSpec | None:
+    """Add a private output directory to a configured Playwright server only."""
+    if spec is None or spec.name != "playwright" or "--output-dir" in spec.args:
+        return spec
+    return MCPServerSpec(
+        name=spec.name, command=spec.command,
+        args=(*spec.args, "--output-dir", str(Path(output_dir).resolve())),
+        env=dict(spec.env), cwd=spec.cwd, intent_keywords=spec.intent_keywords,
+        description=spec.description, allowed_tools=spec.allowed_tools,
+        allowed_domains=spec.allowed_domains, allow_safe_tools=spec.allow_safe_tools,
+        capability=spec.capability, read_only_tools=spec.read_only_tools,
+        action_tools=spec.action_tools, allowed_roots=spec.allowed_roots,
+        max_input_bytes=spec.max_input_bytes, max_output_bytes=spec.max_output_bytes,
+    )
+
+
+def _managed_playwright_output_dir(spec: MCPServerSpec) -> Path | None:
+    """Return the bridge-owned output path that should be created lazily.
+
+    User-supplied MCP configs may point Playwright at an existing directory;
+    only the bridge's reserved temp-path convention is managed here.
+    """
+    if spec.name != "playwright" or "--output-dir" not in spec.args:
+        return None
+    index = spec.args.index("--output-dir")
+    if index + 1 >= len(spec.args):
+        return None
+    candidate = Path(spec.args[index + 1]).expanduser().resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if candidate.parent != temp_root or not candidate.name.startswith("deskorb-playwright-output-"):
+        return None
+    return candidate
 
 
 def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
@@ -269,6 +315,16 @@ class StdioMCPClient:
         with self._lock:
             if self._process and self._process.poll() is None:
                 return
+            managed_output_dir = _managed_playwright_output_dir(self.spec)
+            created_output_dir = False
+            if managed_output_dir is not None and not managed_output_dir.exists():
+                try:
+                    managed_output_dir.mkdir(parents=True, exist_ok=False)
+                    created_output_dir = True
+                except OSError as exc:
+                    raise MCPError(
+                        f"Could not prepare the private Playwright output directory: {exc}"
+                    ) from exc
             env = os.environ.copy()
             env.update(self.spec.env)
             flags = 0x08000000 if os.name == "nt" else 0
@@ -282,6 +338,8 @@ class StdioMCPClient:
                     cwd=self.spec.cwd, env=env, creationflags=flags,
                 )
             except OSError as exc:
+                if created_output_dir:
+                    shutil.rmtree(managed_output_dir, ignore_errors=True)
                 raise MCPError(f"Could not start MCP server {self.spec.name}: {exc}") from exc
             threading.Thread(target=self._read_stdout, daemon=True, name=f"mcp-{self.spec.name}").start()
             self._request("initialize", {
@@ -378,9 +436,28 @@ class MCPToolBridge:
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
                  enable_officecli: bool = True, officecli_binary: str | Path | None = None,
                  timeout_seconds: int = 30, officecli_timeout_seconds: int | None = None):
-        self.specs = load_mcp_servers(config_path, enable_playwright=enable_playwright,
-                                      enable_officecli=enable_officecli,
-                                      officecli_binary=officecli_binary)
+        self._owned_output_dirs: set[Path] = set()
+        output_dir = None
+        if enable_playwright:
+            # Reserve a unique, private path without creating it yet.  The
+            # Playwright process creates the directory when it actually starts;
+            # constructing an AgentRuntime must not leave an orphan temp
+            # directory when no browser task is executed.
+            output_dir = (Path(tempfile.gettempdir()).resolve()
+                          / f"deskorb-playwright-output-{uuid.uuid4().hex}")
+            self._owned_output_dirs.add(output_dir)
+        try:
+            self.specs = load_mcp_servers(
+                config_path, enable_playwright=enable_playwright,
+                enable_officecli=enable_officecli, officecli_binary=officecli_binary,
+                playwright_output_dir=output_dir,
+            )
+        except Exception:
+            if output_dir is not None:
+                shutil.rmtree(output_dir, ignore_errors=True)
+            raise
+        # A user-supplied config may already provide its own output directory;
+        # only directories created by this bridge are owned and cleaned here.
         self.timeout_seconds = timeout_seconds
         self.officecli_timeout_seconds = max(
             int(officecli_timeout_seconds or timeout_seconds), int(timeout_seconds))
@@ -546,6 +623,12 @@ class MCPToolBridge:
     def close(self) -> None:
         for client in self.clients.values():
             client.close()
+        for output_dir in self._owned_output_dirs:
+            try:
+                if output_dir.name.startswith("deskorb-playwright-output-") and output_dir.parent == Path(tempfile.gettempdir()).resolve():
+                    shutil.rmtree(output_dir)
+            except OSError:
+                continue
 
     def _selected_servers(self, server_names: Iterable[str] | None) -> set[str]:
         if server_names is None:

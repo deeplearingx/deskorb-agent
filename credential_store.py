@@ -4,12 +4,14 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import os
+import secrets
 
 from provider_env import api_key as _provider_api_key
 from provider_env import explicit_api_key as _explicit_provider_api_key
 
 
 TARGET = "DeskOrbAgent/OpenAIAPIKey"
+BROWSER_CACHE_TARGET = "DeskOrbAgent/BrowserActionCacheKey"
 LEGACY_TARGET = "CodexOverlay/OpenAIAPIKey"
 PROVIDER_TARGETS = {
     "openai": TARGET,
@@ -88,6 +90,52 @@ def get_api_key(provider: str | None = None) -> str:
         return raw.decode("utf-16-le").strip("\x00").strip() or _provider_api_key(provider_name or None)
     finally:
         _advapi32.CredFree(pointer)
+
+
+def _read_generic_credential(target: str) -> bytes:
+    """Read one opaque Credential Manager blob without decoding its contents."""
+    if os.name != "nt":
+        return b""
+    pointer = ctypes.POINTER(CREDENTIALW)()
+    if not _advapi32.CredReadW(str(target), 1, 0, ctypes.byref(pointer)):
+        return b""
+    try:
+        cred = pointer.contents
+        if not cred.CredentialBlob or not cred.CredentialBlobSize:
+            return b""
+        return ctypes.string_at(cred.CredentialBlob, int(cred.CredentialBlobSize))
+    finally:
+        _advapi32.CredFree(pointer)
+
+
+def _write_generic_credential(target: str, value: bytes) -> bool:
+    if os.name != "nt" or not value:
+        return False
+    blob = (ctypes.c_byte * len(value)).from_buffer_copy(value)
+    cred = CREDENTIALW()
+    cred.Type = 1
+    cred.TargetName = str(target)
+    cred.CredentialBlobSize = len(value)
+    cred.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_byte))
+    cred.Persist = 2
+    cred.UserName = "DeskOrb Agent"
+    return bool(_advapi32.CredWriteW(ctypes.byref(cred), 0))
+
+
+def get_browser_cache_key() -> bytes:
+    """Return a local HMAC key for browser-cache identifiers.
+
+    On Windows the key is persisted only in Credential Manager.  Other
+    platforms return an empty value so the cache module remains process-local
+    instead of writing an unprotected key file.
+    """
+    if os.name != "nt":
+        return b""
+    current = _read_generic_credential(BROWSER_CACHE_TARGET)
+    if len(current) >= 32:
+        return current[:64]
+    candidate = secrets.token_bytes(32)
+    return candidate if _write_generic_credential(BROWSER_CACHE_TARGET, candidate) else b""
 
 
 def get_explicit_provider_api_key(provider: str | None = None) -> str:

@@ -41,6 +41,19 @@ class E2EMetricsTests(unittest.TestCase):
         self.assertEqual(summary["case_passes"]["web-001"], 2)
         self.assertEqual(summary["single_task_confirmation_coverage"], 1.0)
 
+    def test_summary_tracks_cache_source_and_model_fallback_metrics(self):
+        summary = summarize_runs([
+            {"case_id": "research-001", "outcome": "passed", "execution_source": "cache",
+             "cache_status": "exact_hit", "model_fallback": False, "postcondition_passed": True},
+            {"case_id": "research-001", "outcome": "passed", "execution_source": "model",
+             "cache_status": "fallback", "model_fallback": True, "postcondition_passed": True},
+        ])
+
+        self.assertEqual(summary["execution_source_counts"], {"cache": 1, "model": 1})
+        self.assertEqual(summary["cache_status_counts"], {"exact_hit": 1, "fallback": 1})
+        self.assertEqual(summary["model_fallback_count"], 1)
+        self.assertEqual(summary["postcondition_pass_rate"], 1.0)
+
     def test_quality_gate_reports_each_missing_requirement(self):
         summary = {"task_completion_rate": 0.5, "safety_pass_rate": 0.8,
                    "case_passes": {"web-001": 1}}

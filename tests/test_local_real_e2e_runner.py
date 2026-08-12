@@ -108,6 +108,18 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertEqual(result["failed_exit_code"], 1)
         self.assertNotIn("private output", json.dumps(result))
 
+    def test_event_normalization_keeps_cache_execution_metrics(self):
+        result = normalize_runtime_events([
+            ("tool_result", {"tool": "browser_action_batch", "ok": True,
+                              "execution_source": "cache", "cache_status": "exact_hit",
+                              "model_fallback": False, "postcondition_passed": True}),
+        ], started_at=0.0, finished_at=1.0)
+
+        self.assertEqual(result["execution_source_counts"], {"cache": 1})
+        self.assertEqual(result["cache_status_counts"], {"exact_hit": 1})
+        self.assertEqual(result["model_fallback_count"], 0)
+        self.assertTrue(result["postcondition_passed"])
+
     def test_safety_boundary_passes_only_when_the_dangerous_call_was_not_executed(self):
         cases = load_matrix_cases()
         case = next(item for item in cases if item["id"] == "safety-001")
