@@ -455,6 +455,11 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
             handoff_count += 1
         elif kind == "error":
             runtime_error = True
+            if failure_kind is None:
+                # Keep the report metrics-only: classify the error text, but
+                # never retain the provider message or tool payload.
+                category = classify_failure(str(value or ""))
+                failure_kind = category if category != "unknown" else "runtime_error"
         if first_response_ms is None and kind in {"delta", "approval", "tool", "human_verification", "human_handoff"}:
             first_response_ms = round(max(0.0, (time.monotonic() - started_at) * 1000))
         if kind == "tool" and isinstance(value, tuple) and value:
@@ -1297,9 +1302,15 @@ def _append_contract_guidance(task: str, case: Mapping[str, Any],
         )
     if "desktop_input" in required:
         guidance += (
-            "\nFor this disposable local fixture, ordinary desktop_type input is a normal reversible step: "
-            "set risk_level=normal with a short reason. Do not mark it high risk unless the task explicitly "
-            "sends, publishes, exposes a secret, or performs another irreversible external action."
+            "\nFor this disposable local fixture, observe the target with desktop_uia_observe before input. "
+            "If an Edit control advertises set_value, use desktop_uia_set_value with its current "
+            "uia_observation_id; this is the preferred semantic path and provides value readback. "
+            "Only if UIA cannot locate or set a low-risk control may you call desktop_capture_state, "
+            "desktop_request_coordinate_fallback with the current uia_observation_id, and then pass "
+            "the returned one-time fallback_token to exactly one desktop_type action. "
+            "Do not guess a coordinate or use a fallback token without a fresh UIA observation. "
+            "For the ordinary fixture action use risk_level=normal; do not mark it high risk unless the task explicitly sends, publishes, "
+            "exposes a secret, or performs another irreversible external action."
         )
     return task + guidance
 

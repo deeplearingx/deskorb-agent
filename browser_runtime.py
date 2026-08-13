@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from urllib.parse import urlsplit
 from typing import Any, Callable, Protocol
 
 from browser_actions import STATE_CHANGING_ACTIONS, BrowserAction, validate_browser_action_batch
@@ -149,7 +150,9 @@ class BrowserExecutionSession:
         self._last_fill_value = ""
         self._action_log: list[dict[str, Any]] = []
         self._learned_locators: dict[str, LocatorDescriptor] = {}
+        self._rebound_action_signatures: set[str] = set()
         self._cache_verified = False
+        self._allowed_origin = ""
 
     @property
     def observation_id(self) -> str:
@@ -256,11 +259,21 @@ class BrowserExecutionSession:
         self._last_verify_observation_id = ""
         self._trusted_extractor.observe({"observation_id": self._observation_id})
         return {**result, "ok": True, "observation_id": self._observation_id,
-                "state_changed": True}
+                "state_changed": True, "content_trust": "untrusted_page_data"}
 
     def _state_action(self, action: BrowserAction, initial_observation: str) -> dict[str, Any]:
         if self._handoff_required:
             return self._handoff_failure()
+        if action.action == "navigate":
+            url = str(action.arguments.get("url") or "")
+            parsed = urlsplit(url)
+            origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+            if self._allowed_origin and origin != self._allowed_origin:
+                return self._failure(
+                    "browser_navigation_origin_not_allowed",
+                    "Navigation to a new origin requires an explicit user target; page links cannot broaden scope.",
+                )
+            self._allowed_origin = origin
         supplied = str(action.arguments.get("observation_id") or "")
         # Navigation is the only state action that can begin a browser task
         # without an existing page observation. Ref actions must always be
@@ -285,7 +298,46 @@ class BrowserExecutionSession:
                 action = BrowserAction(action.action, {
                     **action.arguments, "observation_id": self._observation_id,
                 })
+        if self._reobservation_required:
+            return self._failure("browser_reobservation_required",
+                                 "Fresh browser observation is required before retrying this action.",
+                                 requires_reobservation=True)
+
+        # If the model tries to change the query while autocomplete is already
+        # waiting for options, stop before locator lookup so a re-rendered ref
+        # cannot turn a repeated search into a new input action.
+        if action.action == "fill_ref" and self._interaction_stage in {
+            "waiting_for_options", "ready_to_choose",
+        }:
+            requested_value = str(action.arguments.get("value", action.arguments.get("text", "")))
+            if requested_value != self._last_fill_value:
+                return self._failure(
+                    "browser_input_stage_locked",
+                    "The search input has already been filled. Observe or choose the current option; "
+                    "do not fill the same search field again.",
+                    interaction_stage=self._interaction_stage,
+                    requires_reobservation=self._interaction_stage == "waiting_for_options",
+                )
+
+        # Risk is checked before ref binding so an obviously sensitive target
+        # (for example login-password) is blocked even when the page has
+        # already re-rendered that ref away.
+        if action.action in {"click_ref", "fill_ref", "select_ref"} and self._is_high_risk_action(action):
+            return self._failure("browser_high_risk_confirmation_required",
+                                 "This browser action is outside the bounded read-only contract.")
+
+        original_signature = self._action_signature(action)
+        action, locator_rebound, ref_error = self._bind_current_ref(action, original_signature)
+        if ref_error:
+            return self._failure("browser_unknown_ref", ref_error,
+                                 requires_reobservation=True)
+
+        # Rebinding changes the semantic target. Recompute the signature and
+        # risk from the new observed control before duplicate-action checks.
         signature = self._action_signature(action)
+        if action.action in {"click_ref", "fill_ref", "select_ref"} and self._is_high_risk_action(action):
+            return self._failure("browser_high_risk_confirmation_required",
+                                 "This browser action is outside the bounded read-only contract.")
         if self._last_state_action_signature == signature:
             self._repeated_state_action_count += 1
             if self._repeated_state_action_count >= 2:
@@ -298,11 +350,11 @@ class BrowserExecutionSession:
             )
         if self._last_no_progress_signature == signature and not self._reobservation_required:
             return self._handoff_failure()
-        if self._reobservation_required:
-            return self._failure("browser_reobservation_required",
-                                 "Fresh browser observation is required before retrying this action.",
-                                 requires_reobservation=True)
 
+        # A re-render may replace the input ref, but the task is still in the
+        # choose-options stage and must not accept another search input. Keep
+        # this after duplicate detection so an identical replay is classified
+        # as a replay, while a new value is classified as an input-stage lock.
         if action.action == "fill_ref" and self._interaction_stage in {
             "waiting_for_options", "ready_to_choose",
         }:
@@ -321,9 +373,6 @@ class BrowserExecutionSession:
         autocomplete_input = self._is_autocomplete_input(action)
         before = self._state_fingerprint
         self._remember_locator(action)
-        if action.action in {"click_ref", "fill_ref", "select_ref"} and self._is_high_risk_action(action):
-            return self._failure("browser_high_risk_confirmation_required",
-                                 "This browser action is outside the bounded read-only contract.")
         self._emit_state_activity("begin", action.action)
         result: dict[str, Any] = {"ok": False, "failure_kind": "browser_backend_failure"}
         try:
@@ -380,7 +429,8 @@ class BrowserExecutionSession:
             self._evidence_failure_count = 0
             return {**result, "ok": True, "state_changed": True,
                     "observation_id": self._observation_id,
-                    "content": after.get("content"),
+                    "content": after.get("content"), "content_trust": "untrusted_page_data",
+                    "locator_rebound": locator_rebound,
                     "interaction_stage": self._interaction_stage}
 
         self._no_progress_count += 1
@@ -396,7 +446,33 @@ class BrowserExecutionSession:
                 "requires_reobservation": True,
                 "observation_id": self._observation_id,
                 "content": after.get("content"),
+                "content_trust": "untrusted_page_data",
+                "locator_rebound": locator_rebound,
                 "interaction_stage": self._interaction_stage}
+
+    def _bind_current_ref(self, action: BrowserAction, signature: str) -> tuple[BrowserAction, bool, str | None]:
+        """Validate a ref against the latest snapshot and rebind it once if learned."""
+        if action.action not in {"click_ref", "fill_ref", "select_ref", "extract"}:
+            return action, False, None
+        ref = str(action.arguments.get("ref") or "")
+        candidates = parse_snapshot_candidates(self._last_snapshot)
+        if any(candidate.ref == ref for candidate in candidates):
+            return action, False, None
+        if signature in self._rebound_action_signatures:
+            return action, False, "The semantic ref is not present in the latest observation after one automatic rebind."
+        descriptor = self._learned_locators.get(action.action)
+        if descriptor is None:
+            return action, False, "The semantic ref was not present in the latest observation; observe again."
+        variables = {}
+        if action.action == "fill_ref":
+            variables = {"query": str(action.arguments.get("value", action.arguments.get("text", "")))}
+        elif action.action == "click_ref":
+            variables = {"target_label": str(action.arguments.get("target_label") or "")}
+        rebound = resolve_locator(descriptor, candidates, variables, key=self.locator_key)
+        if not rebound:
+            return action, False, "The old semantic ref could not be uniquely rebound from the latest observation."
+        self._rebound_action_signatures.add(signature)
+        return BrowserAction(action.action, {**action.arguments, "ref": rebound}), True, None
 
     @staticmethod
     def _has_options(content: Any) -> bool:
@@ -497,6 +573,7 @@ class BrowserExecutionSession:
         self._extractions.append(extraction)
         return {**result, "ok": True, "extraction": extraction,
                 "verification": verification, "observation_id": self._observation_id,
+                "content_trust": "untrusted_page_data",
                 "state_changed": False}
 
     def _verify(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -589,6 +666,8 @@ class BrowserExecutionSession:
         self._interaction_stage = "unknown"
         self._last_fill_value = ""
         self._learned_locators.clear()
+        self._rebound_action_signatures.clear()
+        self._allowed_origin = ""
         self._action_log.clear()
         self._cache_verified = False
         self._trusted_extractor.invalidate()
@@ -618,6 +697,8 @@ class BrowserExecutionSession:
         self._interaction_stage = "unknown"
         self._last_fill_value = ""
         self._learned_locators.clear()
+        self._rebound_action_signatures.clear()
+        self._allowed_origin = ""
         self._action_log.clear()
         self._cache_verified = False
         self._trusted_extractor.invalidate()
@@ -633,6 +714,31 @@ class BrowserExecutionSession:
     @property
     def cache_verified(self) -> bool:
         return self._cache_verified
+
+    def batch_requires_confirmation(self, actions: Any) -> bool:
+        """Inspect current observed targets before the runtime approval gate."""
+        if not isinstance(actions, list):
+            return False
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action") or "")
+            args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if action not in {"click_ref", "fill_ref", "select_ref"}:
+                continue
+            if bool(args.get("submit")) or bool(args.get("doubleClick")):
+                return True
+            ref = str(args.get("ref") or "")
+            candidate = next((value for value in parse_snapshot_candidates(self._last_snapshot)
+                              if value.ref == ref), None)
+            if candidate is not None:
+                text = " ".join((candidate.role, candidate.name, *candidate.parent_roles,
+                                  *candidate.state_tokens)).lower()
+                if any(marker in text for marker in (
+                    "send", "submit", "purchase", "buy", "checkout", "delete", "upload", "login", "password",
+                    "发送", "提交", "购买", "结算", "删除", "上传", "登录", "密码")):
+                    return True
+        return False
 
     def cacheable_workflow(self) -> bool:
         actions = {item.get("action") for item in self._action_log if item.get("ok")}
@@ -844,15 +950,24 @@ class BrowserExecutionSession:
         match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
         return float(match.group(0)) if match else None
 
-    @staticmethod
-    def _is_high_risk_action(action: BrowserAction) -> bool:
+    def _is_high_risk_action(self, action: BrowserAction) -> bool:
         args = action.arguments
+        candidate = next((item for item in parse_snapshot_candidates(self._last_snapshot)
+                          if item.ref == str(args.get("ref") or "")), None)
+        if candidate is not None:
+            text = " ".join((candidate.role, candidate.name, *candidate.parent_roles,
+                              *candidate.state_tokens)).lower()
+            if any(marker in text for marker in (
+                "send", "submit", "purchase", "buy", "checkout", "delete", "upload", "login", "password",
+                "发送", "提交", "购买", "结算", "删除", "上传", "登录", "密码",
+            )):
+                return True
         if bool(args.get("submit")) or bool(args.get("doubleClick")):
             return True
         text = " ".join(str(args.get(key) or "").lower() for key in ("ref", "value", "element"))
         return any(marker in text for marker in (
             "send", "submit", "purchase", "buy", "checkout", "delete", "upload", "login", "password",
-            "发送", "购买", "结算", "删除", "上传", "登录", "密码",
+            "发送", "提交", "购买", "结算", "删除", "上传", "登录", "密码",
         ))
 
 

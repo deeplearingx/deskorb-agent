@@ -151,7 +151,10 @@ class RuntimeE2ETests(unittest.TestCase):
                  patch.object(runtime.desktop, "capture_state", return_value={"ok": True, "snapshot_id": "S1", "active_window": "Notepad", "screen_digest": "fixture"}), \
                  patch.object(runtime.desktop, "capture_image_data_url", return_value=None), \
                 patch.object(runtime.desktop, "type_text", return_value={"ok": True, "characters": 19}), \
-                patch.object(runtime.desktop, "verify_state", return_value={"ok": True, "screen_changed": True, "active_window_changed": False}):
+                patch.object(runtime.desktop, "verify_state", return_value={
+                    "ok": True, "screen_changed": True, "active_window_changed": False,
+                    "verified": True, "verification": {"passed": True, "kind": "uia_value_readback"},
+                }):
                 runtime.run_turn("打开记事本并输入测试文本，然后验证状态", [])
                 pending = self._approve_pending_task(runtime, events)
             remaining = list(pending)

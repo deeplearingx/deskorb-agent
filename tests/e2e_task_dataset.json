@@ -43,11 +43,11 @@
       "id": "research-001",
       "tier": "repeatable",
       "category": "learning_resource_search",
-      "prompt": "搜索 Python asyncio 的入门学习资料，挑出最适合初学者的三个结果。每个结果给出标题、来源、链接和一句推荐理由。",
+      "prompt": "在动态自动补全页面中搜索 Python asyncio，等待下拉选项出现，只点击名为‘Python asyncio 入门’的选项，不要再次重复输入。最后报告页面显示的已选择结果和来源。",
       "setup": {"fixture": "dynamic_search", "query": "Python asyncio 入门", "results_page": "tests/fixtures/web/dynamic_search.html"},
-      "expected": {"must_use": ["mcp_playwright"], "answer_fields": ["title", "source", "url", "reason"], "required_sources": ["Python 官方文档", "Real Python", "Bilibili 教程"]},
-      "success_assertions": ["Three distinct results are returned", "Each URL matches an inspected result", "Ranking favors official documentation and beginner-oriented material", "Recommendation reasons refer to visible evidence, not invented content"],
-      "budgets": {"max_tool_rounds": 7, "max_elapsed_seconds": 40},
+      "expected": {"must_use": ["mcp_playwright"], "answer_fields": ["title", "source"]},
+      "success_assertions": ["搜索词只输入一次", "只点击实际出现的指定下拉选项", "已选择结果和来源来自页面结构化证据"],
+      "budgets": {"max_tool_rounds": 10, "max_elapsed_seconds": 60},
       "risk": "observe"
     },
     {

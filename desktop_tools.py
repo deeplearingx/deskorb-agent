@@ -47,6 +47,10 @@ class DesktopSnapshot:
     active_hwnd: int
     active_title: str
     screen_digest: str
+    target_bounds: dict[str, int] | None = None
+    client_bounds: dict[str, int] | None = None
+    monitor: dict[str, int] | None = None
+    focused_control: str = ""
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,10 @@ class DesktopTools:
         self.overlay_windows: set[int] = set()
         self._current_desktop_authorized = False
         self._action_baseline: DesktopSnapshot | None = None
+        self._action_kind = ""
+        self._modal_blocked = False
+        self._coordinate_fallback_tokens: dict[str, tuple[str, str, float]] = {}
+        self.require_coordinate_token = False
         self.user32 = ctypes.windll.user32 if os.name == "nt" else None
         self.kernel32 = ctypes.windll.kernel32 if os.name == "nt" else None
 
@@ -111,6 +119,35 @@ class DesktopTools:
         """Enable explicit harness-only recovery from an unrelated foreground HWND."""
         self._current_desktop_authorized = bool(authorized)
 
+    def set_modal_blocked(self, blocked: bool) -> None:
+        """Block coordinate input while a semantic observer reports a modal dialog."""
+        self._modal_blocked = bool(blocked)
+
+    def issue_coordinate_fallback(self, snapshot_id: str, action: str, reason: str) -> dict:
+        """Issue one bounded coordinate token after UIA cannot locate a target."""
+        error = self._valid(snapshot_id, require_same_target=True)
+        if error:
+            return {"ok": False, "error": error}
+        action = str(action or "").strip().lower()
+        if action not in {"click", "type", "hotkey", "scroll"}:
+            return {"ok": False, "failure_kind": "desktop_coordinate_fallback_denied",
+                    "error": "Coordinate fallback is limited to low-risk input actions."}
+        reason_text = str(reason or "").strip().lower()
+        if any(marker in reason_text for marker in (
+                "send", "submit", "publish", "purchase", "buy", "checkout", "delete", "upload", "login",
+                "发送", "提交", "发布", "购买", "结算", "删除", "上传", "登录", "密码")):
+            return {"ok": False, "failure_kind": "desktop_coordinate_fallback_denied",
+                    "error": "High-risk desktop actions cannot use coordinate fallback."}
+        if self._modal_blocked:
+            return {"ok": False, "failure_kind": "desktop_modal_dialog",
+                    "error": "A modal dialog requires user attention before coordinate fallback can be issued."}
+        token = secrets.token_urlsafe(18)
+        self._coordinate_fallback_tokens[token] = (
+            str(snapshot_id), action, time.monotonic() + self.TTL_SECONDS,
+        )
+        return {"ok": True, "fallback_token": token, "action": action,
+                "expires_in_seconds": self.TTL_SECONDS}
+
     def clear_target_window(self) -> None:
         self.target_window = None
         self.overlay_window = None
@@ -120,6 +157,8 @@ class DesktopTools:
         self.snapshot = None
         self._window_snapshot.clear()
         self._window_snapshot_at = 0.0
+        self._coordinate_fallback_tokens.clear()
+        self.require_coordinate_token = False
 
     @staticmethod
     def _top_level_window(user32: object, hwnd: int) -> int:
@@ -346,16 +385,26 @@ class DesktopTools:
         except Exception:
             pass
         state = DesktopSnapshot(secrets.token_hex(4).upper(), time.monotonic(), point.x, point.y,
-                                int(hwnd or 0), window_title(hwnd) if hwnd else "", digest)
+                                int(hwnd or 0), window_title(hwnd) if hwnd else "", digest,
+                                target_bounds=self._window_bounds(int(hwnd or 0)) if hwnd else None,
+                                client_bounds=self._client_bounds(int(hwnd or 0)) if hwnd else None,
+                                monitor=self._monitor_bounds(int(hwnd or 0)) if hwnd else None,
+                                focused_control=self._focused_control_summary(int(hwnd or 0)) if hwnd else "")
         self.snapshot = state
         return {"ok": True, "snapshot_id": state.snapshot_id, "cursor": {"x": point.x, "y": point.y},
-                "active_window": state.active_title, "screen_digest": state.screen_digest}
+                "active_window": state.active_title, "screen_digest": state.screen_digest,
+                "target_window": state.active_hwnd,
+                "target_bounds": state.target_bounds,
+                "client_bounds": state.client_bounds,
+                "monitor": state.monitor,
+                "focused_control": state.focused_control}
 
-    def _remember_action_baseline(self, snapshot_id: str) -> None:
+    def _remember_action_baseline(self, snapshot_id: str, action_kind: str = "") -> None:
         """Keep the pre-action snapshot while auto-observation advances ``snapshot``."""
         state = self.snapshot
         if state is not None and state.snapshot_id == str(snapshot_id):
             self._action_baseline = state
+            self._action_kind = str(action_kind or "")
 
     @staticmethod
     def capture_image_data_url() -> str | None:
@@ -371,7 +420,14 @@ class DesktopTools:
         except Exception:
             return None
 
-    def click(self, snapshot_id: str, x: int, y: int, button: str, clicks: int = 1) -> dict:
+    def click(self, snapshot_id: str, x: int, y: int, button: str, clicks: int = 1,
+              fallback_token: str | None = None) -> dict:
+        if self._modal_blocked:
+            return {"ok": False, "failure_kind": "desktop_modal_dialog",
+                    "error": "A modal dialog requires user attention before coordinate input can continue."}
+        error = self._consume_coordinate_fallback(snapshot_id, "click", fallback_token)
+        if error:
+            return {"ok": False, "error": error}
         error = self._valid(snapshot_id, require_same_target=True)
         if error:
             return {"ok": False, "error": error}
@@ -386,7 +442,10 @@ class DesktopTools:
             return {"ok": False, "error": "Click count must be 1 or 2."}
         if not self._in_virtual_screen(x, y):
             return {"ok": False, "error": "Click coordinates are outside the virtual desktop."}
-        self._remember_action_baseline(snapshot_id)
+        error = self._coordinate_target_error(x, y)
+        if error:
+            return {"ok": False, "error": error}
+        self._remember_action_baseline(snapshot_id, "click")
         if not self.user32.SetCursorPos(x, y):
             return {"ok": False, "error": "Windows rejected the cursor move."}
         flags = {"left": (0x0002, 0x0004), "right": (0x0008, 0x0010),
@@ -397,14 +456,20 @@ class DesktopTools:
             self.user32.mouse_event(up, 0, 0, 0, 0)
         return {"ok": True, "clicked": {"x": x, "y": y, "button": button, "count": clicks}}
 
-    def type_text(self, snapshot_id: str, text: str) -> dict:
+    def type_text(self, snapshot_id: str, text: str, fallback_token: str | None = None) -> dict:
+        if self._modal_blocked:
+            return {"ok": False, "failure_kind": "desktop_modal_dialog",
+                    "error": "A modal dialog requires user attention before coordinate input can continue."}
+        error = self._consume_coordinate_fallback(snapshot_id, "type", fallback_token)
+        if error:
+            return {"ok": False, "error": error}
         error = self._valid(snapshot_id, require_same_target=True)
         if error:
             return {"ok": False, "error": error}
         text = str(text)
         if not text or len(text) > 4000 or "\x00" in text:
             return {"ok": False, "error": "Text must contain 1-4000 characters."}
-        self._remember_action_baseline(snapshot_id)
+        self._remember_action_baseline(snapshot_id, "type")
         encoded = text.encode("utf-16-le")
         units = [int.from_bytes(encoded[i:i + 2], "little") for i in range(0, len(encoded), 2)]
         inputs = []
@@ -422,7 +487,13 @@ class DesktopTools:
                         "error": "Windows accepted only part of the keyboard input."}
         return {"ok": True, "characters": len(text), "events_sent": sent_total}
 
-    def hotkey(self, snapshot_id: str, keys: list[str]) -> dict:
+    def hotkey(self, snapshot_id: str, keys: list[str], fallback_token: str | None = None) -> dict:
+        if self._modal_blocked:
+            return {"ok": False, "failure_kind": "desktop_modal_dialog",
+                    "error": "A modal dialog requires user attention before coordinate input can continue."}
+        error = self._consume_coordinate_fallback(snapshot_id, "hotkey", fallback_token)
+        if error:
+            return {"ok": False, "error": error}
         error = self._valid(snapshot_id, require_same_target=True)
         if error:
             return {"ok": False, "error": error}
@@ -441,7 +512,7 @@ class DesktopTools:
                 virtual.append(self.VK[key])
             else:
                 return {"ok": False, "error": f"Unsupported hotkey key: {key}"}
-        self._remember_action_baseline(snapshot_id)
+        self._remember_action_baseline(snapshot_id, "hotkey")
         pressed = []
         try:
             for vk in virtual:
@@ -452,7 +523,14 @@ class DesktopTools:
                 self.user32.keybd_event(vk, 0, 0x0002, 0)
         return {"ok": True, "keys": normalized}
 
-    def scroll(self, snapshot_id: str, delta: int, axis: str = "vertical") -> dict:
+    def scroll(self, snapshot_id: str, delta: int, axis: str = "vertical",
+               fallback_token: str | None = None) -> dict:
+        if self._modal_blocked:
+            return {"ok": False, "failure_kind": "desktop_modal_dialog",
+                    "error": "A modal dialog requires user attention before coordinate input can continue."}
+        error = self._consume_coordinate_fallback(snapshot_id, "scroll", fallback_token)
+        if error:
+            return {"ok": False, "error": error}
         error = self._valid(snapshot_id, require_same_target=True)
         if error:
             return {"ok": False, "error": error}
@@ -465,7 +543,7 @@ class DesktopTools:
         axis = str(axis).lower()
         if axis not in {"vertical", "horizontal"}:
             return {"ok": False, "error": "Scroll axis must be vertical or horizontal."}
-        self._remember_action_baseline(snapshot_id)
+        self._remember_action_baseline(snapshot_id, "scroll")
         flag = 0x0800 if axis == "vertical" else 0x1000
         self.user32.mouse_event(flag, 0, 0, ctypes.c_ulong(amount * 120).value, 0)
         return {"ok": True, "delta": amount, "axis": axis}
@@ -540,6 +618,12 @@ class DesktopTools:
         assert item is not None
         action = str(action or "").strip().lower()
         hwnd = item.window_id
+        before_topmost = None
+        if action == "toggle_topmost":
+            try:
+                before_topmost = bool(int(self.user32.GetWindowLongW(hwnd, -20)) & 0x00000008)
+            except Exception:
+                before_topmost = None
         try:
             if action == "focus":
                 self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
@@ -552,7 +636,6 @@ class DesktopTools:
                 self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
             elif action == "close":
                 self.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
-                return {"ok": True, "window_id": hwnd, "action": action, "title": item.title}
             elif action == "toggle_topmost":
                 exstyle = int(self.user32.GetWindowLongW(hwnd, -20))  # GWL_EXSTYLE
                 topmost = not bool(exstyle & 0x00000008)               # WS_EX_TOPMOST
@@ -576,8 +659,17 @@ class DesktopTools:
                 return {"ok": False, "error": "Unsupported window action."}
         except (TypeError, ValueError, OSError) as exc:
             return {"ok": False, "error": f"Window action failed: {exc}"}
+        after_bounds = self._window_bounds(hwnd)
+        verified = self._window_action_verified(hwnd, action, item, after_bounds,
+                                                before_topmost=before_topmost)
+        if not verified:
+            return {"ok": False, "window_id": hwnd, "action": action, "title": item.title,
+                    "after": after_bounds, "status": "waiting_verification",
+                    "verification": {"passed": False, "kind": "window_placement",
+                                      "action": action}}
         return {"ok": True, "window_id": hwnd, "action": action, "title": item.title,
-                "after": self._window_bounds(hwnd)}
+                "after": after_bounds, "status": "verified",
+                "verification": {"passed": True, "kind": "window_placement", "action": action}}
 
     def clipboard_text(self) -> dict:
         """Read Unicode clipboard text only after the runtime's explicit confirmation gate."""
@@ -621,10 +713,16 @@ class DesktopTools:
         active_changed = current["active_window"] != reference.active_title
         screen_changed = bool(reference.screen_digest and current["screen_digest"]
                               and current["screen_digest"] != reference.screen_digest)
-        verified = bool(active_changed or screen_changed)
+        # A screen hash or foreground change is only a signal. Coordinate
+        # actions require semantic evidence (UIA readback or a dedicated
+        # postcondition) before the runtime may report completion.
+        verified = False
         self._action_baseline = None
         return {"ok": True, "active_window_changed": active_changed,
                 "screen_changed": screen_changed, "verified": verified,
+                "status": "verified" if verified else "waiting_verification",
+                "verification": {"passed": verified, "kind": "semantic_postcondition_required",
+                                  "action": self._action_kind or "unknown"},
                 "after": current}
 
     def _valid(self, snapshot_id: str, *, require_same_target: bool = False) -> str | None:
@@ -704,3 +802,108 @@ class DesktopTools:
         except AttributeError:
             pass
         return -32768 <= x <= 32767 and -32768 <= y <= 32767
+
+    def _coordinate_target_error(self, x: int, y: int) -> str | None:
+        """Keep coordinate fallback inside the fresh target client area."""
+        target = int(self.target_window or (self.snapshot.active_hwnd if self.snapshot else 0))
+        if not target:
+            return None
+        bounds = self._client_bounds(target) or self._window_bounds(target)
+        if bounds:
+            if not (bounds["x"] <= x < bounds["x"] + bounds["width"]
+                    and bounds["y"] <= y < bounds["y"] + bounds["height"]):
+                return "Coordinate is outside the configured target window client area."
+        window_from_point = getattr(self.user32, "WindowFromPoint", None)
+        if callable(window_from_point):
+            try:
+                point = ctypes.wintypes.POINT(int(x), int(y))
+                owner = int(window_from_point(point) or 0)
+                if owner and not self._foreground_matches_target(owner, target):
+                    return "Coordinate belongs to a different top-level window than the configured target window."
+            except Exception:
+                return "Could not validate which window owns the coordinate."
+        return None
+
+    def _consume_coordinate_fallback(self, snapshot_id: str, action: str,
+                                      token: str | None) -> str | None:
+        if not self.require_coordinate_token:
+            return None
+        token = str(token or "")
+        item = self._coordinate_fallback_tokens.pop(token, None)
+        if not item:
+            return "A fresh one-time coordinate fallback token is required."
+        bound_snapshot, bound_action, expires_at = item
+        if (bound_snapshot != str(snapshot_id) or bound_action != action
+                or expires_at <= time.monotonic()):
+            return "The coordinate fallback token is stale or bound to a different action."
+        return None
+
+    def _window_action_verified(self, hwnd: int, action: str, before: WindowSnapshot,
+                                after_bounds: dict[str, int] | None,
+                                *, before_topmost: bool | None = None) -> bool:
+        if action == "focus":
+            return self._foreground_matches_target(int(self.user32.GetForegroundWindow() or 0), hwnd)
+        if action == "minimize":
+            return bool(getattr(self.user32, "IsIconic", lambda _hwnd: False)(hwnd))
+        if action == "maximize":
+            return bool(getattr(self.user32, "IsZoomed", lambda _hwnd: False)(hwnd))
+        if action == "restore":
+            return not bool(getattr(self.user32, "IsIconic", lambda _hwnd: False)(hwnd))
+        if action == "toggle_topmost":
+            style = getattr(self.user32, "GetWindowLongW", None)
+            if not callable(style) or before_topmost is None:
+                return False
+            after_topmost = bool(int(style(hwnd, -20)) & 0x00000008)
+            return after_topmost != before_topmost
+        if action in {"snap_left", "snap_right", "move_resize"}:
+            return after_bounds is not None and after_bounds != before.bounds
+        if action == "close":
+            return not bool(self.user32.IsWindow(hwnd))
+        return False
+
+    def _client_bounds(self, hwnd: int) -> dict[str, int] | None:
+        if not hwnd or not self.user32:
+            return None
+        try:
+            get_client = getattr(self.user32, "GetClientRect", None)
+            client_to_screen = getattr(self.user32, "ClientToScreen", None)
+            if callable(get_client) and callable(client_to_screen):
+                rect = ctypes.wintypes.RECT()
+                origin = ctypes.wintypes.POINT()
+                if get_client(hwnd, ctypes.byref(rect)) and client_to_screen(hwnd, ctypes.byref(origin)):
+                    return {"x": int(origin.x), "y": int(origin.y),
+                            "width": max(0, int(rect.right - rect.left)),
+                            "height": max(0, int(rect.bottom - rect.top))}
+        except Exception:
+            pass
+        return self._window_bounds(hwnd)
+
+    def _monitor_bounds(self, hwnd: int) -> dict[str, int] | None:
+        if not hwnd or not self.user32:
+            return None
+        try:
+            get_monitor = getattr(self.user32, "MonitorFromWindow", None)
+            if callable(get_monitor):
+                monitor = get_monitor(hwnd, 2)
+                if monitor:
+                    class MONITORINFO(ctypes.Structure):
+                        _fields_ = [("cbSize", ctypes.wintypes.DWORD),
+                                    ("rcMonitor", ctypes.wintypes.RECT),
+                                    ("rcWork", ctypes.wintypes.RECT),
+                                    ("dwFlags", ctypes.wintypes.DWORD)]
+                    info = MONITORINFO(ctypes.sizeof(MONITORINFO))
+                    get_info = getattr(self.user32, "GetMonitorInfoW", None)
+                    if callable(get_info) and get_info(monitor, ctypes.byref(info)):
+                        rect = info.rcMonitor
+                        return {"x": int(rect.left), "y": int(rect.top),
+                                "width": int(rect.right - rect.left),
+                                "height": int(rect.bottom - rect.top)}
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _focused_control_summary(hwnd: int) -> str:
+        # UIA supplies the authoritative control identity. Keep the desktop
+        # snapshot field deliberately non-sensitive when UIA is unavailable.
+        return ""

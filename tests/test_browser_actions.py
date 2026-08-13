@@ -64,6 +64,16 @@ class BrowserActionTests(unittest.TestCase):
         }}])
         self.assertIn("semantic names", error)
 
+    def test_normalizes_read_only_verify_after_extract(self):
+        actions, error = validate_browser_action_batch([
+            {"action": "verify", "arguments": {"required_fields": ["title"]}},
+            {"action": "extract", "arguments": {
+                "ref": "card", "observation_id": "obs-1", "fields": ["title"],
+            }},
+        ])
+        self.assertIsNone(error)
+        self.assertEqual([item.action for item in actions], ["extract", "verify"])
+
     def test_extract_bounds_ref_and_semantic_field_names(self):
         _actions, error = validate_browser_action_batch([{
             "action": "extract", "arguments": {"ref": "e" * 81, "fields": ["title"]},

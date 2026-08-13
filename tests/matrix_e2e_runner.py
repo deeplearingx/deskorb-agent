@@ -338,7 +338,10 @@ def _runtime_patches(runtime: AgentRuntime, *, window_mode: bool = False,
         "desktop_image": patch.object(runtime.desktop, "capture_image_data_url", return_value=None),
         "launch": patch.object(runtime.tools, "launch_application", return_value={"ok": True, "application": "fixture", "pid": 1}),
         "type": patch.object(runtime.desktop, "type_text", return_value={"ok": True, "characters": 20}),
-        "verify": patch.object(runtime.desktop, "verify_state", return_value={"ok": True, "screen_changed": True, "active_window_changed": False}),
+        "verify": patch.object(runtime.desktop, "verify_state", return_value={
+            "ok": True, "screen_changed": True, "active_window_changed": False,
+            "verified": True, "verification": {"passed": True, "kind": "uia_value_readback"},
+        }),
         "list_windows": patch.object(runtime.desktop, "list_windows", return_value={"ok": True, "windows": [{"window_id": 101, "title": "Fixture Window"}]}),
         "control_window": patch.object(runtime.desktop, "control_window", return_value={"ok": True, "action": "maximize", "verified": True}),
     }

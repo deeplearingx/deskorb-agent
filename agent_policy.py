@@ -53,7 +53,8 @@ class ToolPolicy:
     OBSERVE_TOOLS = {
         "desktop_get_active_window", "desktop_screenshot", "filesystem_list",
         "filesystem_read_text", "filesystem_search_text", "process_list", "window_list", "desktop_list_windows", "desktop_capture_state", "desktop_verify_state",
-        "mcp_enable_server", "mcp_read_only",
+        "mcp_enable_server", "mcp_read_only", "desktop_uia_observe",
+        "desktop_request_coordinate_fallback",
     }
     REVERSIBLE_TOOLS = {"filesystem_write", "filesystem_patch", "filesystem_copy"}
     # Only actual file deletion remains confirmation-gated. Other requested
@@ -62,7 +63,7 @@ class ToolPolicy:
     AUTOMATIC_TOOLS = {"shell_run", "filesystem_move", "process_stop"}
     EXTERNAL_TOOLS = {"desktop_click", "desktop_type", "desktop_hotkey", "desktop_scroll", "window_focus",
                       "window_control", "desktop_clipboard_read_text", "process_start", "application_launch",
-                      "browser_action_batch"}
+                      "browser_action_batch", "desktop_uia_invoke", "desktop_uia_set_value"}
     TASK_SCOPED_TOOLS = EXTERNAL_TOOLS
 
     def decide(self, tool_name: str, *, execution_requested: bool, full_access: bool,

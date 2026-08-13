@@ -187,4 +187,14 @@ def validate_browser_action_batch(value: Any) -> tuple[list[BrowserAction], str 
         return [], "A browser batch may contain at most one state-changing action."
     if state_change_indexes and state_change_indexes[0] != len(validated) - 1:
         return [], "The state-changing browser action must be the final action in a batch."
+    # Evidence operations are read-only. Normalize their order so a model
+    # cannot lose a valid extraction merely by emitting verify before extract;
+    # state-changing actions are never reordered.
+    if not state_change_indexes:
+        evidence_order = {"extract": 0, "verify": 1}
+        if any(item.action == "extract" for item in validated) and any(item.action == "verify" for item in validated):
+            validated = sorted(enumerate(validated), key=lambda pair: (
+                evidence_order.get(pair[1].action, -1), pair[0],
+            ))
+            validated = [item for _index, item in validated]
     return validated, None

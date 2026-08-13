@@ -1,8 +1,8 @@
 """Real Windows desktop end-to-end probe with an isolated Tk fixture.
 
 The model is deterministic, but AgentRuntime, approval, DesktopTools,
-snapshot-baseline verification, task journal, and the actual Windows mouse and
-keyboard input path are real.  No existing application, document, account, or
+snapshot-baseline verification, task journal, and the actual Windows UIA input
+path are real.  No existing application, document, account, or
 clipboard is touched.
 """
 from __future__ import annotations
@@ -13,7 +13,6 @@ import re
 import sys
 import tempfile
 import time
-import tkinter as tk
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -27,7 +26,147 @@ from agent_runtime import AgentRuntime
 from desktop_uia import DesktopUIA
 
 
-def ensure_fixture_foreground(root: tk.Tk, hwnd: int) -> bool:
+class NativeEditFixture:
+    """Disposable Win32 window with a real Edit control for UIA acceptance."""
+
+    WS_OVERLAPPEDWINDOW = 0x00CF0000
+    WS_CHILD = 0x40000000
+    WS_VISIBLE = 0x10000000
+    WS_TABSTOP = 0x00010000
+    ES_AUTOHSCROLL = 0x0080
+    WS_EX_CLIENTEDGE = 0x00000200
+    SW_RESTORE = 9
+    PM_REMOVE = 1
+
+    def __init__(self):
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._wnd_proc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        )
+        self._wnd_proc = self._wnd_proc_type(self._dispatch)
+        self._class_name = f"DeskOrbUIAFixture_{os.getpid()}"
+        self._title = "DeskOrb UIA E2E Fixture"
+        self._configure_api()
+        self._register_class()
+        instance = self.kernel32.GetModuleHandleW(None)
+        self.hwnd = int(self.user32.CreateWindowExW(
+            0, self._class_name, self._title, self.WS_OVERLAPPEDWINDOW | self.WS_VISIBLE,
+            100, 100, 620, 180, 0, 0, instance, None,
+        ) or 0)
+        if not self.hwnd:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.edit_hwnd = int(self.user32.CreateWindowExW(
+            self.WS_EX_CLIENTEDGE, "EDIT", "",
+            self.WS_CHILD | self.WS_VISIBLE | self.WS_TABSTOP | self.ES_AUTOHSCROLL,
+            24, 60, 560, 34, self.hwnd, 100, instance, None,
+        ) or 0)
+        if not self.edit_hwnd:
+            self.destroy()
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.user32.ShowWindow(wintypes.HWND(self.hwnd), self.SW_RESTORE)
+        self.user32.UpdateWindow(wintypes.HWND(self.hwnd))
+        self.pump()
+
+    def _configure_api(self) -> None:
+        self.kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        self.kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+        self.user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+        self.user32.RegisterClassW.restype = wintypes.ATOM
+        self.user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, ctypes.c_void_p,
+        ]
+        self.user32.CreateWindowExW.restype = wintypes.HWND
+        self.user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        self.user32.DefWindowProcW.restype = ctypes.c_long
+        self.user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.user32.ShowWindow.restype = wintypes.BOOL
+        self.user32.UpdateWindow.argtypes = [wintypes.HWND]
+        self.user32.UpdateWindow.restype = wintypes.BOOL
+        self.user32.DestroyWindow.argtypes = [wintypes.HWND]
+        self.user32.DestroyWindow.restype = wintypes.BOOL
+        self.user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        self.user32.UnregisterClassW.restype = wintypes.BOOL
+        self.user32.PeekMessageW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        self.user32.PeekMessageW.restype = wintypes.BOOL
+        self.user32.TranslateMessage.argtypes = [ctypes.c_void_p]
+        self.user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+        self.user32.SetFocus.argtypes = [wintypes.HWND]
+        self.user32.SetFocus.restype = wintypes.HWND
+        self.user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        self.user32.GetWindowTextLengthW.restype = ctypes.c_int
+        self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        self.user32.GetWindowTextW.restype = ctypes.c_int
+        self.user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        self.user32.SetWindowTextW.restype = wintypes.BOOL
+
+    def _register_class(self) -> None:
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT), ("lpfnWndProc", ctypes.c_void_p),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR),
+            ]
+        instance = self.kernel32.GetModuleHandleW(None)
+        registration = WNDCLASSW(0, ctypes.cast(self._wnd_proc, ctypes.c_void_p), 0, 0,
+                                 instance, 0, 0, 0, None, self._class_name)
+        if not self.user32.RegisterClassW(ctypes.byref(registration)):
+            error = ctypes.get_last_error()
+            if error != 1410:  # ERROR_CLASS_ALREADY_EXISTS
+                raise ctypes.WinError(error)
+
+    def _dispatch(self, hwnd, message, wparam, lparam):
+        return self.user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    def deiconify(self) -> None:
+        self.user32.ShowWindow(wintypes.HWND(self.hwnd), self.SW_RESTORE)
+
+    def lift(self) -> None:
+        self.user32.BringWindowToTop(wintypes.HWND(self.hwnd))
+
+    def focus_force(self) -> None:
+        self.user32.SetFocus(wintypes.HWND(self.hwnd))
+
+    def update_idletasks(self) -> None:
+        self.pump()
+
+    def update(self) -> None:
+        self.pump()
+
+    def pump(self) -> None:
+        message = ctypes.create_string_buffer(48)
+        while self.user32.PeekMessageW(message, 0, 0, 0, self.PM_REMOVE):
+            self.user32.TranslateMessage(message)
+            self.user32.DispatchMessageW(message)
+
+    def focus(self) -> None:
+        self.user32.SetFocus(wintypes.HWND(self.edit_hwnd))
+        self.pump()
+
+    def get(self) -> str:
+        self.pump()
+        length = int(self.user32.GetWindowTextLengthW(wintypes.HWND(self.edit_hwnd)) or 0)
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        self.user32.GetWindowTextW(wintypes.HWND(self.edit_hwnd), buffer, len(buffer))
+        return buffer.value
+
+    def delete(self, _start=0, _end=None) -> None:
+        self.user32.SetWindowTextW(wintypes.HWND(self.edit_hwnd), "")
+        self.pump()
+
+    def destroy(self) -> None:
+        if getattr(self, "hwnd", 0):
+            self.user32.DestroyWindow(wintypes.HWND(self.hwnd))
+            self.hwnd = 0
+        instance = self.kernel32.GetModuleHandleW(None)
+        self.user32.UnregisterClassW(self._class_name, instance)
+
+
+def ensure_fixture_foreground(root: object, hwnd: int) -> bool:
     """Keep the isolated fixture foreground while the real input path runs.
 
     A hosted Windows desktop can have another app reclaim focus between Tk's
@@ -109,13 +248,14 @@ def approval_token(events: list[tuple[str, object]]) -> str | None:
 class ScriptedDesktopModel:
     """Emit bounded tool calls while reading only structural observations."""
 
-    def __init__(self, root: tk.Tk, entry: tk.Entry, target_hwnd: int):
+    def __init__(self, root: NativeEditFixture, entry: NativeEditFixture, target_hwnd: int):
         self.root = root
         self.entry = entry
         self.target_hwnd = int(target_hwnd or 0)
         self.stage = 0
-        self.baseline_id = ""
         self.focus_reacquire_failures = 0
+        self.last_uia_observation_id = ""
+        self.last_uia_control_id = ""
 
     def _pump(self) -> None:
         self.root.update_idletasks()
@@ -134,39 +274,87 @@ class ScriptedDesktopModel:
         self.entry.focus_force()
         self.root.update()
 
-    @staticmethod
-    def _last_snapshot(payload: dict) -> str:
-        text = json.dumps(payload.get("input") or [], ensure_ascii=False)
-        matches = re.findall(r'\\?"snapshot_id\\?"\s*:\s*\\?"([A-F0-9]+)', text)
-        return matches[-1] if matches else ""
+    @classmethod
+    def _last_edit_control(cls, payload: dict) -> str:
+        """Select an observed editable control, never invent a UIA control ID."""
+        observations: list[dict] = []
+
+        def visit(value: object) -> None:
+            if isinstance(value, dict):
+                if value.get("uia_observation_id") and isinstance(value.get("controls"), list):
+                    observations.append(value)
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+            elif isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except (TypeError, ValueError):
+                    return
+                if decoded != value:
+                    visit(decoded)
+
+        visit(payload.get("input") or [])
+        if not observations:
+            return ""
+        latest = observations[-1]
+        for item in latest.get("recommended_actions") or []:
+            if isinstance(item, dict) and "set_value" in (item.get("actions") or ()):
+                return str(item.get("control_id") or "")
+        for item in latest.get("controls") or []:
+            if isinstance(item, dict) and "set_value" in (item.get("actions") or ()):
+                return str(item.get("control_id") or "")
+        return ""
+
+    @classmethod
+    def _latest_uia_observation_id(cls, payload: dict) -> str:
+        observations: list[dict] = []
+
+        def visit(value: object) -> None:
+            if isinstance(value, dict):
+                if value.get("uia_observation_id") and isinstance(value.get("controls"), list):
+                    observations.append(value)
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+            elif isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except (TypeError, ValueError):
+                    return
+                if decoded != value:
+                    visit(decoded)
+
+        visit(payload.get("input") or [])
+        return str(observations[-1].get("uia_observation_id") or "") if observations else ""
 
     def __call__(self, payload: dict, _api_key: str) -> dict:
         self._pump()
-        snapshot_id = self._last_snapshot(payload)
         if self.stage == 0:
-            call = {"application": "notepad"}
+            call = {}
             name = "desktop_capture_state"
         elif self.stage == 1:
             self._refocus_input()
-            call = {
-                "snapshot_id": snapshot_id,
-                "x": self.entry.winfo_rootx() + self.entry.winfo_width() // 2,
-                "y": self.entry.winfo_rooty() + self.entry.winfo_height() // 2,
-                "button": "left", "count": 1, "risk_level": "normal",
-                "risk_reason": "focus the isolated test field",
-            }
-            name = "desktop_click"
+            call = {"window_handle": self.target_hwnd, "max_elements": 80}
+            name = "desktop_uia_observe"
         elif self.stage == 2:
-            self._refocus_input()
-            self.baseline_id = snapshot_id
+            observation_id = self._latest_uia_observation_id(payload)
+            control_id = self._last_edit_control(payload)
+            self.last_uia_observation_id = observation_id
+            self.last_uia_control_id = control_id
             call = {
-                "snapshot_id": snapshot_id, "text": "DESKORB_DESKTOP_E2E",
-                "risk_level": "normal", "risk_reason": "fill the isolated test field",
+                "control_id": control_id,
+                "window_handle": self.target_hwnd,
+                "uia_observation_id": observation_id,
+                "value": "DESKORB_DESKTOP_E2E",
             }
-            name = "desktop_type"
+            name = "desktop_uia_set_value"
         elif self.stage == 3:
-            call = {"snapshot_id": self.baseline_id or snapshot_id}
-            name = "desktop_verify_state"
+            return {"output_text": "已通过 UIA 值回读和重新观察验证。", "output": []}
         else:
             return {"output_text": "已输入并通过桌面状态基线验证。", "output": []}
         self.stage += 1
@@ -175,19 +363,15 @@ class ScriptedDesktopModel:
 
 
 def main() -> int:
-    root = tk.Tk()
-    root.title("DeskOrb Desktop E2E Fixture")
-    root.geometry("520x160+100+100")
-    tk.Label(root, text="Isolated DeskOrb desktop fixture").pack(pady=(18, 8))
-    entry = tk.Entry(root, font=("Segoe UI", 14), width=36)
-    entry.pack(padx=24, pady=8)
+    root = NativeEditFixture()
+    entry = root
     root.update_idletasks()
     root.deiconify()
     root.lift()
     root.focus_force()
     entry.focus_force()
     root.update()
-    target_child_hwnd = int(root.winfo_id() or 0)
+    target_child_hwnd = int(root.edit_hwnd or 0)
     user32_target = ctypes.WinDLL("user32", use_last_error=True)
     user32_target.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     user32_target.GetAncestor.restype = wintypes.HWND
@@ -208,8 +392,6 @@ def main() -> int:
         uia_result = uia.set_value(str(uia_set_value.get("control_id") or ""), target_hwnd,
                                    "DESKORB_UIA_PREFLIGHT")
         uia_value_readback = bool(uia_result.get("ok") and uia_result.get("verified"))
-        root.update()
-        entry.delete(0, tk.END)
         root.update()
     events: Queue = Queue()
     bridge = None
@@ -235,6 +417,7 @@ def main() -> int:
                         "snapshot_id": str(arguments.get("snapshot_id") or "")[:16],
                         "screen_changed": result.get("screen_changed"),
                         "active_window_changed": result.get("active_window_changed"),
+                        "verified": bool(result.get("verified")),
                         "error": str(result.get("error") or "")[:120],
                     })
                 return original_publish(name, arguments, result)
@@ -253,6 +436,11 @@ def main() -> int:
                         break
                     time.sleep(0.03)
             all_events = [*first, *drain(events)]
+            uia_runtime_value_readback = any(
+                item.get("tool") == "desktop_uia_set_value"
+                and item.get("ok") and item.get("verified")
+                for item in tool_results
+            )
             progress = [value for kind, value in all_events
                         if kind == "task_progress" and isinstance(value, dict) and value.get("terminal")]
             final = progress[-1] if progress else {}
@@ -268,6 +456,8 @@ def main() -> int:
                 "terminal": final.get("terminal"),
                 "verified": bool(final.get("verified")),
                 "script_stage": scripted.stage,
+                "script_uia_observation_id": scripted.last_uia_observation_id,
+                "script_uia_control_id": scripted.last_uia_control_id,
                 "focus_reacquire_failures": scripted.focus_reacquire_failures,
                 "evidence_steps": final.get("evidence_steps"),
                 "failed_steps": final.get("failed_steps"),
@@ -279,7 +469,12 @@ def main() -> int:
                 "foreground_hwnd": foreground_hwnd,
                 "uia_recommended_actions": len(uia_recommendations),
                 "uia_set_value_available": bool(uia_set_value),
-                "uia_value_readback": uia_value_readback,
+                "uia_value_readback": bool(uia_value_readback or uia_runtime_value_readback),
+                "uia_controls_summary": [
+                    {key: item.get(key) for key in ("control_id", "name", "control_type", "actions")}
+                    for item in uia_probe.get("controls", [])[:24]
+                    if isinstance(item, dict)
+                ],
             }
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result["ok"] else 2

@@ -76,6 +76,18 @@ class TaskWorkflowTests(unittest.TestCase):
         self.assertEqual(progress["terminal"], "waiting_verification")
         self.assertEqual(workflow.nodes[0].kind, "action")
 
+    def test_desktop_screen_change_without_action_specific_verification_is_not_evidence(self):
+        workflow = TaskWorkflow("T-screen-only", "open app and verify",
+                                contract=TaskContract.from_goal("open app and verify", requires_action=True))
+        node = workflow.record_tool_result("desktop_verify_state", {
+            "ok": True, "screen_changed": True, "active_window_changed": True,
+            "verified": False,
+            "verification": {"passed": False, "kind": "semantic_postcondition_required"},
+        })
+        self.assertFalse(node.evidence)
+        progress = workflow.finish("completed")
+        self.assertFalse(progress["verified"])
+
     def test_failed_action_cannot_be_hidden_by_later_evidence(self):
         workflow = TaskWorkflow("T-failed", "打开浏览器并返回结果")
         workflow.record_tool_result("mcp_playwright_browser_click", {"ok": False, "error": "target closed"})
@@ -96,7 +108,8 @@ class TaskWorkflowTests(unittest.TestCase):
         }, failure_kind="desktop_focus_failure")
         workflow.record_tool_result("desktop_type", {"ok": True})
         workflow.record_tool_result("desktop_verify_state", {
-            "ok": True, "screen_changed": True,
+            "ok": True, "screen_changed": True, "verified": True,
+            "verification": {"passed": True, "kind": "uia_value_readback"},
         })
 
         progress = workflow.finish("completed")
@@ -121,7 +134,10 @@ class TaskWorkflowTests(unittest.TestCase):
     def test_verified_write_and_state_change_supply_evidence(self):
         workflow = TaskWorkflow("T2", "Write a file")
         workflow.record_tool_result("filesystem_write", {"ok": True, "verified": True})
-        workflow.record_tool_result("desktop_verify_state", {"ok": True, "screen_changed": True})
+        workflow.record_tool_result("desktop_verify_state", {
+            "ok": True, "screen_changed": True, "verified": True,
+            "verification": {"passed": True, "kind": "window_placement"},
+        })
         progress = workflow.finish("completed")
         self.assertTrue(progress["verified"])
         self.assertEqual(progress["evidence_steps"], 2)

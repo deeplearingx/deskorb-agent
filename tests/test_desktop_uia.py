@@ -120,6 +120,24 @@ class DesktopUIATests(unittest.TestCase):
         self.assertFalse(rejected["ok"])
         self.assertIsNone(wrapper.value)
 
+    def test_observation_id_binds_controls_and_old_controls_expire_after_action(self):
+        observer, wrapper = self._observer()
+        observed = observer.observe_active_window(42)
+        control = observed["controls"][0]
+        observation_id = observed["uia_observation_id"]
+
+        stale = observer.set_value(control["control_id"], 42, "stale", "old-observation")
+        self.assertFalse(stale["ok"])
+        self.assertIn("observation", stale["error"].lower())
+
+        current = observer.set_value(control["control_id"], 42, "fresh", observation_id)
+        self.assertTrue(current["ok"])
+        self.assertTrue(current["verified"])
+
+        expired = observer.set_value(control["control_id"], 42, "again", observation_id)
+        self.assertFalse(expired["ok"])
+        self.assertIn("observe", expired["error"].lower())
+
     def test_set_value_reports_readback_verification(self):
         observer, wrapper = self._observer()
         control = observer.observe_active_window(42)["controls"][0]
@@ -176,6 +194,13 @@ class DesktopUIATests(unittest.TestCase):
         result = DesktopUIA(desktop_factory=FakeDesktop, foreground_getter=lambda: 42).observe_active_window(42)
         self.assertTrue(result["requires_user_attention"])
         self.assertEqual(result["dialogs"][0]["control_type"], "Dialog")
+
+    def test_coordinate_fallback_requires_current_non_modal_observation(self):
+        observer, _wrapper = self._observer()
+        self.assertFalse(observer.coordinate_fallback_eligible("missing"))
+        observed = observer.observe_active_window(42)
+        self.assertTrue(observer.coordinate_fallback_eligible(observed["uia_observation_id"]))
+        self.assertFalse(observer.coordinate_fallback_eligible("old"))
 
     def test_observed_high_risk_profile_control_is_remembered_for_runtime_policy(self):
         class SendButton(Wrapper):

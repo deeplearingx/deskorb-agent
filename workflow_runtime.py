@@ -378,7 +378,11 @@ class TaskWorkflow:
         if tool_name in {"window_control", "window_focus"}:
             return bool(result.get("ok") and (result.get("after") or result.get("title")))
         if tool_name == "desktop_verify_state":
-            return bool(result.get("screen_changed") or result.get("active_window_changed"))
+            verification = result.get("verification")
+            return bool(result.get("verified") or (
+                isinstance(verification, dict) and verification.get("passed") is True
+                and verification.get("kind") not in {"semantic_postcondition_required", "screen_delta_only"}
+            ))
         if tool_name == "shell_run":
             try:
                 return int(result.get("exit_code")) == 0

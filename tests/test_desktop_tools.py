@@ -98,6 +98,64 @@ class DesktopToolsTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(tools.user32.cursor_positions, [])
 
+    def test_click_rejects_coordinate_outside_target_client_area(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 101, "target", "digest")
+        tools.user32.foreground = 101
+        result = tools.click("FRESH", 700, 300, "left")
+        self.assertFalse(result["ok"])
+        self.assertIn("target window", result["error"].lower())
+        self.assertEqual(tools.user32.cursor_positions, [])
+
+    def test_click_rejects_coordinate_owned_by_another_top_level_window(self):
+        class ForeignPoint(FakeUser32):
+            def WindowFromPoint(self, _point):
+                return 202
+
+            def GetAncestor(self, hwnd, _flags):
+                return int(hwnd)
+
+        tools = self.ready_tools()
+        tools.user32 = ForeignPoint()
+        tools.set_target_window(101)
+        tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 101, "target", "digest")
+        tools.user32.foreground = 101
+        result = tools.click("FRESH", 100, 100, "left")
+        self.assertFalse(result["ok"])
+        self.assertIn("target window", result["error"].lower())
+
+    def test_coordinate_input_is_blocked_when_observation_reports_modal_dialog(self):
+        tools = self.ready_tools()
+        tools.set_modal_blocked(True)
+        result = tools.type_text("FRESH", "hello")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "desktop_modal_dialog")
+
+    def test_coordinate_fallback_requires_and_consumes_one_time_token(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.require_coordinate_token = True
+        tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 101, "target", "digest")
+        tools.user32.foreground = 101
+        issued = tools.issue_coordinate_fallback("FRESH", "click", "low risk selection")
+        self.assertTrue(issued["ok"])
+        token = issued["fallback_token"]
+        first = tools.click("FRESH", 100, 100, "left", fallback_token=token)
+        self.assertTrue(first["ok"])
+        second = tools.click("FRESH", 100, 100, "left", fallback_token=token)
+        self.assertFalse(second["ok"])
+        self.assertIn("fallback", second["error"].lower())
+
+    def test_coordinate_fallback_rejects_high_risk_reason(self):
+        tools = self.ready_tools()
+        tools.set_target_window(101)
+        tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 101, "target", "digest")
+        tools.user32.foreground = 101
+        result = tools.issue_coordinate_fallback("FRESH", "click", "click send and publish message")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "desktop_coordinate_fallback_denied")
+
     def test_input_refuses_changed_foreground_window(self):
         tools = self.ready_tools()
         tools.snapshot = DesktopSnapshot("FRESH", time.monotonic(), 0, 0, 55, "target", "digest")
@@ -201,7 +259,8 @@ class DesktopToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["screen_changed"])
         self.assertTrue(result["active_window_changed"])
-        self.assertTrue(result["verified"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["status"], "waiting_verification")
 
     def test_focus_target_accepts_a_second_known_runner_overlay(self):
         tools = self.ready_tools()
@@ -374,6 +433,54 @@ class DesktopToolsTests(unittest.TestCase):
             result = tools.control_window(101, "minimize")
         self.assertFalse(result["ok"])
         self.assertIn("changed", result["error"])
+
+    def test_window_control_does_not_claim_maximize_without_placement_evidence(self):
+        tools = self.ready_tools()
+        tools._window_snapshot = {
+            101: WindowSnapshot(101, "Editor", 99, {"x": 20, "y": 30, "width": 600, "height": 400}, False, False)
+        }
+        tools._window_snapshot_at = time.monotonic()
+        tools.user32.PostMessageW = Mock()
+        with patch("desktop_tools.window_title", return_value="Editor"):
+            result = tools.control_window(101, "maximize")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "waiting_verification")
+        self.assertEqual(result["verification"]["kind"], "window_placement")
+
+    def test_window_control_does_not_claim_close_before_window_disappears(self):
+        tools = self.ready_tools()
+        tools._window_snapshot = {
+            101: WindowSnapshot(101, "Editor", 99, {"x": 20, "y": 30, "width": 600, "height": 400}, False, False)
+        }
+        tools._window_snapshot_at = time.monotonic()
+        tools.user32.PostMessageW = Mock()
+        with patch("desktop_tools.window_title", return_value="Editor"):
+            result = tools.control_window(101, "close")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "waiting_verification")
+
+    def test_window_control_topmost_uses_before_and_after_style(self):
+        class Topmost(FakeUser32):
+            def __init__(self):
+                super().__init__()
+                self.topmost = False
+
+            def GetWindowLongW(self, _hwnd, _index):
+                return 0x00000008 if self.topmost else 0
+
+            def SetWindowPos(self, *_args):
+                self.topmost = not self.topmost
+
+        tools = self.ready_tools()
+        tools.user32 = Topmost()
+        tools._window_snapshot = {
+            101: WindowSnapshot(101, "Editor", 99, {"x": 20, "y": 30, "width": 600, "height": 400}, False, False)
+        }
+        tools._window_snapshot_at = time.monotonic()
+        with patch("desktop_tools.window_title", return_value="Editor"):
+            result = tools.control_window(101, "toggle_topmost")
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["verification"]["passed"])
 
 
 if __name__ == "__main__":

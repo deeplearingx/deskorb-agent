@@ -16,6 +16,22 @@ class ToolPolicyTests(unittest.TestCase):
         decision = self.policy.decide("desktop_list_windows", execution_requested=False, full_access=False)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)
 
+    def test_desktop_uia_observation_and_coordinate_token_are_read_only(self):
+        for tool in ("desktop_uia_observe", "desktop_request_coordinate_fallback"):
+            with self.subTest(tool=tool):
+                decision = self.policy.decide(tool, execution_requested=False, full_access=False)
+                self.assertEqual(decision.kind, DecisionKind.ALLOW)
+
+    def test_desktop_uia_state_action_is_external_and_confirmation_scoped(self):
+        for tool in ("desktop_uia_invoke", "desktop_uia_set_value"):
+            with self.subTest(tool=tool):
+                pending = self.policy.decide(tool, execution_requested=True, full_access=True,
+                                             task_authorized=False)
+                self.assertEqual(pending.kind, DecisionKind.CONFIRM)
+                allowed = self.policy.decide(tool, execution_requested=True, full_access=True,
+                                             task_authorized=True)
+                self.assertEqual(allowed.kind, DecisionKind.ALLOW)
+
     def test_mcp_read_only_is_allowed_in_read_only_mode(self):
         decision = self.policy.decide("mcp_read_only", execution_requested=False, full_access=False)
         self.assertEqual(decision.kind, DecisionKind.ALLOW)

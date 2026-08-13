@@ -29,6 +29,7 @@ class CachedControl:
     wrapper: Any
     hwnd: int
     created_at: float
+    observation_id: str
 
 
 class DesktopUIA:
@@ -48,6 +49,9 @@ class DesktopUIA:
         self._observation_fingerprints: dict[int, tuple[str, float]] = {}
         self._pending_message_verification: dict[int, tuple[float, str | None]] = {}
         self._application_registry = application_registry or DesktopApplicationRegistry()
+        self._observation_counter = 0
+        self._observation_id = ""
+        self._blocking_observations: set[str] = set()
 
     @property
     def available(self) -> bool:
@@ -68,6 +72,10 @@ class DesktopUIA:
         process_name = window_process_name(hwnd)
         application = self._application_registry.match(process_name)
         self._prune()
+        self._observation_counter += 1
+        self._observation_id = f"uia-obs-{self._observation_counter}"
+        self._controls.clear()
+        self._high_risk_controls.clear()
         controls: list[dict[str, Any]] = []
         for wrapper in descendants:
             if len(controls) >= max(1, min(int(max_elements), 200)):
@@ -89,11 +97,14 @@ class DesktopUIA:
         verification = self._message_delivery_verification(application.app_id, controls, fingerprint, int(hwnd))
         result = {
             "ok": True, "window_handle": hwnd, "process_name": process_name[:80],
+            "uia_observation_id": self._observation_id,
             "application": application.safe_dict(), "controls": controls,
             "recommended_actions": recommended_actions, "dialogs": dialogs[:8],
             "disabled_control_count": disabled, "requires_user_attention": bool(dialogs),
             "expires_in_seconds": self.TTL_SECONDS,
         }
+        if dialogs:
+            self._blocking_observations.add(self._observation_id)
         if verification is not None:
             result["verification"] = verification
         return result
@@ -103,8 +114,8 @@ class DesktopUIA:
         self._prune()
         return str(control_id or "") in self._high_risk_controls
 
-    def invoke(self, control_id: str, hwnd: int) -> dict[str, Any]:
-        wrapper, error = self._valid(control_id, hwnd)
+    def invoke(self, control_id: str, hwnd: int, observation_id: str | None = None) -> dict[str, Any]:
+        wrapper, error = self._valid(control_id, hwnd, observation_id)
         if error:
             return {"ok": False, "error": error}
         before = self._action_state(wrapper)
@@ -135,13 +146,16 @@ class DesktopUIA:
             kind = "uia_state_change"
         else:
             kind = "uia_invoke_dispatch"
+        self._invalidate_controls()
         return {"ok": True, "control_id": control_id, "action": "invoke",
                 "verified": verified,
+                "uia_observation_id": str(observation_id or self._observation_id),
                 "verification": {"passed": verified, "kind": kind,
                                   "requires_reobserve": not verified}}
 
-    def set_value(self, control_id: str, hwnd: int, value: str) -> dict[str, Any]:
-        wrapper, error = self._valid(control_id, hwnd)
+    def set_value(self, control_id: str, hwnd: int, value: str,
+                  observation_id: str | None = None) -> dict[str, Any]:
+        wrapper, error = self._valid(control_id, hwnd, observation_id)
         if error:
             return {"ok": False, "error": error}
         value = str(value)
@@ -160,8 +174,33 @@ class DesktopUIA:
             return {"ok": False, "error": f"UI Automation set value failed: {exc}"}
         observed = self._read_value(wrapper)
         verified = observed is not None and observed == value
+        self._invalidate_controls()
         return {"ok": True, "control_id": control_id, "action": "set_value", "characters": len(value),
-                "verified": verified, "verification": {"passed": verified, "kind": "uia_value_readback"}}
+                "verified": verified, "uia_observation_id": str(observation_id or self._observation_id),
+                "verification": {"passed": verified, "kind": "uia_value_readback"}}
+
+    def is_blocking_observation(self, observation_id: str) -> bool:
+        return str(observation_id or "") in self._blocking_observations
+
+    def coordinate_fallback_eligible(self, observation_id: str) -> bool:
+        """Allow coordinate fallback only after a fresh, non-modal UIA observation."""
+        if not self.available:
+            return True
+        current = str(observation_id or "")
+        return bool(current and current == self._observation_id
+                    and current not in self._blocking_observations)
+
+    def reset(self) -> None:
+        self._controls.clear()
+        self._high_risk_controls.clear()
+        self._observation_fingerprints.clear()
+        self._pending_message_verification.clear()
+        self._blocking_observations.clear()
+        self._observation_id = ""
+
+    def _invalidate_controls(self) -> None:
+        self._controls.clear()
+        self._high_risk_controls.clear()
 
     @staticmethod
     def _read_value(wrapper: Any) -> str | None:
@@ -246,7 +285,9 @@ class DesktopUIA:
                 return None
             rect = wrapper.rectangle()
             control_id = "U" + secrets.token_hex(4).upper()
-            self._controls[control_id] = CachedControl(wrapper, hwnd, self._clock())
+            self._controls[control_id] = CachedControl(
+                wrapper, hwnd, self._clock(), self._observation_id,
+            )
             return {"control_id": control_id, "name": name[:160], "automation_id": automation_id[:160],
                     "control_type": control_type[:80], "enabled": self._enabled(wrapper),
                     "actions": self._actions(wrapper),
@@ -319,10 +360,15 @@ class DesktopUIA:
         except Exception:
             return True
 
-    def _valid(self, control_id: str, hwnd: int) -> tuple[Any | None, str | None]:
+    def _valid(self, control_id: str, hwnd: int,
+               observation_id: str | None = None) -> tuple[Any | None, str | None]:
         item = self._controls.get(str(control_id))
         if item is None:
             return None, "Unknown UI Automation control; observe the active window again."
+        if observation_id and str(observation_id) != item.observation_id:
+            return None, "UI Automation observation changed; observe the active window again."
+        if item.observation_id != self._observation_id:
+            return None, "UI Automation control is stale; observe the active window again."
         if self._clock() - item.created_at > self.TTL_SECONDS:
             return None, "UI Automation observation expired; observe the active window again."
         if int(hwnd or 0) != item.hwnd:

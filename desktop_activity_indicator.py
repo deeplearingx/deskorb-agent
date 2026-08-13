@@ -68,6 +68,8 @@ DESKTOP_ACTIVITY_TOOLS = frozenset({
     "desktop_scroll",
     "window_focus",
     "window_control",
+    "desktop_uia_invoke",
+    "desktop_uia_set_value",
 })
 
 # Browser actions use the same privacy-bounded visual affordance, while page
