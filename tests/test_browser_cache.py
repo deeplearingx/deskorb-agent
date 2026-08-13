@@ -72,6 +72,13 @@ class BrowserActionCacheTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cache.record_success(self.intent, template)
 
+    def test_generic_accessibility_result_role_is_allowed_for_parameterized_cache(self):
+        template = build_parameterized_search_template(fields=("title", "source"))
+        template["steps"][5]["locator"]["role"] = "generic"
+        entry = self.cache.record_success(self.intent, template)
+        self.assertEqual(self.cache.lookup(self.intent).status, "exact_hit")
+        self.assertEqual(entry.template["steps"][5]["locator"]["role"], "generic")
+
     def test_localhost_port_changes_share_the_parameterized_template_scope(self):
         first = parse_browser_task_intent(SEARCH_TASK, key=self.cache.key)
         second = parse_browser_task_intent(

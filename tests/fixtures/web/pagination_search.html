@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>DeskOrb pagination fixture</title></head>
+<body>
+  <main>
+    <h1>分页结果夹具</h1>
+    <p id="page-label">第 1 页</p>
+    <button id="next" type="button">下一页</button>
+    <section id="result" aria-live="polite"><p>第一页占位结果</p></section>
+  </main>
+  <script>
+    document.querySelector('#next').addEventListener('click', () => {
+      document.querySelector('#page-label').textContent = '第 2 页';
+      const result = document.querySelector('#result');
+      result.replaceChildren();
+      const title = document.createElement('h2');
+      title.textContent = '第二页高评分 T 恤';
+      const rating = document.createElement('p');
+      rating.textContent = '评分：4.7 / 5';
+      result.append(title, rating);
+    });
+  </script>
+</body>
+</html>

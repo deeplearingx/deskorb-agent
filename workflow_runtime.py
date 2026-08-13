@@ -27,6 +27,14 @@ _NEGATED_FILE_CHANGE = re.compile(
 def _has_positive_file_change_intent(text: str) -> bool:
     """Ignore file-change words used only to scope a negative safety constraint."""
     normalized = " ".join(str(text or "").lower().split())
+    # A plan-only request may mention a repair while explicitly forbidding the
+    # write.  Treat the explicit boundary as authoritative for the contract;
+    # otherwise an unexecuted write would make a read-only diagnosis look
+    # incomplete forever.
+    if re.search(r"(?:不执行|不要|不得|禁止|不允许|不进行)\s*(?:任何)?\s*(?:写操作|写入|修改|改动)", normalized):
+        return False
+    if "只读" in normalized and not re.search(r"(?:执行|允许|需要)\s*(?:写操作|写入|修改)", normalized):
+        return False
     for match in _FILE_CHANGE_MARKER.finditer(normalized):
         prefix = normalized[max(0, match.start() - 80):match.start()]
         if not _NEGATED_FILE_CHANGE.search(prefix):

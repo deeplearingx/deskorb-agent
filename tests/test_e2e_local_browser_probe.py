@@ -31,6 +31,11 @@ class BrowserProbeMatrixTests(unittest.TestCase):
         )
         self.assertFalse(probe._verification_evidence_passed(verification_results))
 
+    def test_evidence_accepts_verified_deterministic_cache_replay(self):
+        self.assertTrue(probe._verification_evidence_passed([{
+            "source": "cache_tool_result", "action": "verify", "passed": True,
+        }]))
+
     def test_probe_wraps_production_two_argument_dispatcher(self):
         calls = []
 

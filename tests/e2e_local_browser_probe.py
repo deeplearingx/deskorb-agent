@@ -88,7 +88,8 @@ def _verification_evidence_passed(results: list[dict[str, object]]) -> bool:
     """
     final_verify = next(
         (item for item in reversed(results)
-         if item.get("source") == "observation" and item.get("action") == "verify"),
+         if item.get("action") == "verify"
+         and item.get("source") in {"observation", "cache_tool_result"}),
         None,
     )
     return bool(final_verify and final_verify.get("passed"))
@@ -152,7 +153,8 @@ def _classify_probe_timeout(failure_kind: str | None,
 
 
 def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
-             timeout_seconds: int | None = None) -> dict[str, object]:
+             timeout_seconds: int | None = None, *,
+             definition: dict[str, object] | None = None) -> dict[str, object]:
     started = time.perf_counter()
     verification_results: list[dict[str, object]] = []
     browser_trace: list[dict[str, object]] = []
@@ -198,6 +200,7 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
                 "state_changed": bool(result.get("state_changed")),
                 "action_steps": int(result.get("action_steps") or 0),
                 "interaction_stage": str(result.get("interaction_stage") or "")[:32] or None,
+                "stage_transition_count": int(result.get("stage_transition_count") or 0),
                 "execution_source": str(result.get("execution_source") or "model")[:16],
                 "cache_status": str(result.get("cache_status") or "miss")[:16],
                 "model_fallback": bool(result.get("model_fallback")),
@@ -217,8 +220,16 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
         return result
 
     runtime._run_local_tool = record_with_verification
-    case = CASES[case_id]
-    task = case["task"].format(url=base_url + "/" + case["page"])
+    # Flagship stability probes may supply an isolated variation definition
+    # without expanding the ordinary three-case probe CLI.  Keeping the
+    # normal CASES table unchanged preserves the fast smoke contract while
+    # allowing each variation to run against its own fixture and evidence
+    # fields.
+    case = definition if isinstance(definition, dict) else CASES[case_id]
+    task = case["task"].format(
+        url=base_url + "/" + case["page"],
+        working_dir=str(getattr(runtime, "working_dir", "") or ""),
+    )
     task += (
         "\n完成前必须通过 browser_action_batch 获取当前快照，并使用 extract 提取页面中"
         "实际显示的目标字段，再使用 verify 验证这些字段；不能只用最终文字回答代替结构化验证。"
@@ -230,6 +241,8 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
                  + "；verify 时 required_fields 必须使用同一组字段")
     if contains:
         task += "，并在 verify 的 contains 中检查：" + "、".join(contains)
+    if case.get("verify_postcondition"):
+        task += "；verify 的 postcondition 必须使用：" + str(case["verify_postcondition"])
     task += "。verify 必须是最后一个浏览器动作，且不要把多个状态动作放在同一批次。"
     failure_kind = None
     try:
@@ -262,6 +275,17 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
                 "cache_status": str(value.get("cache_status") or "miss")[:16],
                 "model_fallback": bool(value.get("model_fallback")),
                 "postcondition_passed": bool(value.get("postcondition_passed")),
+                "verification_passed": bool(value.get("verification_passed")),
+                "stage_transition_count": int(value.get("stage_transition_count") or 0),
+            })
+            verification_results.append({
+                "source": "cache_tool_result",
+                "action": "verify",
+                "passed": bool(value.get("verification_passed")
+                                or value.get("postcondition_passed")),
+                "checks": [],
+                "observed_chars": None,
+                "observed_numbers": [],
             })
         tool_calls = [value for kind, value in all_events if kind == "tool"]
         mcp_calls = sum(1 for value in tool_calls if isinstance(value, tuple)
@@ -273,12 +297,13 @@ def run_case(case_id: str, base_url: str, runtime: AgentRuntime, events: Queue,
         verified = (final_progress.get("terminal") == "completed"
                     and bool(final_progress.get("verified")))
         evidence_passed = _verification_evidence_passed(verification_results)
+        bounded_failure = failure_kind or ("unverified_terminal_state" if not verified else None)
         return {"id": case_id, "ok": bool(token and mcp_calls and verified and evidence_passed),
                 "approval_used": bool(token), "mcp_tool_calls": mcp_calls,
                 "terminal": final_progress.get("terminal"),
                 "verified": bool(final_progress.get("verified")),
                 "evidence_passed": evidence_passed,
-                "failure_kind": failure_kind,
+                "failure_kind": bounded_failure,
                 "verification_results": verification_results,
                 "browser_trace": browser_trace,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000)}

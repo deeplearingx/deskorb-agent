@@ -98,6 +98,7 @@ class DesktopUIA:
         result = {
             "ok": True, "window_handle": hwnd, "process_name": process_name[:80],
             "uia_observation_id": self._observation_id,
+            "observation_fingerprint": fingerprint,
             "application": application.safe_dict(), "controls": controls,
             "recommended_actions": recommended_actions, "dialogs": dialogs[:8],
             "disabled_control_count": disabled, "requires_user_attention": bool(dialogs),
@@ -121,6 +122,7 @@ class DesktopUIA:
         before = self._action_state(wrapper)
         message_action = self._is_message_send_control(wrapper, hwnd)
         message_baseline = self._observation_fingerprints.get(int(hwnd), (None, 0.0))[0] if message_action else None
+        before_fingerprint = self._observation_fingerprints.get(int(hwnd), ("", 0.0))[0]
         try:
             invoke = getattr(wrapper, "invoke", None)
             if callable(invoke):
@@ -149,6 +151,7 @@ class DesktopUIA:
         self._invalidate_controls()
         return {"ok": True, "control_id": control_id, "action": "invoke",
                 "verified": verified,
+                "before_observation_fingerprint": before_fingerprint,
                 "uia_observation_id": str(observation_id or self._observation_id),
                 "verification": {"passed": verified, "kind": kind,
                                   "requires_reobserve": not verified}}
@@ -168,7 +171,8 @@ class DesktopUIA:
             else:
                 set_value = getattr(wrapper, "set_value", None)
                 if not callable(set_value):
-                    return {"ok": False, "error": "The selected control does not support setting a value."}
+                    return {"ok": False, "failure_kind": "desktop_uia_value_pattern_unavailable",
+                            "error": "The selected control does not support setting a value."}
                 set_value(value)
         except Exception as exc:
             return {"ok": False, "error": f"UI Automation set value failed: {exc}"}
@@ -176,8 +180,86 @@ class DesktopUIA:
         verified = observed is not None and observed == value
         self._invalidate_controls()
         return {"ok": True, "control_id": control_id, "action": "set_value", "characters": len(value),
+                "readback_available": observed is not None,
                 "verified": verified, "uia_observation_id": str(observation_id or self._observation_id),
                 "verification": {"passed": verified, "kind": "uia_value_readback"}}
+
+    def focus_control(self, control_id: str, hwnd: int,
+                      observation_id: str | None = None) -> dict[str, Any]:
+        """Focus one observed control without using coordinates."""
+        wrapper, error = self._valid(control_id, hwnd, observation_id)
+        if error:
+            return {"ok": False, "failure_kind": "desktop_uia_stale_control", "error": error}
+        setter = getattr(wrapper, "set_focus", None)
+        if not callable(setter):
+            return {"ok": False, "failure_kind": "desktop_uia_focus_unavailable",
+                    "error": "The observed UI Automation control does not support semantic focus."}
+        try:
+            setter()
+        except Exception as exc:
+            return {"ok": False, "failure_kind": "desktop_uia_focus_failed",
+                    "error": f"UI Automation could not focus the observed control: {exc}"}
+        if not self._foreground_matches(int(self._foreground_getter() or 0), int(hwnd)):
+            return {"ok": False, "failure_kind": "desktop_uia_focus_window_changed",
+                    "error": "The target application lost foreground focus during fallback preparation."}
+        return {"ok": True, "control_id": str(control_id), "uia_observation_id": self._observation_id}
+
+    def control_descriptor(self, control_id: str, observation_id: str | None = None) -> dict[str, str] | None:
+        """Return non-content identity fields for one observed control."""
+        item = self._controls.get(str(control_id))
+        if item is None or (observation_id and str(observation_id) != item.observation_id):
+            return None
+        try:
+            info = item.wrapper.element_info
+            return {
+                "name": str(getattr(info, "name", "") or "").strip()[:160],
+                "automation_id": str(getattr(info, "automation_id", "") or "").strip()[:160],
+                "control_type": str(getattr(info, "control_type", "") or "").strip()[:80],
+            }
+        except Exception:
+            return None
+
+    def find_control(self, descriptor: dict[str, str] | None,
+                     observation_id: str | None = None) -> str | None:
+        """Find the same semantic control in the latest observation."""
+        if not isinstance(descriptor, dict):
+            return None
+        wanted_type = str(descriptor.get("control_type") or "").casefold()
+        wanted_automation = str(descriptor.get("automation_id") or "").strip()
+        wanted_name = str(descriptor.get("name") or "").strip()
+        self._prune()
+        for control_id, item in self._controls.items():
+            if observation_id and item.observation_id != str(observation_id):
+                continue
+            try:
+                info = item.wrapper.element_info
+                current_type = str(getattr(info, "control_type", "") or "").casefold()
+                current_automation = str(getattr(info, "automation_id", "") or "").strip()
+                current_name = str(getattr(info, "name", "") or "").strip()
+            except Exception:
+                continue
+            if wanted_type and current_type != wanted_type:
+                continue
+            if wanted_automation and current_automation != wanted_automation:
+                continue
+            if wanted_name and current_name != wanted_name:
+                continue
+            return control_id
+        return None
+
+    def read_value(self, control_id: str, hwnd: int,
+                   observation_id: str | None = None) -> dict[str, Any]:
+        """Read one current control value for an exact, in-memory postcondition."""
+        wrapper, error = self._valid(control_id, hwnd, observation_id)
+        if error:
+            return {"ok": False, "failure_kind": "desktop_uia_stale_control", "error": error}
+        observed = self._read_value(wrapper)
+        return {
+            "ok": observed is not None,
+            "readback_available": observed is not None,
+            "value": observed,
+            "characters": len(observed) if observed is not None else 0,
+        }
 
     def is_blocking_observation(self, observation_id: str) -> bool:
         return str(observation_id or "") in self._blocking_observations

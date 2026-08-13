@@ -12,6 +12,26 @@ class BrowserActionTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual([item.action for item in actions], ["snapshot", "click_ref"])
 
+    def test_accepts_only_observation_bound_safe_navigation_keys(self):
+        actions, error = validate_browser_action_batch([{
+            "action": "press_key",
+            "arguments": {"key": "Enter", "ref": "option-1", "observation_id": "obs-1"},
+        }])
+        self.assertIsNone(error)
+        self.assertEqual(actions[0].arguments["key"], "Enter")
+
+        _actions, error = validate_browser_action_batch([{
+            "action": "press_key",
+            "arguments": {"key": "Control+L", "ref": "option-1", "observation_id": "obs-1"},
+        }])
+        self.assertIn("allowed", error)
+
+        _actions, error = validate_browser_action_batch([{
+            "action": "press_key",
+            "arguments": {"key": "Enter", "ref": "option-1"},
+        }])
+        self.assertIn("observation_id", error)
+
     def test_requires_current_observation_for_ref_actions(self):
         _actions, error = validate_browser_action_batch([{
             "action": "click_ref", "arguments": {"ref": "e17"},

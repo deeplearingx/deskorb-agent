@@ -36,6 +36,20 @@ class DesktopVMPreflightTests(unittest.TestCase):
             result = preflight.run()
         self.assertTrue(result["ok"])
 
+    def test_deferred_target_mode_allows_fixture_to_be_started_after_host_preflight(self):
+        checks = {
+            "signed_in_user": True, "desktop_window": True,
+            "foreground_window": False, "screen_size": True,
+            "powershell7": True, "uia_provider": True,
+            "uia_window_count": 0, "interactive_uia_desktop": False,
+        }
+        with patch.object(preflight.os, "name", "nt"), patch.object(preflight, "_windows_checks", return_value=checks):
+            strict = preflight.run()
+            deferred = preflight.run(require_foreground=False)
+        self.assertFalse(strict["ok"])
+        self.assertTrue(deferred["ok"])
+        self.assertFalse(deferred["checks"]["interactive_uia_desktop"])
+
     def test_uia_probe_targets_foreground_window_without_enumerating_desktop(self):
         calls = []
 

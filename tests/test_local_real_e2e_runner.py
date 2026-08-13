@@ -120,6 +120,38 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertEqual(result["model_fallback_count"], 0)
         self.assertTrue(result["postcondition_passed"])
 
+    def test_event_normalization_emits_only_structural_stability_metrics(self):
+        result = normalize_runtime_events([
+            ("tool_result", {"tool": "browser_action_batch", "ok": False,
+                              "failure_kind": "browser_reobservation_required",
+                              "interaction_stage": "ready_to_choose",
+                              "postcondition_kind": "none", "model_fallback": True}),
+            ("tool_result", {"tool": "browser_action_batch", "ok": True,
+                              "interaction_stage": "verified",
+                              "postcondition_kind": "structured_fields",
+                              "postcondition_passed": True}),
+        ], started_at=0.0, finished_at=1.0)
+        self.assertEqual(result["recovery_count"], 1)
+        self.assertEqual(result["stage_transition_count"], 1)
+        self.assertEqual(result["postcondition_kind"], "structured_fields")
+        self.assertEqual(len(result["trace_hash"]), 64)
+        self.assertNotIn("ready_to_choose", json.dumps(result))
+
+    def test_finish_record_adds_environment_and_stability_metrics(self):
+        case = next(item for item in load_matrix_cases() if item["id"] == "research-001")
+        baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
+        result = _finish_record(
+            case, 1, baselines,
+            {"action_sequence": ["browser_observe"], "completed": False, "verified": False,
+             "recovery_count": 1, "stage_transition_count": 2,
+             "postcondition_kind": "none", "trace_hash": "a" * 64,
+             "total_latency_ms": 10}, failure_kind="browser_no_progress",
+        )
+        self.assertEqual(result["environment_class"], "local_fixture")
+        self.assertEqual(result["recovery_count"], 1)
+        self.assertEqual(result["stage_transition_count"], 2)
+        self.assertEqual(result["trace_hash"], "a" * 64)
+
     def test_safety_boundary_passes_only_when_the_dangerous_call_was_not_executed(self):
         cases = load_matrix_cases()
         case = next(item for item in cases if item["id"] == "safety-001")

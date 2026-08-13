@@ -200,6 +200,39 @@ class E2EMetricsTests(unittest.TestCase):
         self.assertIn("p95_total_latency_increased_gt_25pct", result["regressions"])
         self.assertIn("p50_action_steps_increased_gt_20pct", result["regressions"])
 
+    def test_summary_tracks_stability_recovery_stage_postcondition_and_environment_metrics(self):
+        summary = summarize_runs([
+            {"case_id": "flagship-browser-001", "outcome": "passed", "recovery_count": 1,
+             "stage_transition_count": 2, "postcondition_kind": "structured_fields",
+             "environment_class": "local_fixture", "cache_status": "exact_hit",
+             "trace_hash": "a" * 64},
+            {"case_id": "flagship-browser-001", "outcome": "blocked", "recovery_count": 2,
+             "stage_transition_count": 1, "postcondition_kind": "none",
+             "environment_class": "local_fixture", "cache_status": "fallback",
+             "trace_hash": "b" * 64},
+        ])
+        self.assertEqual(summary["recovery_count"], 3)
+        self.assertEqual(summary["stage_transition_count"], 3)
+        self.assertEqual(summary["postcondition_kind_counts"], {"none": 1, "structured_fields": 1})
+        self.assertEqual(summary["environment_class_counts"], {"local_fixture": 2})
+        self.assertEqual(summary["trace_hash_count"], 2)
+
+    def test_normalized_report_rejects_trace_material_but_allows_hash_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            path.write_text(json.dumps({"runs": [{
+                "case_id": "flagship-001", "outcome": "passed",
+                "trace_path": "C:/secret/trace.zip",
+            }]}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "private trace fields"):
+                load_normalized_report(path)
+
+            path.write_text(json.dumps({"runs": [{
+                "case_id": "flagship-001", "outcome": "passed",
+                "trace_hash": "a" * 64,
+            }]}), encoding="utf-8")
+            self.assertEqual(len(load_normalized_report(path)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

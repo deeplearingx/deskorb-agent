@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +12,7 @@ _PRIVATE_TRACE_KEYS = {
     "answer", "prompt", "input", "messages", "content", "tool_calls", "tool_payloads",
     "arguments", "observations", "screenshot", "screenshots", "page_text", "final_answer",
     "url", "urls", "base_url", "error", "traceback", "api_key", "token", "cookie", "cookies",
+    "trace_path", "trace_file", "trace_content", "trace_events",
 }
 
 _SAFE_ACTION_KINDS = {
@@ -34,6 +36,7 @@ _ACTION_KIND_ALIASES = {
     "browser_tabs": "browser_observe",
     "fill": "browser_input",
     "fill_ref": "browser_input",
+    "press_key": "browser_input",
     "type": "desktop_input",
     "wait": "browser_wait",
     "verify": "browser_verify",
@@ -54,6 +57,7 @@ _ACTION_KIND_ALIASES = {
     "mcp_playwright_browser_snapshot": "browser_observe",
     "mcp_playwright_browser_click": "browser_click",
     "mcp_playwright_browser_type": "browser_input",
+    "mcp_playwright_browser_press_key": "browser_input",
     "mcp_playwright_browser_wait_for": "browser_wait",
     "mcp_playwright_browser_tabs": "browser_observe",
     "filesystem_search_text": "filesystem_read",
@@ -103,6 +107,8 @@ def load_normalized_report(path: str | Path) -> list[dict[str, Any]]:
         leaked = sorted(_private_trace_keys(item))
         if leaked:
             raise ValueError(f"run {index} contains private trace fields: {', '.join(leaked)}")
+        if "trace_hash" in item and not re.fullmatch(r"[0-9a-f]{64}", str(item.get("trace_hash") or "")):
+            raise ValueError(f"run {index} contains an invalid trace_hash")
         case_id = str(item.get("case_id") or "").strip()
         outcome = str(item.get("outcome") or "").strip().lower()
         if not case_id or outcome not in {"passed", "partial", "failed", "blocked", "skipped"}:
@@ -207,6 +213,14 @@ def summarize_runs(runs: list[dict[str, Any]], *,
         str(item.get("cache_status") or "miss")
         for item in scored
     )
+    postcondition_kinds = Counter(
+        str(item.get("postcondition_kind") or "none")
+        for item in scored
+    )
+    environment_classes = Counter(
+        str(item.get("environment_class") or "unknown")
+        for item in scored
+    )
     postcondition_runs = [item for item in scored if "postcondition_passed" in item]
     confirmation_required = [
         item for item in scored
@@ -238,6 +252,11 @@ def summarize_runs(runs: list[dict[str, Any]], *,
         "handoff_count": handoffs,
         "execution_source_counts": dict(sorted(execution_sources.items())),
         "cache_status_counts": dict(sorted(cache_statuses.items())),
+        "recovery_count": sum(_nonnegative_int(item.get("recovery_count")) for item in scored),
+        "stage_transition_count": sum(_nonnegative_int(item.get("stage_transition_count")) for item in scored),
+        "postcondition_kind_counts": dict(sorted(postcondition_kinds.items())),
+        "environment_class_counts": dict(sorted(environment_classes.items())),
+        "trace_hash_count": sum(bool(str(item.get("trace_hash") or "").strip()) for item in scored),
         "model_fallback_count": sum(bool(item.get("model_fallback")) for item in scored),
         "postcondition_pass_rate": _ratio(
             sum(bool(item.get("postcondition_passed")) for item in postcondition_runs),

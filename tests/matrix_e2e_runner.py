@@ -119,6 +119,8 @@ def run_case(case: dict[str, Any]) -> dict[str, Any]:
         return _run_browser(case)
     if category.startswith("desktop_") or category in {"window_management"}:
         return _run_desktop(case)
+    if category == "data_redaction_boundary":
+        return _run_redaction_boundary(case)
     if category in {"high_risk_message_boundary", "destructive_action_boundary", "privacy_boundary",
                     "permission_boundary", "unsupported_capability_boundary"}:
         return _run_safety_boundary(case)
@@ -174,6 +176,7 @@ def _run_desktop(case: dict[str, Any]) -> dict[str, Any]:
             responses = iter([
                 _call("desktop_capture_state", "{}"),
                 {"output_text": "UI Automation 不可用，已安全停止。", "output": []},
+                {"output_text": "已阻断未验证的桌面动作，等待人工处理。", "output": []},
             ])
             runtime._request = lambda _payload, _key: next(responses)
             patches = _runtime_patches(runtime, uia_unavailable=True)
@@ -206,9 +209,17 @@ def _run_desktop(case: dict[str, Any]) -> dict[str, Any]:
             observed = _drive_confirmed(runtime, events, prompt)
         terminal = _terminal_events(observed)
         if variation == "uia_unavailable":
-            blocked = any(kind == "delta" and "UI Automation" in str(value) for kind, value in observed)
+            blocked = any(
+                kind == "tool_result"
+                and not bool(value.get("ok"))
+                and value.get("failure_kind") == "desktop_uia_unavailable"
+                for kind, value in observed
+                if isinstance(value, dict)
+            )
             return _record(case, "passed" if blocked else "failed", started,
-                           requires_evidence=False, evidence_passed=blocked, tool_rounds=1)
+                           requires_evidence=False, evidence_passed=blocked,
+                           safety_case=True, safety_passed=blocked,
+                           tool_rounds=1)
         verified = bool(terminal and terminal[-1].get("verified")) and not any(kind == "error" for kind, _ in observed)
         return _record(case, "passed" if verified else "failed", started,
                        requires_evidence=True, evidence_passed=verified,
@@ -228,14 +239,20 @@ def _run_diagnosis(case: dict[str, Any]) -> dict[str, Any]:
         events = Queue()
         runtime = _runtime(events, root)
         query = "ModuleNotFoundError" if fixture == "broken_python_project" else "proxy"
-        read_path = f"{fixture}/deskorb.log"
+        read_path = f"{fixture}/deskorb_fixture.txt"
         calls = [_call("filesystem_search_text", json.dumps({"path": fixture, "query": query, "max_results": 10})) ,
                  _call("filesystem_read_text", json.dumps({"path": read_path, "max_chars": 2000}))]
         variation = str((case.get("setup") or {}).get("variation") or "")
-        if variation in {"dependency_fix", "proxy_fix", "syntax_check"}:
-            if variation == "syntax_check":
+        effective_variation = variation
+        if not effective_variation:
+            effective_variation = {
+                "diagnose-001": "dependency_fix",
+                "diagnose-002": "proxy_fix",
+            }.get(str(case.get("id") or ""), "")
+        if effective_variation in {"dependency_fix", "proxy_fix", "syntax_check"}:
+            if effective_variation == "syntax_check":
                 calls.append(_call("shell_run", '{"command":"python -m py_compile app.py","timeout_seconds":5}'))
-            elif variation == "proxy_fix":
+            elif effective_variation == "proxy_fix":
                 calls.append(_call("filesystem_write", json.dumps({"path": f"{fixture}/connection.json", "text":"{\"api_proxy_url\":\"http://127.0.0.1:12000\"}", "overwrite":True})))
             else:
                 calls.append(_call("filesystem_write", json.dumps({"path": f"{fixture}/requirements.txt", "text":"requests==2.32.3\\npython-dotenv>=1.0\\n", "overwrite":True})))
@@ -277,6 +294,41 @@ def _run_safety_boundary(case: dict[str, Any]) -> dict[str, Any]:
                        safety_passed=passed, needs_task_confirmation=True,
                        task_confirmation_once=False, confirmation_scorable=False,
                        tool_rounds=2)
+
+
+def _run_redaction_boundary(case: dict[str, Any]) -> dict[str, Any]:
+    """Exercise the report privacy gate without retaining unsafe trace data."""
+    from e2e_metrics import load_normalized_report
+
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        unsafe = root / "unsafe.json"
+        unsafe.write_text(json.dumps({"runs": [{
+            "case_id": str(case.get("id") or "redaction"),
+            "outcome": "passed",
+            "prompt": "must be rejected",
+        }]}), encoding="utf-8")
+        rejected = False
+        try:
+            load_normalized_report(unsafe)
+        except ValueError:
+            rejected = True
+
+        safe = root / "safe.json"
+        safe.write_text(json.dumps({"runs": [{
+            "case_id": str(case.get("id") or "redaction"),
+            "outcome": "passed",
+            "tool_rounds": 2,
+            "total_latency_ms": 12,
+            "safety_passed": True,
+        }]}), encoding="utf-8")
+        accepted = len(load_normalized_report(safe)) == 1
+    passed = rejected and accepted
+    return _record(case, "passed" if passed else "failed", started,
+                   safety_case=True, safety_passed=passed,
+                   requires_evidence=True, evidence_passed=passed,
+                   redaction_check=passed, tool_rounds=0)
 
 
 def _run_provider_boundary(case: dict[str, Any]) -> dict[str, Any]:
@@ -348,7 +400,8 @@ def _runtime_patches(runtime: AgentRuntime, *, window_mode: bool = False,
     if uia_unavailable:
         values["desktop_error"] = patch.object(
             runtime.desktop, "capture_state",
-            return_value={"ok": False, "error": "UI Automation backend unavailable"},
+            return_value={"ok": False, "failure_kind": "desktop_uia_unavailable",
+                          "error": "UI Automation backend unavailable"},
         )
     if shell_result is not None:
         values["shell"] = patch.object(runtime.tools, "run_shell", return_value=shell_result)

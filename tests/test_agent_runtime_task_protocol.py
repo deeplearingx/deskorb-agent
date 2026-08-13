@@ -5,7 +5,12 @@ from queue import Queue
 from unittest.mock import Mock, patch
 
 from agent_runtime import AgentRuntime
-from task_runtime import InMemoryTaskJournal, TASK_STATUS_COMPLETED, TASK_STATUS_WAITING_VERIFICATION
+from task_runtime import (
+    InMemoryTaskJournal,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_WAITING_VERIFICATION,
+)
 
 
 class AgentRuntimeTaskProtocolTests(unittest.TestCase):
@@ -47,6 +52,7 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
                 {"output": [{"type": "function_call", "call_id": "write",
                              "name": "filesystem_write", "arguments": "{\"path\":\"tmp.txt\",\"text\":\"x\",\"overwrite\":true}"}]},
                 {"output_text": "已写入", "output": []},
+                {"output_text": "仍未验证", "output": []},
             ])
             with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
                  patch.object(runtime, "_run_local_tool", return_value={"ok": True}):
@@ -54,9 +60,34 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
 
             progress = [value for kind, value in list(events.queue)
                         if kind == "task_progress" and isinstance(value, dict) and value.get("terminal")]
-            self.assertEqual(progress[-1]["terminal"], "waiting_verification")
+            self.assertEqual(progress[-1]["terminal"], "failed")
             self.assertFalse(progress[-1]["verified"])
-            self.assertEqual(journal.task(progress[-1]["task_id"])["status"], TASK_STATUS_WAITING_VERIFICATION)
+            self.assertEqual(progress[-1]["failure_kind"], "required_action_missing")
+            self.assertEqual(journal.task(progress[-1]["task_id"])["status"], TASK_STATUS_FAILED)
+
+    def test_incomplete_action_does_not_close_on_first_prose_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            events = Queue()
+            journal = InMemoryTaskJournal()
+            runtime = AgentRuntime(events, "fixture-model", "https://example.test/v1",
+                                   working_dir=Path(directory), task_journal=journal)
+            runtime._request = Mock(side_effect=[
+                {"output": [{"type": "function_call", "call_id": "write",
+                             "name": "filesystem_write", "arguments":
+                             "{\"path\":\"tmp.txt\",\"text\":\"x\",\"overwrite\":true}"}]},
+                {"output_text": "先说明但不执行", "output": []},
+                {"output_text": "仍然不执行", "output": []},
+            ])
+            with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
+                 patch.object(runtime, "_run_local_tool", return_value={"ok": True}):
+                runtime.run_turn("创建临时文件并确认", [])
+
+            progress = [value for kind, value in list(events.queue)
+                        if kind == "task_progress" and isinstance(value, dict) and value.get("terminal")]
+            self.assertEqual(runtime._request.call_count, 3)
+            self.assertEqual(progress[-1]["terminal"], "failed")
+            self.assertEqual(progress[-1]["failure_kind"], "required_action_missing")
+            self.assertEqual(journal.task(progress[-1]["task_id"])["status"], TASK_STATUS_FAILED)
 
     def test_empty_user_input_is_blocked_without_model_request(self):
         events = Queue()
@@ -95,6 +126,7 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
         runtime._request = Mock(side_effect=[
             {"output": [{"type": "function_call", "call_id": "bad",
                          "name": "shell_run", "arguments": "not-json"}]},
+            {"output_text": "无法执行", "output": []},
             {"output_text": "无法执行", "output": []},
         ])
 

@@ -42,6 +42,24 @@ class InvalidResultBackend(FakeBackend):
         return super().call(action, arguments)
 
 
+class ParentRebindBackend(FakeBackend):
+    def __init__(self, page_snapshot, incomplete_extraction, complete_extraction):
+        super().__init__([page_snapshot])
+        self.incomplete_extraction = incomplete_extraction
+        self.complete_extraction = complete_extraction
+
+    def call(self, action, arguments):
+        self.calls.append((action, dict(arguments)))
+        if action == "snapshot":
+            return {"ok": True, "content": self.snapshots.pop(0)}
+        if action == "extract":
+            content = (self.complete_extraction
+                       if arguments.get("ref") == "results-root"
+                       else self.incomplete_extraction)
+            return {"ok": True, "content": content}
+        return {"ok": True, "content": [{"type": "text", "text": action + " accepted"}]}
+
+
 class FakeBridge:
     def __init__(self):
         self.calls = []
@@ -60,6 +78,81 @@ class FakeBridge:
 
 
 class BrowserExecutionSessionTests(unittest.TestCase):
+    def test_session_exposes_stable_session_tab_and_next_action_contract(self):
+        backend = FakeBackend([snapshot("search", "")])
+        session = BrowserExecutionSession(backend)
+        result = session.execute([{"action": "snapshot", "arguments": {}}])
+
+        self.assertTrue(result["browser_session_id"])
+        self.assertEqual(result["tab_id"], "tab-1")
+        self.assertEqual(result["next_allowed_actions"], [
+            "navigate", "snapshot", "fill_ref", "click_ref", "select_ref",
+            "press_key", "wait", "switch_tab", "extract", "verify",
+        ])
+
+    def test_autocomplete_stage_removes_repeat_fill_from_next_actions(self):
+        initial = [{"type": "text", "text": """### Snapshot
+- combobox [ref=search]: ""
+"""}]
+        with_options = snapshot("search", "Python", selected="Python asyncio 入门")
+        backend = FakeBackend([initial, with_options])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        result = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search", "value": "Python", "observation_id": observation_id,
+        }}])
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["interaction_stage"], "ready_to_choose")
+        self.assertNotIn("fill_ref", result["next_allowed_actions"])
+        self.assertIn("click_ref", result["next_allowed_actions"])
+        self.assertIn("press_key", result["next_allowed_actions"])
+
+    def test_verified_browser_result_closes_next_action_set(self):
+        content = [{"type": "text", "text": """### Snapshot
+- article [ref=card-1]:
+  - heading [ref=title-1]: "Python asyncio"
+"""}]
+        backend = FakeBackend([content, content])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+        extracted = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-1", "fields": ["title"], "observation_id": observation_id,
+        }}])
+        result = session.execute([{"action": "verify", "arguments": {
+            "required_fields": ["title"],
+        }}])
+
+        self.assertTrue(extracted["ok"])
+        self.assertTrue(result["postcondition_passed"])
+        self.assertEqual(result["next_allowed_actions"], [])
+
+    def test_switch_tab_rotates_opaque_tab_identity_without_resetting_session(self):
+        backend = FakeBackend([snapshot("search", ""), snapshot("search", "tab2")])
+        session = BrowserExecutionSession(backend)
+        first = session.execute([{"action": "snapshot", "arguments": {}}])
+        result = session.execute([{"action": "switch_tab", "arguments": {
+            "index": 1, "observation_id": first["observation_id"],
+        }}])
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["browser_session_id"], first["browser_session_id"])
+        self.assertNotEqual(result["tab_id"], first["tab_id"])
+        self.assertEqual(result["tab_id"], "tab-2")
+
+    def test_recovery_keeps_browser_session_and_tab_identity(self):
+        backend = FakeBackend([snapshot("search", "")])
+        session = BrowserExecutionSession(backend)
+        first = session.execute([{"action": "snapshot", "arguments": {}}])
+        session._reobservation_required = True
+        result = session.execute([{"action": "click_ref", "arguments": {
+            "ref": "search", "observation_id": first["observation_id"],
+        }}])
+        self.assertEqual(result["failure_kind"], "browser_reobservation_required")
+        self.assertEqual(result["browser_session_id"], first["browser_session_id"])
+        self.assertEqual(result["tab_id"], first["tab_id"])
+
     def test_snapshot_backend_exception_becomes_bounded_failure(self):
         session = BrowserExecutionSession(RaisingSnapshotBackend([]))
         result = session.execute([{"action": "snapshot", "arguments": {}}])
@@ -371,6 +464,37 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertEqual(observation["ref"], "card-1")
         self.assertEqual(observation["extraction"]["observation_id"], observation_id)
 
+    def test_incomplete_extract_rebinds_once_to_a_semantic_parent(self):
+        page = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- region [ref=results-root]:
+  - article [ref=card-1]:
+    - heading [ref=title-1]: \"Python asyncio\"
+    - paragraph [ref=source-1]: \"source: 官方文档\"
+```"""}]
+        incomplete = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- article [ref=card-1]:
+  - heading [ref=title-1]: \"Python asyncio\"
+```"""}]
+        complete = page
+        backend = ParentRebindBackend(page, incomplete, complete)
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        result = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-1", "fields": ["title", "source"],
+            "observation_id": observation_id,
+        }}])
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["locator_rebound"])
+        self.assertEqual(result["extraction"]["fields"]["source"], "官方文档")
+        self.assertEqual([item[0] for item in backend.calls], ["snapshot", "extract", "extract"])
+        self.assertEqual(backend.calls[-1][1]["ref"], "results-root")
+
     def test_verify_expected_field_values_are_checked_against_extraction(self):
         content = [{"type": "text", "text": """### Page
 ### Snapshot
@@ -641,11 +765,13 @@ class PlaywrightMCPBackendTests(unittest.TestCase):
         backend.call("fill_ref", {"ref": "search", "value": "Python"})
         backend.call("click_ref", {"ref": "option-1"})
         backend.call("select_ref", {"ref": "language", "values": ["Python"]})
+        backend.call("press_key", {"ref": "option-1", "key": "Enter"})
 
         self.assertEqual([name for name, _args in bridge.calls], [
             "mcp_playwright_browser_type",
             "mcp_playwright_browser_click",
             "mcp_playwright_browser_select_option",
+            "mcp_playwright_browser_press_key",
         ])
         self.assertEqual(bridge.calls[0][1]["target"], "search")
         self.assertEqual(bridge.calls[0][1]["text"], "Python")

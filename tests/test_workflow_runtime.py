@@ -50,6 +50,13 @@ class TaskWorkflowTests(unittest.TestCase):
         self.assertFalse(progress["verified"])
         self.assertEqual(progress["terminal"], "waiting_verification")
 
+    def test_plan_only_repair_request_does_not_require_file_change(self):
+        contract = TaskContract.from_goal(
+            "读取测试项目的错误日志，给出一个最小修复方案和一个验证步骤，不执行写操作。",
+            requires_action=True,
+        )
+        self.assertNotIn("path_and_content_hash", contract.required_evidence_schemas)
+
     def test_successful_read_only_shell_check_is_exit_status_evidence(self):
         workflow = TaskWorkflow("T-shell", "运行语法检查并报告结果",
                                 contract=TaskContract.from_goal("运行语法检查并报告结果", requires_action=True))

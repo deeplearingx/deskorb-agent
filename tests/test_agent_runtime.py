@@ -188,6 +188,11 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(runtime._mcp_servers_for_task("启用 PowerToys 保持唤醒"), ("powertoys",))
         self.assertEqual(runtime._mcp_servers_for_task("打开记事本并输入 hello"), ())
 
+    def test_mcp_router_does_not_start_playwright_for_desktop_search(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        self.assertEqual(runtime._mcp_servers_for_task("在 QQ 中搜索张三"), ())
+        self.assertEqual(runtime._mcp_servers_for_task("在资源管理器中搜索报告"), ())
+
     def test_mcp_router_recognizes_natural_language_office_file_requests(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
         class OfficeRouter:
@@ -249,6 +254,66 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertIn("browser_action_batch", names)
         self.assertNotIn("mcp_playwright_browser_snapshot", names)
         self.assertNotIn("mcp_playwright_browser_click", names)
+
+    def test_verified_browser_result_stops_before_requesting_an_extra_browser_round(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._browser_session = object()
+        runtime._browser_stage_verified = True
+        self.assertNotIn("browser_action_batch", {
+            item["name"] for item in runtime._available_schemas("打开浏览器搜索结果")
+        })
+
+    def test_verified_browser_task_terminates_runtime_loop_without_extra_model_round(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        class FakeMcp:
+            available_servers = ("playwright",)
+
+            def schemas(self, _servers):
+                return []
+
+            def is_browser_isolated(self):
+                return True
+
+            def owns(self, _name):
+                return False
+
+        runtime.mcp = FakeMcp()
+        runtime._task_authorized_until = __import__("time").monotonic() + 30
+        response = {"output": [{
+            "type": "function_call", "call_id": "browser-1", "name": "browser_action_batch",
+            "arguments": '{"actions":[{"action":"verify","arguments":{"required_fields":["title"]}}]}',
+        }]}
+        runtime._request = Mock(return_value=response)
+        browser_result = {
+            "ok": True, "postcondition_passed": True, "verified": True,
+            "verification": {"passed": True, "kind": "browser_structured_verification"},
+            "extraction": {"fields": {"title": "Verified result"}},
+        }
+        runtime._run_desktop_action = Mock(return_value=browser_result)
+
+        runtime._run_task_loop("test-key", [{"role": "user", "content": "search"}],
+                               "open browser and search a result", False)
+
+        runtime._request.assert_called_once()
+        events = []
+        while not runtime.ui.empty():
+            events.append(runtime.ui.get_nowait())
+        self.assertTrue(any(kind == "delta" and "Verified result" in str(value)
+                            for kind, value in events))
+        progress = [value for kind, value in events if kind == "task_progress"]
+        self.assertEqual(progress[-1]["terminal"], "completed")
+        self.assertTrue(progress[-1]["verified"])
+
+    def test_browser_schema_exposes_only_restricted_press_key(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        schema = runtime._browser_action_batch_schema()
+        variants = schema["parameters"]["properties"]["actions"]["items"]["oneOf"]
+        press = next(item for item in variants
+                     if item["properties"]["action"]["enum"] == ["press_key"])
+        self.assertEqual(press["properties"]["arguments"]["properties"]["key"]["enum"], [
+            "Enter", "Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft",
+            "ArrowRight", "PageUp", "PageDown",
+        ])
 
     def test_semantic_browser_dispatch_keeps_raw_tools_internal(self):
         class FakePlaywright:
@@ -362,6 +427,150 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["after_observation"]["uia_observation_id"], "uia-2")
         observe.assert_called_once_with(101, max_elements=80)
+
+    def test_uia_invoke_applies_application_specific_postcondition(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        with patch.object(runtime.uia, "is_blocking_observation", return_value=False), \
+             patch.object(runtime.uia, "invoke", return_value={
+                 "ok": True, "verified": False,
+                 "before_observation_fingerprint": "before",
+             }), \
+             patch.object(runtime.uia, "observe_active_window", return_value={
+                 "ok": True, "uia_observation_id": "uia-2", "controls": [],
+                 "observation_fingerprint": "after",
+             }), \
+             patch.object(runtime.desktop_registry, "verify_action", return_value={
+                 "passed": True, "kind": "calculator_result_observation",
+             }) as verify:
+            result = runtime._run_local_tool("desktop_uia_invoke", {
+                "control_id": "U1", "window_handle": 101, "uia_observation_id": "uia-1",
+            })
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["verification"]["passed"])
+        self.assertEqual(result["postcondition_kind"], "calculator_result_observation")
+        verify.assert_called_once()
+
+    def test_uia_set_value_does_not_complete_without_exact_postcondition(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        with patch.object(runtime.uia, "is_blocking_observation", return_value=False), \
+             patch.object(runtime.uia, "set_value", return_value={
+                 "ok": True, "verified": True,
+                 "verification": {"passed": True, "kind": "uia_value_readback"},
+             }), \
+             patch.object(runtime.uia, "observe_active_window", return_value={
+                 "ok": True, "uia_observation_id": "uia-2", "controls": [],
+             }), \
+             patch.object(runtime.desktop_registry, "verify_action", return_value={
+                 "passed": False, "kind": "uia_value_readback",
+             }):
+            result = runtime._run_local_tool("desktop_uia_set_value", {
+                "control_id": "U1", "window_handle": 101,
+                "uia_observation_id": "uia-1", "value": "safe",
+            })
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertFalse(result["verification"]["passed"])
+        self.assertEqual(result["postcondition_kind"], "uia_value_readback")
+
+    def test_notepad_uia_value_pattern_failure_uses_one_time_keyboard_fallback(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.desktop.target_window = 101
+        runtime.desktop.require_coordinate_token = True
+        with patch.object(runtime.uia, "is_blocking_observation", return_value=False), \
+             patch("agent_runtime.window_process_name", return_value="notepad.exe"), \
+             patch.object(runtime.uia, "set_value", return_value={
+                 "ok": False,
+                 "failure_kind": "desktop_uia_value_pattern_unavailable",
+                 "error": "The selected control does not support setting a value.",
+             }), \
+             patch.object(runtime.desktop, "capture_state", return_value={
+                 "ok": True, "snapshot_id": "snap-1",
+             }), \
+             patch.object(runtime.desktop, "issue_coordinate_fallback", return_value={
+                 "ok": True, "fallback_token": "fallback-1",
+             }) as issue_fallback, \
+             patch.object(runtime.desktop, "type_text", return_value={
+                 "ok": True, "characters": 5,
+             }) as type_text, \
+             patch.object(runtime.uia, "control_descriptor", return_value={
+                 "name": "Text", "automation_id": "", "control_type": "Edit",
+             }), \
+             patch.object(runtime.uia, "focus_control", return_value={"ok": True}), \
+             patch.object(runtime.uia, "observe_active_window", return_value={
+                 "ok": True, "uia_observation_id": "uia-2", "controls": [],
+                 "process_name": "notepad.exe",
+             }), \
+             patch.object(runtime.uia, "find_control", return_value="U2"), \
+             patch.object(runtime.uia, "read_value", return_value={
+                 "ok": True, "verified": True, "readback_available": True,
+                 "value": "hello",
+             }), \
+             patch.object(runtime.desktop_registry, "verify_action", return_value={
+                 "passed": True, "kind": "uia_value_readback",
+             }):
+            result = runtime._run_local_tool("desktop_uia_set_value", {
+                "control_id": "U1", "window_handle": 101,
+                "uia_observation_id": "uia-1", "value": "hello",
+            })
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["fallback_backend"], "keyboard")
+        issue_fallback.assert_called_once()
+        type_text.assert_called_once_with("snap-1", "hello", "fallback-1")
+
+    def test_notepad_keyboard_fallback_is_not_replayed_after_an_attempt(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime.desktop.target_window = 101
+        runtime.desktop.require_coordinate_token = True
+        with patch.object(runtime.uia, "is_blocking_observation", return_value=False), \
+             patch("agent_runtime.window_process_name", return_value="notepad.exe"), \
+             patch.object(runtime.uia, "set_value", return_value={
+                 "ok": False,
+                 "failure_kind": "desktop_uia_value_pattern_unavailable",
+                 "error": "The selected control does not support setting a value.",
+             }), \
+             patch.object(runtime.desktop, "capture_state", return_value={
+                 "ok": True, "snapshot_id": "snap-1",
+             }), \
+             patch.object(runtime.desktop, "issue_coordinate_fallback", return_value={
+                 "ok": True, "fallback_token": "fallback-1",
+             }), \
+             patch.object(runtime.desktop, "type_text", return_value={
+                 "ok": False, "error": "Windows accepted only part of the keyboard input.",
+             }), \
+             patch.object(runtime.uia, "control_descriptor", return_value={
+                 "name": "Text", "automation_id": "", "control_type": "Edit",
+             }), \
+             patch.object(runtime.uia, "focus_control", return_value={"ok": True}):
+            first = runtime._run_local_tool("desktop_uia_set_value", {
+                "control_id": "U1", "window_handle": 101,
+                "uia_observation_id": "uia-1", "value": "hello",
+            })
+            second = runtime._run_local_tool("desktop_uia_set_value", {
+                "control_id": "U1", "window_handle": 101,
+                "uia_observation_id": "uia-1", "value": "hello",
+            })
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["failure_kind"], "desktop_keyboard_fallback_failed")
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["failure_kind"], "desktop_keyboard_fallback_exhausted")
+
+    def test_notepad_keyboard_fallback_converts_unexpected_error_to_bounded_failure(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        with patch.object(runtime.uia, "is_blocking_observation", return_value=False), \
+             patch.object(runtime.uia, "set_value", return_value={
+                 "ok": False, "failure_kind": "desktop_uia_value_pattern_unavailable",
+             }), \
+             patch.object(runtime, "_try_notepad_keyboard_fallback",
+                          side_effect=RuntimeError("not for telemetry")):
+            result = runtime._run_local_tool("desktop_uia_set_value", {
+                "control_id": "U1", "window_handle": 101,
+                "uia_observation_id": "uia-1", "value": "hello",
+            })
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "desktop_keyboard_fallback_error")
+        self.assertEqual(result["error_type"], "RuntimeError")
 
     def test_uia_action_is_not_success_when_post_action_observation_fails(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
@@ -534,12 +743,16 @@ class ReadOnlyToolsTests(unittest.TestCase):
             {"output": [{"type": "function_call", "call_id": "call-1", "name": name,
                          "arguments": '{"command":["create","report.docx"]}'}]},
             {"output_text": "created", "output": []},
+            {"output_text": "created", "output": []},
         ])
         events = runtime.ui
         with patch("agent_runtime.get_api_key", return_value="test-key"), \
              patch("agent_runtime.OFFICECLI_AUTO_APPROVE", True, create=True), \
-             patch.object(runtime, "_run_local_tool", return_value={"ok": True}) as run_local:
-            runtime.run_turn("create report.docx", [])
+             patch.object(runtime, "_run_local_tool", return_value={
+                 "ok": True, "verified": True,
+                 "verification": {"passed": True, "kind": "desktop_state_delta"},
+             }) as run_local:
+            runtime.run_turn("use OfficeCLI to inspect the report workflow", [])
         event_list = []
         while not events.empty():
             event_list.append(events.get_nowait())
@@ -606,11 +819,17 @@ class ReadOnlyToolsTests(unittest.TestCase):
             {"output": [{"type": "function_call", "call_id": "call-2",
                          "name": "desktop_hotkey",
                          "arguments": '{"snapshot_id":"NEXT","keys":["ctrl","l"],"risk_level":"normal","risk_reason":"ordinary navigation"}'}]},
+            {"output": [{"type": "function_call", "call_id": "call-3",
+                         "name": "desktop_verify_state",
+                         "arguments": '{"snapshot_id":"NEXT"}'}]},
             {"output_text": "TASK_DONE", "output": []},
         ])
         runtime._request = lambda payload, key: next(responses)
         with patch("agent_runtime.get_api_key", return_value="test-key"), \
-             patch.object(runtime, "_run_local_tool", return_value={"ok": True}), \
+             patch.object(runtime, "_run_local_tool", return_value={
+                 "ok": True, "verified": True,
+                 "verification": {"passed": True, "kind": "desktop_state_delta"},
+             }), \
              patch.object(runtime, "_append_desktop_observation", side_effect=lambda transcript, name: transcript):
             runtime.run_turn("打开 Edge 并聚焦地址栏", [])
             first_events = []
@@ -740,14 +959,24 @@ class ReadOnlyToolsTests(unittest.TestCase):
             def schemas(self):
                 return []
 
+            def __init__(self):
+                self.calls = 0
+
             def call(self, name, arguments):
-                return {"ok": True, "content": [{"type": "text", "text": "快速验证身份：我是人类"}]}
+                self.calls += 1
+                if self.calls == 1:
+                    return {"ok": True, "content": [{"type": "text", "text": "快速验证身份：我是人类"}]}
+                return {"ok": True, "verified": True,
+                        "verification": {"passed": True, "kind": "browser_structured_verification"},
+                        "content": [{"type": "text", "text": "结果页面"}]}
 
         events = Queue()
         runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
         runtime.mcp = FakeMcp()
         responses = iter([
             {"output": [{"type": "function_call", "call_id": "call-captcha",
+                         "name": "mcp_playwright_browser_snapshot", "arguments": "{}"}]},
+            {"output": [{"type": "function_call", "call_id": "call-captcha-verify",
                          "name": "mcp_playwright_browser_snapshot", "arguments": "{}"}]},
             {"output_text": "Found a T-shirt priced ¥129.", "output": []},
         ])

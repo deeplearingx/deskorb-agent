@@ -115,3 +115,41 @@ class DesktopApplicationRegistry:
             if len(recommendations) >= 24:
                 break
         return recommendations
+
+    def verify_action(self, process_name: str | None, action: str,
+                      result: dict[str, object] | None,
+                      after: dict[str, object] | None = None,
+                      *, requested_value: str | None = None) -> dict[str, object]:
+        """Evaluate an app-specific postcondition from bounded UIA evidence."""
+        profile = self.match(process_name)
+        payload = result if isinstance(result, dict) else {}
+        following = after if isinstance(after, dict) else {}
+        verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+        after_verification = following.get("verification") if isinstance(following.get("verification"), dict) else {}
+        if profile.app_id == "notepad" and action == "set_value":
+            passed = bool(payload.get("verified") and verification.get("passed")
+                          and verification.get("kind") == "uia_value_readback")
+            return {"passed": passed, "kind": "uia_value_readback"}
+        if profile.app_id == "calculator" and action == "invoke":
+            before = str(payload.get("before_observation_fingerprint") or "")
+            current = str(following.get("observation_fingerprint") or "")
+            has_result = any(
+                isinstance(control, dict)
+                and str(control.get("control_type") or "").casefold() in {"text", "edit"}
+                and bool(str(control.get("name") or "").strip())
+                for control in following.get("controls") or ()
+            )
+            return {"passed": bool(has_result and current and current != before),
+                    "kind": "calculator_result_observation"}
+        if profile.app_id == "qq" and action == "invoke":
+            passed = bool(after_verification.get("passed")
+                          and after_verification.get("kind") == "message_delivery")
+            return {"passed": passed, "kind": "message_delivery"}
+        if profile.app_id == "file_explorer" and action == "invoke":
+            passed = bool(payload.get("verified") and verification.get("passed"))
+            return {"passed": passed, "kind": "uia_control_state"}
+        if action == "set_value" and requested_value is not None:
+            return {"passed": bool(payload.get("verified") and verification.get("passed")),
+                    "kind": "uia_value_readback"}
+        return {"passed": bool(payload.get("verified") and verification.get("passed")),
+                "kind": "uia_control_state"}

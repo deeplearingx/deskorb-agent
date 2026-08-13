@@ -50,7 +50,7 @@ _FORBIDDEN_TEMPLATE_KEYS = frozenset({
 })
 _SAFE_TEMPLATE_LITERALS = {
     "action": {"navigate", "snapshot", "fill_ref", "wait_for_options", "click_ref", "extract", "verify"},
-    "role": {"combobox", "option", "listbox", "article", "section", "region", "main", "group",
+    "role": {"combobox", "option", "listbox", "article", "section", "region", "main", "group", "generic",
              "textbox", "searchbox", "heading", "paragraph", "link"},
     "postconditions": {"options_observed", "structured_evidence_verified"},
     "fields": {"title", "source", "price", "url"},

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>DeskOrb SPA fixture</title></head>
+<body>
+  <main>
+    <h1>同源 SPA 结果夹具</h1>
+    <button id="load" type="button">加载结果</button>
+    <section id="result" aria-live="polite"><p>尚未加载结果</p></section>
+  </main>
+  <script>
+    document.querySelector('#load').addEventListener('click', () => {
+      const result = document.querySelector('#result');
+      result.replaceChildren();
+      const title = document.createElement('h2');
+      title.textContent = '同源 SPA 学习结果';
+      const source = document.createElement('p');
+      source.textContent = '来源：官方文档';
+      result.append(title, source);
+      history.replaceState({}, '', location.pathname);
+    });
+  </script>
+</body>
+</html>

@@ -13,10 +13,14 @@ from typing import Any
 
 ALLOWED_ACTIONS = frozenset({
     "navigate", "snapshot", "click_ref", "fill_ref", "select_ref", "wait",
-    "switch_tab", "extract", "verify",
+    "switch_tab", "press_key", "extract", "verify",
 })
 STATE_CHANGING_ACTIONS = frozenset({
-    "navigate", "click_ref", "fill_ref", "select_ref", "wait", "switch_tab",
+    "navigate", "click_ref", "fill_ref", "select_ref", "wait", "switch_tab", "press_key",
+})
+SAFE_PRESS_KEYS = frozenset({
+    "Enter", "Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+    "PageUp", "PageDown",
 })
 MAX_ACTIONS = 8
 _MAX_REF_CHARS = 80
@@ -69,6 +73,10 @@ def _normalize_arguments(action: str, arguments: dict[str, Any]) -> dict[str, An
             normalized["ms"] = normalized["duration_ms"]
         if "ms" not in normalized and "milliseconds" in normalized:
             normalized["ms"] = normalized["milliseconds"]
+    if action == "press_key" and isinstance(normalized.get("key"), str):
+        key = normalized["key"].strip().lower()
+        normalized["key"] = next((allowed for allowed in SAFE_PRESS_KEYS
+                                   if allowed.lower() == key), normalized["key"].strip())
     if action == "extract" and "fields" not in normalized:
         raw_fields = normalized.get("selectors")
         if not isinstance(raw_fields, list):
@@ -94,6 +102,8 @@ def _normalize_arguments(action: str, arguments: dict[str, Any]) -> dict[str, An
         if "required_fields" not in normalized and isinstance(normalized.get("fields"), list):
             normalized["required_fields"] = _normalize_field_names(normalized["fields"])
         normalized.setdefault("required_fields", [])
+        if "postcondition" in normalized:
+            normalized["postcondition"] = str(normalized["postcondition"]).strip().lower()
     return normalized
 
 
@@ -125,14 +135,18 @@ def validate_browser_action_batch(value: Any) -> tuple[list[BrowserAction], str 
             index = arguments.get("index")
             if isinstance(index, bool) or not isinstance(index, int) or index < 0:
                 return [], "switch_tab requires a non-negative tab index."
-        if action in {"click_ref", "fill_ref", "select_ref", "extract", "switch_tab"}:
+        if action in {"click_ref", "fill_ref", "select_ref", "press_key", "extract", "switch_tab"}:
             ref = str(arguments.get("ref") or "").strip()
-            if action in {"click_ref", "fill_ref", "select_ref", "extract"} and not ref:
+            if action in {"click_ref", "fill_ref", "select_ref", "press_key", "extract"} and not ref:
                 return [], f"{action} requires a structured page reference."
             if ref and (len(ref) > _MAX_REF_CHARS or any(character.isspace() for character in ref)):
                 return [], f"{action} requires a bounded structured page reference."
             if not str(arguments.get("observation_id") or "").strip():
                 return [], f"{action} requires the current observation_id."
+        if action == "press_key":
+            key = arguments.get("key")
+            if not isinstance(key, str) or key not in SAFE_PRESS_KEYS:
+                return [], "press_key key must be one of the allowed navigation keys."
         if action == "fill_ref":
             value = arguments.get("value", arguments.get("text"))
             if not isinstance(value, str):

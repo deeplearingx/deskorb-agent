@@ -45,6 +45,44 @@ class DesktopApplicationAdapterTests(unittest.TestCase):
                      "enabled": True, "actions": ["set_value"]}]
         self.assertEqual(self.registry.recommended_actions("msedge.exe", controls), [])
 
+    def test_notepad_set_value_requires_exact_uia_readback(self):
+        result = self.registry.verify_action(
+            "notepad.exe", "set_value",
+            {"verified": True, "verification": {"passed": True, "kind": "uia_value_readback"}},
+            requested_value="DeskOrb E2E",
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["kind"], "uia_value_readback")
+
+    def test_calculator_invoke_requires_a_new_result_observation(self):
+        result = self.registry.verify_action(
+            "calculatorapp.exe", "invoke",
+            {"verified": False, "before_observation_fingerprint": "before"},
+            {"observation_fingerprint": "after", "controls": [
+                {"control_type": "Text", "name": "42", "enabled": True},
+            ]},
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["kind"], "calculator_result_observation")
+
+    def test_explorer_invoke_uses_control_state_evidence(self):
+        result = self.registry.verify_action(
+            "explorer.exe", "invoke",
+            {"verified": True, "verification": {"passed": True}},
+            {"observation_fingerprint": "same"},
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["kind"], "uia_control_state")
+
+    def test_qq_send_requires_independent_delivery_evidence(self):
+        result = self.registry.verify_action(
+            "qqnt.exe", "invoke",
+            {"verified": False},
+            {"verification": {"passed": True, "kind": "message_delivery"}},
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["kind"], "message_delivery")
+
 
 if __name__ == "__main__":
     unittest.main()

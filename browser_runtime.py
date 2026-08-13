@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import time
 from urllib.parse import urlsplit
 from typing import Any, Callable, Protocol
@@ -38,6 +39,7 @@ class PlaywrightMCPBackend:
         "click_ref": "mcp_playwright_browser_click",
         "fill_ref": "mcp_playwright_browser_type",
         "select_ref": "mcp_playwright_browser_select_option",
+        "press_key": "mcp_playwright_browser_press_key",
         "wait": "mcp_playwright_browser_wait_for",
         "switch_tab": "mcp_playwright_browser_tabs",
         "extract": "mcp_playwright_browser_snapshot",
@@ -93,6 +95,9 @@ class PlaywrightMCPBackend:
         if action == "select_ref":
             return {"target": str(args.get("ref") or ""),
                     "values": [str(value) for value in args.get("values") or []]}
+        if action == "press_key":
+            return {"target": str(args.get("ref") or ""),
+                    "key": str(args.get("key") or "")}
         if action == "wait":
             payload = {}
             if args.get("text") is not None:
@@ -127,6 +132,9 @@ class BrowserExecutionSession:
         self.reset()
 
     def reset(self) -> None:
+        self._browser_session_id = f"bs-{secrets.token_hex(8)}"
+        self._tab_generation = 1
+        self._tab_id = "tab-1"
         self._observation_counter = 0
         self._observation_id = ""
         self._state_fingerprint = ""
@@ -142,11 +150,13 @@ class BrowserExecutionSession:
         self._extractions: list[dict[str, Any]] = []
         self._last_extract_signature: str | None = None
         self._last_extract_observation_id = ""
+        self._extract_parent_rebind_attempted = False
         self._last_verify_signature: str | None = None
         self._last_verify_observation_id = ""
         self._evidence_failure_count = 0
         self._trusted_extractor = TrustedBrowserRefExtractor()
         self._interaction_stage = "unknown"
+        self._stage_transition_count = 0
         self._last_fill_value = ""
         self._action_log: list[dict[str, Any]] = []
         self._learned_locators: dict[str, LocatorDescriptor] = {}
@@ -159,6 +169,43 @@ class BrowserExecutionSession:
         return self._observation_id
 
     @property
+    def browser_session_id(self) -> str:
+        return self._browser_session_id
+
+    @property
+    def tab_id(self) -> str:
+        return self._tab_id
+
+    @property
+    def stage_transition_count(self) -> int:
+        return self._stage_transition_count
+
+    @property
+    def next_allowed_actions(self) -> list[str]:
+        if self._cache_verified:
+            return []
+        all_actions = [
+            "navigate", "snapshot", "fill_ref", "click_ref", "select_ref",
+            "press_key", "wait", "switch_tab", "extract", "verify",
+        ]
+        if self._handoff_required or self._reobservation_required:
+            return ["snapshot"]
+        if self._interaction_stage == "evidence_ready":
+            return ["verify"]
+        if self._interaction_stage == "result_ready":
+            # A click may have opened a new target=_blank tab while the
+            # current tab still exposes its old page.  Keep tab switching
+            # available until evidence is verified; the action remains bound
+            # to the current observation and is still followed by a snapshot.
+            return ["snapshot", "switch_tab", "extract"]
+        if self._interaction_stage in {"waiting_for_options", "ready_to_choose"}:
+            blocked = {"fill_ref", "navigate"}
+            if self._interaction_stage == "ready_to_choose":
+                blocked.add("wait")
+            return [item for item in all_actions if item not in blocked]
+        return all_actions
+
+    @property
     def action_steps(self) -> int:
         return self._action_steps
 
@@ -168,6 +215,23 @@ class BrowserExecutionSession:
                                  "Manual browser handoff must be completed before continuing.",
                                  handoff_required=True,
                                  handoff_timeout_seconds=self.handoff_timeout_seconds)
+        # A tab switch is still bound to the current observation, but the
+        # runtime may fill that opaque binding when a model omits it.  This
+        # keeps the contract fail-closed without making a harmless tab action
+        # loop on a schema omission.
+        if isinstance(value, list) and self._observation_id:
+            prepared: list[Any] = []
+            for item in value:
+                if (isinstance(item, dict) and str(item.get("action") or "").strip().lower() == "switch_tab"
+                        and isinstance(item.get("arguments"), dict)
+                        and not str(item["arguments"].get("observation_id") or "").strip()):
+                    prepared.append({
+                        **item,
+                        "arguments": {**item["arguments"], "observation_id": self._observation_id},
+                    })
+                else:
+                    prepared.append(item)
+            value = prepared
         actions, error = validate_browser_action_batch(value)
         if error:
             return self._failure("invalid_browser_action_batch", error,
@@ -184,6 +248,27 @@ class BrowserExecutionSession:
                 return self._failure("browser_action_budget_exceeded",
                                      "The browser action budget has been exhausted.",
                                      observations=observations)
+            if not self._stage_allows_action(action.action):
+                final = self._failure(
+                    "browser_action_not_allowed_for_stage",
+                    "The requested browser action is not allowed in the current interaction stage. "
+                    "Follow next_allowed_actions from the latest semantic result.",
+                    requested_action=action.action,
+                )
+                self._action_steps += 1
+                self._action_log.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                })
+                observations.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                    "failure_kind": final.get("failure_kind"),
+                    "observation_id": self._observation_id,
+                })
+                break
             if action.action == "snapshot":
                 final = self._observe(action.arguments)
             elif action.action == "extract":
@@ -221,6 +306,10 @@ class BrowserExecutionSession:
         result["action_steps"] = self._action_steps
         result["observation_id"] = self._observation_id
         result["interaction_stage"] = self._interaction_stage
+        result["browser_session_id"] = self._browser_session_id
+        result["tab_id"] = self._tab_id
+        result["next_allowed_actions"] = self.next_allowed_actions
+        result["stage_transition_count"] = self._stage_transition_count
         return result
 
     def _observe(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -241,12 +330,17 @@ class BrowserExecutionSession:
         if not result.get("ok"):
             return self._backend_failure(result)
         content = result.get("content", result)
+        previous_stage = self._interaction_stage
         self._observation_counter += 1
         self._observation_id = f"obs-{self._observation_counter}"
         self._state_fingerprint = self._fingerprint(content)
         self._last_snapshot = content
-        if self._interaction_stage == "waiting_for_options" and self._has_options(content):
-            self._interaction_stage = "ready_to_choose"
+        if previous_stage == "evidence_ready":
+            self._set_interaction_stage(
+                "result_ready" if self._has_extractable_result(content) else "unknown"
+            )
+        elif previous_stage == "waiting_for_options" and self._has_options(content):
+            self._set_interaction_stage("ready_to_choose")
         self._reobservation_required = False
         # A new observation invalidates all ref-bound evidence and any
         # observation-only retry signature.  State actions already do this
@@ -255,11 +349,32 @@ class BrowserExecutionSession:
         self._cache_verified = False
         self._last_extract_signature = None
         self._last_extract_observation_id = ""
+        self._extract_parent_rebind_attempted = False
         self._last_verify_signature = None
         self._last_verify_observation_id = ""
         self._trusted_extractor.observe({"observation_id": self._observation_id})
         return {**result, "ok": True, "observation_id": self._observation_id,
                 "state_changed": True, "content_trust": "untrusted_page_data"}
+
+    def _stage_allows_action(self, action: str) -> bool:
+        """Keep model-facing stages strict while preserving typed recovery errors."""
+        if self._reobservation_required:
+            # Let the action handler return the more specific stale/reobserve
+            # failure instead of masking it with a generic stage error.
+            return True
+        if self._cache_verified:
+            return action in {"snapshot", "extract", "verify"}
+        if self._interaction_stage == "ready_to_choose":
+            # fill_ref is intentionally absent from next_allowed_actions, but
+            # reaches its dedicated input-stage lock for clearer diagnostics.
+            return action not in {"navigate", "wait"}
+        if self._interaction_stage == "evidence_ready":
+            return action in {"snapshot", "extract", "verify"}
+        if self._interaction_stage == "result_ready":
+            # verify without a fresh extract must still reach _verify so stale
+            # evidence is reported as such; the schema recommends extract.
+            return action in {"snapshot", "switch_tab", "extract", "verify"}
+        return True
 
     def _state_action(self, action: BrowserAction, initial_observation: str) -> dict[str, Any]:
         if self._handoff_required:
@@ -280,7 +395,7 @@ class BrowserExecutionSession:
         # bound to the current generation; this is what prevents a model from
         # reusing a ref after a re-render or tab switch.
         observation_required = action.action != "navigate"
-        ref_bound = action.action in {"click_ref", "fill_ref", "select_ref"}
+        ref_bound = action.action in {"click_ref", "fill_ref", "select_ref", "press_key"}
         if observation_required and (not self._observation_id or supplied != self._observation_id):
             # When a batch starts with snapshot, allow the action to use the
             # pre-batch generation; the snapshot is the fresh observation it
@@ -322,7 +437,7 @@ class BrowserExecutionSession:
         # Risk is checked before ref binding so an obviously sensitive target
         # (for example login-password) is blocked even when the page has
         # already re-rendered that ref away.
-        if action.action in {"click_ref", "fill_ref", "select_ref"} and self._is_high_risk_action(action):
+        if action.action in {"click_ref", "fill_ref", "select_ref", "press_key"} and self._is_high_risk_action(action):
             return self._failure("browser_high_risk_confirmation_required",
                                  "This browser action is outside the bounded read-only contract.")
 
@@ -335,7 +450,7 @@ class BrowserExecutionSession:
         # Rebinding changes the semantic target. Recompute the signature and
         # risk from the new observed control before duplicate-action checks.
         signature = self._action_signature(action)
-        if action.action in {"click_ref", "fill_ref", "select_ref"} and self._is_high_risk_action(action):
+        if action.action in {"click_ref", "fill_ref", "select_ref", "press_key"} and self._is_high_risk_action(action):
             return self._failure("browser_high_risk_confirmation_required",
                                  "This browser action is outside the bounded read-only contract.")
         if self._last_state_action_signature == signature:
@@ -390,6 +505,9 @@ class BrowserExecutionSession:
             })
         if not result.get("ok"):
             return self._backend_failure(result)
+        if action.action == "switch_tab":
+            self._tab_generation += 1
+            self._tab_id = f"tab-{self._tab_generation}"
         after = self._observe({})
         if not after.get("ok"):
             return {**after, "requires_reobservation": True}
@@ -400,10 +518,10 @@ class BrowserExecutionSession:
         # is bounded and is not counted as another model semantic action.
         if autocomplete_input:
             self._last_fill_value = str(action.arguments.get("value", action.arguments.get("text", "")))
-            self._interaction_stage = "waiting_for_options"
+            self._set_interaction_stage("waiting_for_options")
             for _ in range(8):
                 if self._has_options(after.get("content")):
-                    self._interaction_stage = "ready_to_choose"
+                    self._set_interaction_stage("ready_to_choose")
                     break
                 try:
                     waited = self.backend.call("wait", {"seconds": 0.15})
@@ -416,7 +534,7 @@ class BrowserExecutionSession:
                     break
                 after = refreshed
                 if self._has_options(after.get("content")):
-                    self._interaction_stage = "ready_to_choose"
+                    self._set_interaction_stage("ready_to_choose")
                     break
         changed = bool(after.get("observation_id") and self._state_fingerprint != before)
         if changed:
@@ -427,6 +545,8 @@ class BrowserExecutionSession:
             self._reobservation_required = False
             self._extractions.clear()
             self._evidence_failure_count = 0
+            if action.action == "click_ref" and self._has_extractable_result(after.get("content")):
+                self._set_interaction_stage("result_ready")
             return {**result, "ok": True, "state_changed": True,
                     "observation_id": self._observation_id,
                     "content": after.get("content"), "content_trust": "untrusted_page_data",
@@ -452,7 +572,7 @@ class BrowserExecutionSession:
 
     def _bind_current_ref(self, action: BrowserAction, signature: str) -> tuple[BrowserAction, bool, str | None]:
         """Validate a ref against the latest snapshot and rebind it once if learned."""
-        if action.action not in {"click_ref", "fill_ref", "select_ref", "extract"}:
+        if action.action not in {"click_ref", "fill_ref", "select_ref", "press_key", "extract"}:
             return action, False, None
         ref = str(action.arguments.get("ref") or "")
         candidates = parse_snapshot_candidates(self._last_snapshot)
@@ -477,6 +597,11 @@ class BrowserExecutionSession:
     @staticmethod
     def _has_options(content: Any) -> bool:
         return any(candidate.role in {"option", "listbox"}
+                   for candidate in parse_snapshot_candidates(content))
+
+    @staticmethod
+    def _has_extractable_result(content: Any) -> bool:
+        return any(candidate.role in {"article", "region", "main", "section", "group", "generic"}
                    for candidate in parse_snapshot_candidates(content))
 
     def _is_autocomplete_input(self, action: BrowserAction) -> bool:
@@ -535,7 +660,73 @@ class BrowserExecutionSession:
                 "The requested page ref could not be extracted. Obtain a fresh observation and relocate once.",
             )
         fields = arguments.get("fields") or []
-        parsed = parse_ref_snapshot(result.get("content", result), ref, fields)
+        parsed, extraction, verification = self._attest_extraction(
+            result.get("content", result), ref, fields,
+        )
+        if not verification["passed"] and not self._extract_parent_rebind_attempted:
+            parent_ref = self._semantic_parent_ref(ref)
+            if parent_ref and parent_ref != ref:
+                self._extract_parent_rebind_attempted = True
+                rebound_arguments = {
+                    "ref": parent_ref,
+                    "fields": list(fields),
+                    "observation_id": self._observation_id,
+                }
+                try:
+                    rebound_result = self.backend.call("extract", rebound_arguments)
+                except Exception:
+                    rebound_result = {"ok": False}
+                if isinstance(rebound_result, dict) and rebound_result.get("ok"):
+                    rebound_parsed, rebound_extraction, rebound_verification = self._attest_extraction(
+                        rebound_result.get("content", rebound_result), parent_ref, fields,
+                    )
+                    if rebound_verification["passed"]:
+                        self._remember_locator(BrowserAction("extract", rebound_arguments))
+                        self._evidence_failure_count = 0
+                        self._set_interaction_stage("evidence_ready")
+                        self._extractions.append(rebound_extraction)
+                        return {
+                            **rebound_result,
+                            "ok": True,
+                            "extraction": rebound_extraction,
+                            "verification": rebound_verification,
+                            "observation_id": self._observation_id,
+                            "content_trust": "untrusted_page_data",
+                            "state_changed": False,
+                            "locator_rebound": True,
+                        }
+        native = {
+            "source": "deskorb_ref_subtree",
+            "ref": ref,
+            "fields": extraction.get("fields") if isinstance(extraction, dict) else {},
+            "matched_fields": extraction.get("matched_fields") if isinstance(extraction, dict) else 0,
+            "observed_chars": extraction.get("observed_chars") if isinstance(extraction, dict) else 0,
+            "trusted_ref": bool(isinstance(extraction, dict) and extraction.get("trusted_ref")),
+            "observation_id": self._observation_id,
+        }
+        if not verification["passed"]:
+            return self._evidence_failure(
+                "browser_evidence_insufficient",
+                "The selected page ref did not provide all requested structured fields. "
+                "Obtain a fresh observation and relocate once; do not repeat the same ref.",
+                extraction=extraction,
+                verification=verification,
+                observation_id=self._observation_id,
+                state_changed=False,
+            )
+        extraction["observation_id"] = self._observation_id
+        self._evidence_failure_count = 0
+        self._set_interaction_stage("evidence_ready")
+        self._extractions.append(extraction)
+        return {**result, "ok": True, "extraction": extraction,
+                "verification": verification, "observation_id": self._observation_id,
+                "content_trust": "untrusted_page_data",
+                "state_changed": False}
+
+    def _attest_extraction(self, content: Any, ref: str,
+                           fields: list[Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Parse and attest one ref subtree without widening page-data trust."""
+        parsed = parse_ref_snapshot(content, ref, fields)
         native = {
             "source": "deskorb_ref_subtree",
             "ref": ref,
@@ -556,25 +747,26 @@ class BrowserExecutionSession:
                             extraction.get("matched_fields") == len(fields)),
             "kind": "browser_structured_verification",
             "matched_fields": int(extraction.get("matched_fields") or 0),
-                            "required_fields": len(fields),
+            "required_fields": len(fields),
         }
-        if not verification["passed"]:
-            return self._evidence_failure(
-                "browser_evidence_insufficient",
-                "The selected page ref did not provide all requested structured fields. "
-                "Obtain a fresh observation and relocate once; do not repeat the same ref.",
-                extraction=extraction,
-                verification=verification,
-                observation_id=self._observation_id,
-                state_changed=False,
-            )
-        extraction["observation_id"] = self._observation_id
-        self._evidence_failure_count = 0
-        self._extractions.append(extraction)
-        return {**result, "ok": True, "extraction": extraction,
-                "verification": verification, "observation_id": self._observation_id,
-                "content_trust": "untrusted_page_data",
-                "state_changed": False}
+        return parsed, extraction, verification
+
+    def _semantic_parent_ref(self, ref: str) -> str | None:
+        """Return at most one semantic parent ref from the latest observation."""
+        candidates = parse_snapshot_candidates(self._last_snapshot)
+        target_index = next((index for index, candidate in enumerate(candidates)
+                             if candidate.ref == ref), None)
+        if target_index is None:
+            return None
+        target = candidates[target_index]
+        preferred_roles = list(target.parent_roles[-1:])
+        allowed_roles = {"article", "region", "main", "section", "group", "generic"}
+        if preferred_roles:
+            allowed_roles &= {role.casefold() for role in preferred_roles}
+        for candidate in reversed(candidates[:target_index]):
+            if candidate.ref != ref and candidate.role.casefold() in allowed_roles:
+                return candidate.ref
+        return None
 
     def _verify(self, arguments: dict[str, Any]) -> dict[str, Any]:
         latest = self._extractions[-1] if self._extractions else {}
@@ -628,12 +820,23 @@ class BrowserExecutionSession:
             passed = passed and price is not None and price >= float(arguments["price_min"])
         if arguments.get("price_max") is not None:
             passed = passed and price is not None and price <= float(arguments["price_max"])
-        verification = {"passed": bool(passed), "kind": "browser_structured_verification",
+        postcondition = str(arguments.get("postcondition") or "structured_fields").strip().lower()
+        if postcondition == "tab_changed":
+            passed = passed and self._tab_generation > 1
+        verification_kind = postcondition if postcondition in {
+            "structured_fields", "element_present", "element_absent", "selection",
+            "result_count", "tab_changed", "origin",
+        } else "browser_structured_verification"
+        verification = {"passed": bool(passed), "kind": verification_kind,
                         "matched_fields": sum(bool(value) for value in fields.values()),
                         "required_fields": len(required)}
         self._cache_verified = bool(passed)
+        if passed:
+            self._set_interaction_stage("verified")
         return {"ok": True, "verified": bool(passed), "verification": verification,
+                "postcondition_kind": verification_kind,
                 "postcondition_passed": bool(passed),
+                "extraction": dict(latest),
                 "observation_id": self._observation_id, "state_changed": False}
 
     def _evidence_failure(self, failure_kind: str, error: str, **extra: Any) -> dict[str, Any]:
@@ -660,6 +863,7 @@ class BrowserExecutionSession:
         self._extractions.clear()
         self._last_extract_signature = None
         self._last_extract_observation_id = ""
+        self._extract_parent_rebind_attempted = False
         self._last_verify_signature = None
         self._last_verify_observation_id = ""
         self._evidence_failure_count = 0
@@ -675,7 +879,12 @@ class BrowserExecutionSession:
                 "error": "Browser interaction made no progress; manual handoff is required.",
                 "handoff_required": True,
                 "handoff_timeout_seconds": self.handoff_timeout_seconds,
-                "observation_id": ""}
+                "observation_id": "",
+                "browser_session_id": self._browser_session_id,
+                "tab_id": self._tab_id,
+                "interaction_stage": self._interaction_stage,
+                "next_allowed_actions": self.next_allowed_actions,
+                "stage_transition_count": self._stage_transition_count}
 
     def resume_after_handoff(self) -> None:
         self._handoff_required = False
@@ -691,6 +900,7 @@ class BrowserExecutionSession:
         self._extractions.clear()
         self._last_extract_signature = None
         self._last_extract_observation_id = ""
+        self._extract_parent_rebind_attempted = False
         self._last_verify_signature = None
         self._last_verify_observation_id = ""
         self._evidence_failure_count = 0
@@ -705,11 +915,23 @@ class BrowserExecutionSession:
 
     def _failure(self, failure_kind: str, error: str, **extra: Any) -> dict[str, Any]:
         return {"ok": False, "failure_kind": failure_kind, "error": error,
-                "observation_id": self._observation_id, **extra}
+                "observation_id": self._observation_id,
+                "browser_session_id": self._browser_session_id,
+                "tab_id": self._tab_id,
+                "interaction_stage": self._interaction_stage,
+                "next_allowed_actions": self.next_allowed_actions,
+                "stage_transition_count": self._stage_transition_count,
+                **extra}
 
     @property
     def interaction_stage(self) -> str:
         return self._interaction_stage
+
+    def _set_interaction_stage(self, stage: str) -> None:
+        normalized = str(stage or "unknown")[:40]
+        if normalized != self._interaction_stage:
+            self._stage_transition_count += 1
+            self._interaction_stage = normalized
 
     @property
     def cache_verified(self) -> bool:
@@ -724,7 +946,7 @@ class BrowserExecutionSession:
                 continue
             action = str(item.get("action") or "")
             args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            if action not in {"click_ref", "fill_ref", "select_ref"}:
+            if action not in {"click_ref", "fill_ref", "select_ref", "press_key"}:
                 continue
             if bool(args.get("submit")) or bool(args.get("doubleClick")):
                 return True

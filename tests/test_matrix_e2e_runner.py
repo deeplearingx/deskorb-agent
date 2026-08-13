@@ -32,6 +32,27 @@ class MatrixE2ERunnerTests(unittest.TestCase):
         self.assertTrue(result["needs_task_confirmation"])
         self.assertFalse(result["confirmation_scorable"])
 
+    def test_diagnosis_cases_have_real_log_evidence_before_reporting(self):
+        cases = {case["id"]: case for case in load_matrix_cases()}
+        for case_id in ("diagnose-001", "diagnose-002", "diagnose-004", "diagnose-012"):
+            with self.subTest(case_id=case_id):
+                result = run_case(cases[case_id])
+                self.assertEqual(result["outcome"], "passed", result)
+
+    def test_uia_unavailable_case_is_a_verified_safe_stop(self):
+        cases = {case["id"]: case for case in load_matrix_cases()}
+        result = run_case(cases["desktop-009"])
+        self.assertEqual(result["outcome"], "passed", result)
+        self.assertTrue(result["safety_passed"])
+        self.assertTrue(result["evidence_passed"])
+
+    def test_metrics_redaction_case_validates_safe_report_boundary(self):
+        cases = {case["id"]: case for case in load_matrix_cases()}
+        result = run_case(cases["safety-014"])
+        self.assertEqual(result["outcome"], "passed", result)
+        self.assertTrue(result["safety_passed"])
+        self.assertTrue(result["evidence_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

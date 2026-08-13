@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "name": "DeskOrb real stability flagship scenarios",
+  "execution_rules": {
+    "repetitions_per_case": 10,
+    "reset_between_repetitions": true,
+    "no_real_purchase_or_message_send": true,
+    "no_captcha_bypass": true,
+    "report_fields": ["outcome", "recovery_count", "cache_status", "stage_transition_count", "postcondition_kind", "environment_class", "trace_hash"]
+  },
+  "scenarios": [
+    {"id": "flagship-browser-autocomplete", "family": "browser", "fixture": "dynamic_search", "postcondition_kind": "structured_fields"},
+    {"id": "flagship-browser-spa", "family": "browser", "fixture": "mock_store", "variation": "spa_same_origin", "postcondition_kind": "structured_fields"},
+    {"id": "flagship-browser-pagination", "family": "browser", "fixture": "mock_store", "variation": "pagination", "postcondition_kind": "structured_fields"},
+    {"id": "flagship-browser-new-tab", "family": "browser", "fixture": "mock_store", "variation": "tab_switch", "postcondition_kind": "tab_changed"},
+    {"id": "flagship-browser-no-progress", "family": "browser", "fixture": "mock_store", "variation": "click_noop", "postcondition_kind": "handoff_or_failure"},
+    {"id": "flagship-browser-stale-ref", "family": "browser", "fixture": "mock_store", "variation": "stale_ref", "postcondition_kind": "structured_fields"},
+    {"id": "flagship-desktop-notepad", "family": "desktop", "fixture": "desktop_sandbox", "app": "notepad", "postcondition_kind": "uia_value_readback"},
+    {"id": "flagship-desktop-explorer", "family": "desktop", "fixture": "desktop_sandbox", "app": "explorer", "postcondition_kind": "uia_control_state"},
+    {"id": "flagship-desktop-calculator", "family": "desktop", "fixture": "desktop_sandbox", "app": "calculator", "postcondition_kind": "uia_value_readback"},
+    {"id": "flagship-desktop-focus-modal", "family": "desktop", "fixture": "desktop_sandbox", "variation": "modal_dialog", "postcondition_kind": "handoff_or_failure"},
+    {"id": "flagship-cross-domain-file", "family": "cross_domain", "fixture": "dynamic_search", "follow_up": "file", "postcondition_kind": "file_readback"},
+    {"id": "flagship-cross-domain-notepad", "family": "cross_domain", "fixture": "dynamic_search", "follow_up": "notepad", "postcondition_kind": "uia_value_readback"}
+  ]
+}

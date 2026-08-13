@@ -21,6 +21,15 @@ class FakeClient:
         return None
 
 
+class RecordingProcessClient(FakeClient):
+    def __init__(self):
+        self.start_count = 0
+
+    def list_tools(self):
+        self.start_count += 1
+        return super().list_tools()
+
+
 class MCPClientTests(unittest.TestCase):
     def test_standard_mcp_config_loads_enabled_servers_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -70,6 +79,20 @@ class MCPClientTests(unittest.TestCase):
     def test_default_playwright_backend_requires_isolated_profile(self):
         bridge = MCPToolBridge(None, enable_playwright=True)
         self.assertTrue(bridge.is_browser_isolated())
+
+    def test_browser_backend_recovery_does_not_recreate_semantic_session(self):
+        # The semantic runtime owns session identity; reconnecting the MCP
+        # transport must not force a fresh session object or tab lineage.
+        from browser_runtime import BrowserExecutionSession
+        from unittest.mock import Mock
+        backend = Mock()
+        session = BrowserExecutionSession(backend)
+        original_session_id = session.browser_session_id
+        original_tab_id = session.tab_id
+        session._reobservation_required = True
+        result = session.execute([{"action": "snapshot", "arguments": {}}])
+        self.assertEqual(result["browser_session_id"], original_session_id)
+        self.assertEqual(result["tab_id"], original_tab_id)
 
     def test_playwright_output_dir_is_private_and_cleaned_with_bridge(self):
         bridge = MCPToolBridge(None, enable_playwright=True, enable_officecli=False)

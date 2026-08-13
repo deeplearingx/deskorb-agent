@@ -1,0 +1,1 @@
+2026-08-13T09:00:00Z ERROR startup failed: ModuleNotFoundError: No module named 'dotenv'

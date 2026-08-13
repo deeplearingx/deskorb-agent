@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import ctypes.wintypes
 import functools
+import hashlib
 import json
 import os
 import re
@@ -448,6 +449,11 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
     failed_tool: str | None = None
     tool_failure_kind: str | None = None
     failed_exit_code: int | None = None
+    recovery_count = 0
+    stage_transition_count = 0
+    last_stage = ""
+    postcondition_kind = "none"
+    trace_material: list[str] = []
     for kind, value in events:
         if kind == "approval":
             confirmation_count += 1
@@ -500,6 +506,24 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
             if "postcondition_passed" in value:
                 postcondition_seen = True
                 postcondition_passed = postcondition_passed or bool(value.get("postcondition_passed"))
+            if value.get("model_fallback") or str(value.get("failure_kind") or "") in {
+                "browser_reobservation_required", "browser_unknown_ref", "browser_no_progress",
+            }:
+                recovery_count += 1
+            stage = str(value.get("interaction_stage") or "")
+            if stage and stage != last_stage:
+                if last_stage:
+                    stage_transition_count += 1
+                last_stage = stage
+            if value.get("postcondition_kind"):
+                postcondition_kind = str(value.get("postcondition_kind"))
+            trace_material.append("tool_result:" + str(bool(value.get("ok"))))
+        elif kind in {"human_handoff", "human_verification"}:
+            recovery_count += 1
+            trace_material.append("handoff")
+        elif kind == "tool":
+            trace_material.append("tool")
+    trace_hash = hashlib.sha256("|".join(trace_material).encode("utf-8")).hexdigest()
     return {
         "total_latency_ms": round(max(0.0, (finished_at - started_at) * 1000), 2),
         "first_response_ms": first_response_ms,
@@ -520,6 +544,10 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
         "cache_status_counts": cache_status_counts,
         "model_fallback_count": model_fallback_count,
         "postcondition_passed": postcondition_passed if postcondition_seen else None,
+        "recovery_count": recovery_count,
+        "stage_transition_count": stage_transition_count,
+        "postcondition_kind": postcondition_kind,
+        "trace_hash": trace_hash,
     }
 
 
@@ -535,12 +563,17 @@ def preflight_public_network(*, timeout_seconds: int = 5) -> dict[str, Any]:
         return {"ok": False, "status_class": "unreachable"}
 
 
-def preflight_current_desktop() -> dict[str, Any]:
-    """Run the existing bounded Windows interactive-session preflight."""
+def preflight_current_desktop(*, require_foreground: bool = True) -> dict[str, Any]:
+    """Run the bounded Windows interactive-session preflight.
+
+    ``require_foreground=False`` is only for runners that start their own
+    disposable target after the host capability check. The target-specific
+    UIA observation and focus validation still happen before any input.
+    """
     try:
         from desktop_vm_preflight import run
 
-        result = run()
+        result = run(require_foreground=require_foreground)
     except Exception:
         return {"ok": False, "checks": {}}
     checks = result.get("checks") if isinstance(result, dict) else {}
@@ -1150,6 +1183,11 @@ def _finish_record(case: Mapping[str, Any], attempt: int,
         "cache_status_counts": dict(metrics.get("cache_status_counts") or {}),
         "model_fallback_count": int(metrics.get("model_fallback_count") or 0),
         "postcondition_passed": metrics.get("postcondition_passed"),
+        "recovery_count": int(metrics.get("recovery_count") or 0),
+        "stage_transition_count": int(metrics.get("stage_transition_count") or 0),
+        "postcondition_kind": str(metrics.get("postcondition_kind") or "none"),
+        "environment_class": _environment_class(case),
+        "trace_hash": str(metrics.get("trace_hash") or ""),
     })
     return result
 
@@ -1198,6 +1236,11 @@ def _record_base(case: Mapping[str, Any], attempt: int, outcome: str,
         "cache_status_counts": {},
         "model_fallback_count": 0,
         "postcondition_passed": None,
+        "recovery_count": 0,
+        "stage_transition_count": 0,
+        "postcondition_kind": "none",
+        "environment_class": _environment_class(case),
+        "trace_hash": "",
     }
 
 
@@ -1264,6 +1307,16 @@ def _last_json_object(stdout: str) -> dict[str, Any] | None:
 
 def _is_public_case(case: Mapping[str, Any]) -> bool:
     return str(case.get("tier") or "") == "live_acceptance" or str((case.get("setup") or {}).get("network") or "") == "public"
+
+
+def _environment_class(case: Mapping[str, Any]) -> str:
+    if _is_public_case(case):
+        return "public_network"
+    if _is_desktop_case(case):
+        return "current_desktop"
+    if _is_local_browser_case(case):
+        return "local_fixture"
+    return "local_workspace"
 
 
 def _append_contract_guidance(task: str, case: Mapping[str, Any],

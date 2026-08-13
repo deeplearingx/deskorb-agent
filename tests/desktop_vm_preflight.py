@@ -45,12 +45,19 @@ def _windows_checks() -> dict[str, object]:
     return checks
 
 
-def run() -> dict[str, object]:
+def run(*, require_foreground: bool = True) -> dict[str, object]:
     if os.name != "nt":
         return {"ok": False, "error_kind": "unsupported_platform", "checks": {}}
     checks = _windows_checks()
-    boolean_checks = [value for key, value in checks.items()
-                      if key not in {"uia_window_count"}]
+    excluded = {"uia_window_count", "foreground_window", "uia_provider",
+                "interactive_uia_desktop"}
+    boolean_checks = [value for key, value in checks.items() if key not in excluded]
+    if require_foreground:
+        boolean_checks.extend([
+            bool(checks.get("foreground_window")),
+            bool(checks.get("uia_provider")),
+            bool(checks.get("interactive_uia_desktop")),
+        ])
     return {"ok": all(bool(value) for value in boolean_checks), "checks": checks}
 
 

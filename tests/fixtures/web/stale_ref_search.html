@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>DeskOrb stale ref fixture</title></head>
+<body>
+  <main>
+    <button id="render" type="button">重新渲染结果</button>
+    <section id="result"><article><h2>重渲染候选结果</h2><p>来源：官方文档</p></article></section>
+  </main>
+  <script>
+    document.querySelector('#render').addEventListener('click', () => {
+      const result = document.querySelector('#result');
+      result.replaceChildren();
+      const article = document.createElement('article');
+      const title = document.createElement('h2');
+      title.textContent = '重渲染候选结果';
+      const source = document.createElement('p');
+      source.textContent = '来源：官方文档';
+      article.append(title, source);
+      result.append(article);
+    });
+  </script>
+</body>
+</html>

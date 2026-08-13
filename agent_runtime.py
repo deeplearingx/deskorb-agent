@@ -26,6 +26,7 @@ from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQU
 from agent_policy import ApprovalManager, Risk, ToolPolicy
 from desktop_tools import DesktopTools
 from desktop_uia import DesktopUIA
+from desktop_adapters import DesktopApplicationRegistry
 from mcp_client import MCPError, MCPToolBridge
 from model_adapter import ModelAdapter
 from conversation_context import ConversationContext
@@ -34,6 +35,7 @@ from desktop_activity_indicator import ACTIVITY_TOOLS, BROWSER_ACTIVITY_TOOLS, D
 from browser_actions import STATE_CHANGING_ACTIONS
 from browser_cache import BrowserActionCache, parse_browser_task_intent
 from browser_runtime import BrowserExecutionSession, PlaywrightMCPBackend
+from task_plan import TaskPlan
 from responses_tool_protocol import continue_input, function_call_output, function_calls
 from runtime_task_state import RuntimeTaskState
 from task_runtime import InMemoryTaskJournal, classify_failure
@@ -373,6 +375,7 @@ class AgentRuntime:
                  task_journal: Any | None = None,
                  browser_cache: BrowserActionCache | None = None):
         self.ui = ui_queue
+        self.working_dir = Path(working_dir).resolve()
         self.model = model
         self.model_provider = model_provider or MODEL_PROVIDER
         self.adapter = ModelAdapter(self.model_provider, api_base_url)
@@ -385,6 +388,7 @@ class AgentRuntime:
         self.browser_cache = browser_cache if browser_cache is not None else BrowserActionCache.default()
         self.desktop = DesktopTools()
         self.uia = DesktopUIA()
+        self.desktop_registry = DesktopApplicationRegistry()
         try:
             self.mcp = MCPToolBridge(MCP_CONFIG_PATH, enable_playwright=PLAYWRIGHT_MCP_ENABLED,
                                      enable_officecli=OFFICECLI_ENABLED,
@@ -411,10 +415,12 @@ class AgentRuntime:
         self.task_journal = task_journal if task_journal is not None else InMemoryTaskJournal()
         self._task_state: RuntimeTaskState | None = None
         self._desktop_target_launches = 0
+        self._desktop_keyboard_fallback_attempted: set[str] = set()
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
         self._browser_session: BrowserExecutionSession | None = None
         self._browser_stage_verified = False
+        self._task_plan: TaskPlan | None = None
         self._browser_activity_ids: dict[str, int] = {}
         self._next_desktop_activity_id = 0
 
@@ -437,10 +443,12 @@ class AgentRuntime:
         self._task_mcp_servers.clear()
         self._task_state = None
         self._desktop_target_launches = 0
+        self._desktop_keyboard_fallback_attempted.clear()
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
         self._browser_session = None
         self._browser_stage_verified = False
+        self._task_plan = None
         self._browser_activity_ids.clear()
         self.desktop.clear_target_window()
         self.uia.reset()
@@ -457,10 +465,12 @@ class AgentRuntime:
         self._task_mcp_servers.clear()
         self._task_state = None
         self._desktop_target_launches = 0
+        self._desktop_keyboard_fallback_attempted.clear()
         self._browser_recovery_attempts = 0
         self._browser_reobservation_required = False
         self._browser_session = None
         self._browser_stage_verified = False
+        self._task_plan = None
         self._browser_activity_ids.clear()
         self.desktop.clear_target_window()
         self.uia.reset()
@@ -523,6 +533,7 @@ class AgentRuntime:
         self.desktop.clear_target_window()
         self.desktop.require_coordinate_token = False
         self._desktop_target_launches = 0
+        self._desktop_keyboard_fallback_attempted.clear()
 
     def run_ephemeral_turn(self, text: str, image_paths: list[str]):
         """Run one request without reading or updating normal conversation context."""
@@ -585,6 +596,7 @@ class AgentRuntime:
 
     def _ensure_task_state(self, goal: str) -> RuntimeTaskState:
         if self._task_state is None:
+            self._task_plan = TaskPlan.from_goal(goal)
             self._task_state = RuntimeTaskState.start(
                 self.task_journal,
                 goal,
@@ -636,6 +648,10 @@ class AgentRuntime:
                 "execution_source": str(result.get("execution_source") or "model") if isinstance(result, dict) else "model",
                 "cache_status": str(result.get("cache_status") or "miss") if isinstance(result, dict) else "miss",
                 "postcondition_passed": bool(result.get("postcondition_passed")) if isinstance(result, dict) else False,
+                "postcondition_kind": str(result.get("postcondition_kind") or "none") if isinstance(result, dict) else "none",
+                "interaction_stage": str(result.get("interaction_stage") or "") if isinstance(result, dict) else "",
+                "stage_transition_count": int(result.get("stage_transition_count") or 0) if isinstance(result, dict) else 0,
+                "recovery_count": int(result.get("recovery_count") or 0) if isinstance(result, dict) else 0,
                 "model_fallback": bool(result.get("model_fallback")) if isinstance(result, dict) else False,
                 "model_planning_requests": int(result.get("model_planning_requests") or 0) if isinstance(result, dict) else 0,
                 "deterministic_steps": int(result.get("deterministic_steps") or 0) if isinstance(result, dict) else 0,
@@ -838,6 +854,7 @@ class AgentRuntime:
         """Run (or resume) an agent task against its existing tool transcript."""
         if not ephemeral:
             self._ensure_task_state(original_text)
+        incomplete_prose_recovery_attempted = False
         instructions = SYSTEM_APPEND + (
             "\nYou are the independent DeskOrb Agent Runtime. You may inspect the active window and files below the configured working directory. "
             "When Full access is enabled and the user explicitly asks for a local change, filesystem_write may be used and its result is verified by rereading the file. "
@@ -860,6 +877,35 @@ class AgentRuntime:
                 answer = self._extract_text(response)
                 if not answer:
                     raise RuntimeError("Agent response contained neither text nor a function call")
+                task_state = self._task_state
+                contract_verified = bool(
+                    task_state is None
+                    or not task_state.contract.requires_verification
+                    or task_state.contract.verify(list(task_state.workflow.nodes))
+                )
+                if not ephemeral and not contract_verified:
+                    if not incomplete_prose_recovery_attempted:
+                        # A prose response is not allowed to close an action
+                        # task whose evidence contract is still unsatisfied.
+                        # Give the model exactly one bounded continuation with
+                        # the same tool set; do not publish the unverified prose
+                        # as if it were the user's requested result.
+                        incomplete_prose_recovery_attempted = True
+                        transcript = continue_input(transcript, response, [])
+                        transcript.append({"role": "user", "content": [{
+                            "type": "input_text",
+                            "text": (
+                                "The requested action is not complete yet. The latest tool evidence "
+                                "does not satisfy the task contract. Continue with the missing semantic "
+                                "tool action and its independent verification now; do not answer in prose "
+                                "until the contract is satisfied."
+                            ),
+                        }]})
+                        continue
+                    self._task_authorized_until = 0.0
+                    self._finish_task("failed", failure_kind="required_action_missing")
+                    self.ui.put(("system", "Task stopped because the required action or verification was not completed."))
+                    return
                 if not ephemeral:
                     self.context.add_turn(original_text, answer)
                 self._task_authorized_until = 0.0
@@ -928,6 +974,12 @@ class AgentRuntime:
                     self._task_state.record_tool_result(call.name, result)
                     self._publish_tool_result(call.name, arguments, result)
                 outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
+                if (call.name == "browser_action_batch"
+                        and isinstance(result, dict)
+                        and result.get("postcondition_passed") is True
+                        and not self._browser_has_follow_up_stage(original_text)):
+                    self._finish_verified_browser_task(original_text, result, ephemeral=ephemeral)
+                    return
                 browser_handoff = self._browser_handoff_reason(call.name, result)
                 if browser_handoff:
                     if not ephemeral and self._task_state is not None:
@@ -1127,20 +1179,20 @@ class AgentRuntime:
 
     def _available_schemas(self, task_text: str) -> list[dict[str, Any]]:
         schemas = self.tools.schemas()
-        browser_task = self._browser_task_requested(task_text)
-        composite = self._browser_follow_up_kind(task_text)
+        plan = self._task_plan or TaskPlan.from_goal(task_text)
+        browser_task = plan.browser_required
+        composite = plan.follow_up_kind
         if browser_task:
             # Composite tasks expose only the browser contract until its
             # structured postcondition is verified. Page text never changes
             # this gate.
             if composite and self._browser_stage_verified:
-                allowed = {
-                    "file": {"filesystem_list", "filesystem_read_text", "filesystem_search_text", "filesystem_write"},
-                    "desktop": {"application_launch", "desktop_capture_state", "desktop_verify_state",
-                                 "desktop_uia_observe", "desktop_uia_invoke", "desktop_uia_set_value",
-                                 "desktop_request_coordinate_fallback", "desktop_click", "desktop_type",
-                                 "desktop_hotkey", "desktop_scroll"},
-                }.get(composite, set())
+                allowed = set(plan.capabilities_for_stage(True))
+                if composite == "desktop":
+                    allowed.update({
+                        "desktop_capture_state", "desktop_request_coordinate_fallback", "desktop_click",
+                        "desktop_type", "desktop_hotkey", "desktop_scroll",
+                    })
                 schemas = [item for item in schemas if item.get("name") in allowed]
             else:
                 schemas = []
@@ -1152,7 +1204,7 @@ class AgentRuntime:
                 # MCP installation is missing; the dispatcher then returns a
                 # bounded backend-unavailable result instead of allowing
                 # coordinate fallback.
-                schemas.append(self._browser_action_batch_schema())
+                schemas.append(self._browser_action_batch_schema(self._browser_allowed_actions()))
         if self.mcp:
             servers = set(self._mcp_servers_for_task(task_text)) | self._task_mcp_servers
             if "playwright" in servers and not self._browser_stage_verified:
@@ -1161,7 +1213,7 @@ class AgentRuntime:
                 # semantic runtime below is the only browser entry point.
                 self.mcp.schemas(("playwright",))
                 schemas = [item for item in schemas if item.get("name") != "browser_action_batch"]
-                schemas.append(self._browser_action_batch_schema())
+                schemas.append(self._browser_action_batch_schema(self._browser_allowed_actions()))
             other_servers = servers - {"playwright"}
             if other_servers:
                 schemas.extend(self.mcp.schemas(other_servers))
@@ -1172,29 +1224,14 @@ class AgentRuntime:
 
     @staticmethod
     def _browser_follow_up_kind(text: str) -> str:
-        lowered = str(text or "").lower()
-        file_markers = ("保存", "写入文件", "写到文件", "文件", "report.txt", "save", "write to")
-        desktop_markers = ("记事本", "notepad", "输入到桌面", "写入记事本", "calculator", "计算器")
-        if any(marker in lowered for marker in desktop_markers):
-            return "desktop"
-        if any(marker in lowered for marker in file_markers):
-            return "file"
-        return ""
+        return TaskPlan.from_goal(text).follow_up_kind
 
     @classmethod
     def _browser_task_requested(cls, text: str) -> bool:
-        lowered = str(text or "").lower()
-        desktop_markers = ("qq", "资源管理器", "文件管理器", "记事本", "计算器", "explorer", "notepad", "calculator")
-        explicit_web_markers = ("浏览器", "网页", "网站", "淘宝", "京东", "百度", "google", "browser",
-                                "website", "web page", "http://", "https://")
-        if any(marker in lowered for marker in desktop_markers) and not any(marker in lowered for marker in explicit_web_markers):
-            return False
-        return any(marker in lowered for marker in cls.BROWSER_TASK_MARKERS if marker not in {"搜索", "search"}) or (
-            any(marker in lowered for marker in ("搜索", "search")) and not any(marker in lowered for marker in desktop_markers)
-        )
+        return TaskPlan.from_goal(text).browser_required
 
     @staticmethod
-    def _browser_action_batch_schema() -> dict[str, Any]:
+    def _browser_action_batch_schema(allowed_actions: set[str] | frozenset[str] | None = None) -> dict[str, Any]:
         common = {
             "observation_id": {"type": "string", "description": "Latest opaque observation token."},
             "ref": {"type": "string", "description": "Current accessibility ref from that observation."},
@@ -1246,6 +1283,18 @@ class AgentRuntime:
             {
                 "type": "object",
                 "properties": {
+                    "action": {"type": "string", "enum": ["press_key"]},
+                    "arguments": {"type": "object", "properties": {
+                        **common, "key": {"type": "string", "enum": [
+                            "Enter", "Escape", "Tab", "ArrowUp", "ArrowDown",
+                            "ArrowLeft", "ArrowRight", "PageUp", "PageDown",
+                        ]},
+                    }, "required": ["ref", "observation_id", "key"], "additionalProperties": False},
+                }, "required": ["action", "arguments"], "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
                     "action": {"type": "string", "enum": ["wait"]},
                     "arguments": {"type": "object", "properties": {
                         "seconds": {"type": "number", "minimum": 0, "maximum": 30},
@@ -1283,10 +1332,19 @@ class AgentRuntime:
                         "required_fields": {"type": "array", "items": {"type": "string"}},
                         "contains": {"type": ["string", "array"], "items": {"type": "string"}},
                         "expected": {}, "price_min": {"type": "number"}, "price_max": {"type": "number"},
+                        "postcondition": {"type": "string", "enum": [
+                            "structured_fields", "element_present", "element_absent", "selection",
+                            "result_count", "tab_changed", "origin",
+                        ]},
                     }, "required": ["required_fields"], "additionalProperties": True},
                 }, "required": ["action", "arguments"], "additionalProperties": False,
             },
         ]
+        allowed = set(allowed_actions or ())
+        if allowed_actions is not None:
+            action_variants = [variant for variant in action_variants
+                               if str(next(iter(variant.get("properties", {}).get("action", {}).get("enum", [])), ""))
+                                  in allowed]
         return {
             "type": "function",
             "name": "browser_action_batch",
@@ -1315,6 +1373,13 @@ class AgentRuntime:
             },
         }
 
+    def _browser_allowed_actions(self) -> set[str] | None:
+        """Expose only actions admitted by the current semantic browser stage."""
+        session = self._browser_session
+        if session is None:
+            return None
+        return set(session.next_allowed_actions)
+
     def _mcp_servers_for_task(self, text: str) -> tuple[str, ...]:
         """Route a task to its minimum MCP set before any process is spawned."""
         if not self.mcp:
@@ -1326,7 +1391,8 @@ class AgentRuntime:
             "powertoys", "保持唤醒", "不休眠", "置顶", "always on top", "awake", "fancyzones", "键盘管理器",
         )
         available = set(getattr(self.mcp, "available_servers", ()))
-        if "playwright" in available and any(marker in lowered for marker in browser_markers):
+        plan = self._task_plan or TaskPlan.from_goal(text)
+        if "playwright" in available and plan.browser_required:
             selected.append("playwright")
         if "powertoys" in available and any(marker in lowered for marker in powertoys_markers):
             selected.append("powertoys")
@@ -1681,23 +1747,149 @@ class AgentRuntime:
                     return {"ok": False, "failure_kind": str(after.get("failure_kind") or "desktop_reobserve_failed"),
                             "error": str(after.get("error") or "Post-action UI Automation observation failed.")}
                 self.desktop.set_modal_blocked(bool(after.get("requires_user_attention")))
-                result = {**result, "after_observation": after}
+                process_name = str(after.get("process_name") or window_process_name(int(arguments.get("window_handle") or 0)))
+                postcondition = self.desktop_registry.verify_action(
+                    process_name, "invoke", result, after,
+                )
+                result = {**result, "after_observation": after,
+                          "verified": bool(postcondition.get("passed")),
+                          "verification": {**dict(result.get("verification") or {}),
+                                           "passed": bool(postcondition.get("passed")),
+                                           "kind": postcondition.get("kind")},
+                          "postcondition_passed": bool(postcondition.get("passed")),
+                          "postcondition_kind": str(postcondition.get("kind") or "uia_control_state")}
             return result
         if name == "desktop_uia_set_value":
             observation_id = str(arguments.get("uia_observation_id") or "")
             if self.uia.is_blocking_observation(observation_id):
                 return {"ok": False, "failure_kind": "desktop_modal_dialog", "error": "A modal dialog requires user attention before UIA actions can continue."}
-            result = self.uia.set_value(str(arguments.get("control_id") or ""), int(arguments.get("window_handle") or 0),
-                                        str(arguments.get("value") or ""), observation_id)
+            control_id = str(arguments.get("control_id") or "")
+            window_handle = int(arguments.get("window_handle") or 0)
+            value = str(arguments.get("value") or "")
+            result = self.uia.set_value(control_id, window_handle, value, observation_id)
+            if not result.get("ok"):
+                try:
+                    fallback = self._try_notepad_keyboard_fallback(
+                        control_id, window_handle, value, observation_id, result,
+                    )
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "failure_kind": "desktop_keyboard_fallback_error",
+                        "error_type": type(exc).__name__,
+                        "error": "The bounded Notepad keyboard fallback raised an unexpected error.",
+                    }
+                if fallback is not None:
+                    return fallback
             if result.get("ok"):
-                after = self.uia.observe_active_window(int(arguments.get("window_handle") or 0), max_elements=80)
+                after = self.uia.observe_active_window(window_handle, max_elements=80)
                 if not after.get("ok"):
                     return {"ok": False, "failure_kind": str(after.get("failure_kind") or "desktop_reobserve_failed"),
                             "error": str(after.get("error") or "Post-action UI Automation observation failed.")}
                 self.desktop.set_modal_blocked(bool(after.get("requires_user_attention")))
-                result = {**result, "after_observation": after}
+                process_name = str(after.get("process_name") or window_process_name(window_handle))
+                postcondition = self.desktop_registry.verify_action(
+                    process_name, "set_value", result, after,
+                    requested_value=value,
+                )
+                result = {**result, "after_observation": after,
+                          "verified": bool(postcondition.get("passed")),
+                          "verification": {**dict(result.get("verification") or {}),
+                                           "passed": bool(postcondition.get("passed")),
+                                           "kind": postcondition.get("kind")},
+                          "postcondition_passed": bool(postcondition.get("passed")),
+                          "postcondition_kind": str(postcondition.get("kind") or "uia_value_readback")}
             return result
         return self.tools.call(name, arguments)
+
+    def _try_notepad_keyboard_fallback(self, control_id: str, window_handle: int,
+                                       value: str, observation_id: str,
+                                       uia_result: dict[str, Any]) -> dict[str, Any] | None:
+        """Use one bounded keyboard fallback when Notepad lacks ValuePattern."""
+        process_name = Path(str(window_process_name(window_handle) or "")).name.casefold()
+        if process_name not in {"notepad.exe", "notepad"}:
+            return None
+        if str(uia_result.get("failure_kind") or "") != "desktop_uia_value_pattern_unavailable":
+            return None
+        descriptor = self.uia.control_descriptor(control_id, observation_id)
+        if descriptor is None:
+            return {
+                "ok": False, "failure_kind": "desktop_keyboard_fallback_unavailable",
+                "error": "The observed Notepad control identity is no longer available for keyboard fallback.",
+            }
+        fallback_key = "|".join([
+            str(window_handle), process_name,
+            str(descriptor.get("control_type") or ""),
+            str(descriptor.get("automation_id") or ""),
+            str(descriptor.get("name") or ""),
+        ])
+        if fallback_key in self._desktop_keyboard_fallback_attempted:
+            return {
+                "ok": False, "failure_kind": "desktop_keyboard_fallback_exhausted",
+                "error": "The one-time Notepad keyboard fallback was already attempted; observe and recover manually.",
+            }
+        self._desktop_keyboard_fallback_attempted.add(fallback_key)
+        focused = self.uia.focus_control(control_id, window_handle, observation_id)
+        if not focused.get("ok"):
+            return {"ok": False, "failure_kind": "desktop_keyboard_fallback_focus_failed",
+                    "error": str(focused.get("error") or "Notepad edit control could not be focused semantically.")}
+        state = self.desktop.capture_state()
+        if not state.get("ok"):
+            return {"ok": False, "failure_kind": "desktop_keyboard_fallback_snapshot_failed",
+                    "error": str(state.get("error") or "A fresh desktop snapshot was required before keyboard fallback.")}
+        token_result = self.desktop.issue_coordinate_fallback(
+            str(state.get("snapshot_id") or ""), "type",
+            "Notepad UIA ValuePattern unavailable; low-risk exact keyboard fallback",
+        )
+        if not token_result.get("ok"):
+            return {"ok": False, "failure_kind": "desktop_keyboard_fallback_denied",
+                    "error": str(token_result.get("error") or "The bounded keyboard fallback was denied.")}
+        typed = self.desktop.type_text(
+            str(state.get("snapshot_id") or ""), value,
+            str(token_result.get("fallback_token") or ""),
+        )
+        if not typed.get("ok"):
+            return {"ok": False, "failure_kind": "desktop_keyboard_fallback_failed",
+                    "error": str(typed.get("error") or "Windows rejected the bounded keyboard fallback."),
+                    "characters": int(typed.get("characters") or len(value)),
+                    "fallback_backend": "keyboard"}
+        after = self.uia.observe_active_window(window_handle, max_elements=80)
+        if not after.get("ok"):
+            return {"ok": False, "failure_kind": "desktop_keyboard_fallback_reobserve_failed",
+                    "error": str(after.get("error") or "Notepad could not be observed after keyboard fallback."),
+                    "fallback_backend": "keyboard"}
+        after_id = str(after.get("uia_observation_id") or "")
+        rebound_control_id = self.uia.find_control(descriptor, after_id)
+        if not rebound_control_id:
+            return {"ok": False, "failure_kind": "desktop_keyboard_fallback_control_not_found",
+                    "error": "The Notepad edit control could not be rebound after keyboard fallback.",
+                    "fallback_backend": "keyboard"}
+        readback = self.uia.read_value(rebound_control_id, window_handle, after_id)
+        exact = bool(readback.get("ok") and readback.get("readback_available")
+                     and readback.get("value") == value)
+        postcondition = self.desktop_registry.verify_action(
+            process_name, "set_value",
+            {"ok": exact, "verified": exact,
+             "verification": {"passed": exact, "kind": "uia_value_readback"}},
+            after, requested_value=value,
+        )
+        passed = bool(exact and postcondition.get("passed"))
+        return {
+            "ok": passed,
+            "verified": passed,
+            "characters": len(value),
+            "readback_available": bool(readback.get("readback_available")),
+            "fallback_backend": "keyboard",
+            "after_observation": after,
+            "verification": {"passed": passed, "kind": "uia_value_readback",
+                              "fallback": True},
+            "postcondition_passed": passed,
+            "postcondition_kind": "uia_value_readback",
+            **({} if passed else {
+                "failure_kind": "desktop_keyboard_readback_failed",
+                "error": "Notepad keyboard fallback completed without an exact value readback.",
+            }),
+        }
 
     def _run_browser_action_batch(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Run the single model-facing browser contract on the trusted MCP backend."""
@@ -1727,6 +1919,33 @@ class AgentRuntime:
         result = self._browser_session.execute(arguments.get("actions"))
         self._record_browser_stage_result(result)
         return result
+
+    def _browser_has_follow_up_stage(self, task_text: str) -> bool:
+        plan = self._task_plan or TaskPlan.from_goal(task_text)
+        return bool(plan.browser_required and plan.follow_up_kind)
+
+    def _finish_verified_browser_task(self, original_text: str, result: dict[str, Any],
+                                      *, ephemeral: bool) -> None:
+        """Close a verified browser-only task without another model/tool round."""
+        extraction = result.get("extraction") if isinstance(result, dict) else None
+        fields = extraction.get("fields") if isinstance(extraction, dict) else None
+        rendered = []
+        if isinstance(fields, dict):
+            for key in ("title", "price", "rating", "source", "url"):
+                value = str(fields.get(key) or "").strip()
+                if value:
+                    rendered.append(f"{key}：{value}")
+        answer = "已完成浏览器任务，结果已通过结构化验证。"
+        if rendered:
+            answer += " " + "；".join(rendered)
+        if not ephemeral:
+            self.context.add_turn(original_text, answer)
+            self._record_browser_cache_success(original_text)
+            self.ui.put(("ctx", self.context.usage_percent()))
+        self._task_authorized_until = 0.0
+        self.ui.put(("delta", answer))
+        if not ephemeral:
+            self._finish_task("completed")
 
     def _record_browser_stage_result(self, result: dict[str, Any] | None) -> None:
         """Advance composite routing only from runtime-owned structured evidence."""
