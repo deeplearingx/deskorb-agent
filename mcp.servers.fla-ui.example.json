@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "windows": {
+      "enabled": true,
+      "command": "D:\\tools\\deskorb\\fla-ui-mcp\\v0.2.0\\FlaUI.Mcp.exe",
+      "deskorb": {
+        "capability": "desktop_uia",
+        "description": "Internal semantic Windows UI Automation backend for DeskOrb",
+        "keywords": ["Notepad", "Calculator", "Explorer", "QQ", "Windows desktop"],
+        "allowed_tools": [
+          "windows_launch",
+          "windows_snapshot",
+          "windows_click",
+          "windows_fill",
+          "windows_type",
+          "windows_get_text",
+          "windows_focus"
+        ],
+        "read_only_tools": ["windows_snapshot", "windows_get_text"],
+        "action_tools": [
+          "windows_launch",
+          "windows_click",
+          "windows_fill",
+          "windows_type",
+          "windows_focus"
+        ]
+      }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@0.0.79", "--browser", "chromium", "--isolated"]
+    }
+  }
+}

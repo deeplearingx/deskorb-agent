@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcp_client import MCPToolBridge, load_mcp_servers, resolve_officecli_binary
+from mcp_client import MCPServerSpec, MCPToolBridge, StdioMCPClient, load_mcp_servers, resolve_officecli_binary
 
 
 class FakeClient:
@@ -41,6 +41,22 @@ class MCPClientTests(unittest.TestCase):
             specs = load_mcp_servers(path)
         self.assertEqual([spec.name for spec in specs], ["playwright"])
         self.assertIn("@playwright/mcp@0.0.79", specs[0].args)
+
+    def test_fla_ui_example_keeps_the_isolated_playwright_backend(self):
+        root = Path(__file__).resolve().parents[1]
+        example = root / "mcp.servers.fla-ui.example.json"
+        specs = load_mcp_servers(example)
+        self.assertEqual([spec.name for spec in specs], ["windows", "playwright"])
+        self.assertEqual(specs[0].command, r"D:\tools\deskorb\fla-ui-mcp\v0.2.0\FlaUI.Mcp.exe")
+        self.assertIn("@playwright/mcp@0.0.79", specs[1].args)
+
+        payload = json.loads(example.read_text(encoding="utf-8"))
+        payload["mcpServers"]["windows"]["enabled"] = False
+        with tempfile.TemporaryDirectory() as directory:
+            enabled = Path(directory) / "mcp.json"
+            enabled.write_text(json.dumps(payload), encoding="utf-8")
+            specs = load_mcp_servers(enabled)
+        self.assertEqual([spec.name for spec in specs], ["playwright"])
 
     def test_custom_intent_metadata_is_available_without_starting_server(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +300,40 @@ class MCPClientTests(unittest.TestCase):
         self.assertEqual(playwright.list_calls, 1)
         self.assertEqual(powertoys.list_calls, 0)
         self.assertTrue(all(item["name"].startswith("mcp_playwright_") for item in schemas))
+
+    def test_desktop_uia_backend_tools_are_internal_and_not_model_exposed(self):
+        class WindowsClient:
+            def list_tools(self):
+                return [
+                    {"name": "windows_snapshot", "inputSchema": {"type": "object"}},
+                    {"name": "windows_click", "inputSchema": {"type": "object"}},
+                    {"name": "windows_batch", "inputSchema": {"type": "object"}},
+                ]
+
+            def close(self):
+                return None
+
+        bridge = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        bridge.specs = [MCPServerSpec(
+            name="windows", command="", args=(), env={}, capability="desktop_uia",
+            allowed_tools=("windows_snapshot", "windows_click", "windows_batch"),
+            read_only_tools=("windows_snapshot",), action_tools=("windows_click", "windows_batch"),
+        )]
+        bridge.clients = {"windows": WindowsClient()}
+        schemas = bridge.schemas(["windows"])
+        self.assertTrue(bridge.is_internal_backend_server("windows"))
+        self.assertFalse(bridge.is_model_exposed_server("windows"))
+        self.assertTrue(schemas)
+
+    def test_stdio_tool_call_accepts_a_per_call_timeout_budget(self):
+        client = StdioMCPClient(MCPServerSpec("windows", "fla-ui", (), {}), timeout_seconds=30)
+        with patch.object(client, "start"), patch.object(client, "_request", return_value={"content": []}) as request:
+            result = client.call_tool("windows_snapshot", {"handle": "w1"}, timeout_seconds=2)
+        self.assertEqual(result, {"content": []})
+        request.assert_called_once_with(
+            "tools/call", {"name": "windows_snapshot", "arguments": {"handle": "w1"}},
+            timeout_seconds=2,
+        )
 
     def test_failed_server_discovery_is_not_repeated_in_one_runtime(self):
         class FailingClient:

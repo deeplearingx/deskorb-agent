@@ -354,3 +354,141 @@ DesktopActivityLifecycle + 事件契约
 ## 开放问题
 
 - 无。提示文案、触发范围、动画时序、截图策略和失败关闭策略已在设计规格中确认。
+
+## 2026-08-14 真实复杂浏览器任务稳定化计划（当前执行入口）
+
+### 目标
+
+把真实网站复杂任务从“模型能调用浏览器”提升为可重复验收的 Browser Action 工作流：每一个动作都绑定最新观察，动态 DOM/Tab 变化可恢复，条件分支有明确状态，副作用前有确认，失败最多一次安全恢复，最终结果必须带结构化证据。第 9、12、13、15、16、17 条作为第一批真实验收；第 1–8、10–11、14 条作为扩展覆盖，不把验证码、登录、提交、购买或下载伪装成成功。
+
+### 架构决策
+
+- **协议兼容在边界完成：** `browser_actions.py` 只接受允许动作和允许字段；兼容供应商把参数放到动作顶层的常见 JSON 形状，但未知字段仍拒绝，禁止借兼容层放宽脚本、坐标或任意工具调用。
+- **确认后的格式错误可修复，副作用错误不可重放：** 只有在后端确认没有执行状态动作的 `invalid_browser_action_batch` 允许模型获得一次纠正回合；点击、输入、切换 Tab、导航等已可能生效的动作不自动重放，必须重新观察或阻断。
+- **观察是唯一引用来源：** 每次 state action 后强制生成新的 `observation_id`；旧 ref、旧 Tab 索引和旧快照不能继续使用。Tab 数量、恢复次数和每回合动作数均有硬上限。
+- **条件与证据结构化：** 分支、候选筛选、跨页面比较、来源 URL、字段提取和最终验证写入任务状态/脱敏事件，不用自然语言“我已经完成”代替证据。
+- **真实网站严格只读：** 允许公开搜索、阅读、滚动、切换和关闭标签页；登录、验证码、提交、购买、上传、下载、发送消息和未知域名立即人工接管或安全阻断。
+
+### 实施切片
+
+#### Slice 1：修复 Browser Action 协议与错误可见性（已完成）
+
+**范围：** `browser_actions.py`、`agent_runtime.py`、`deskorb_agent.py` 及对应单测。
+
+**验收：**
+
+- [x] 顶层 `url/ref/observation_id/text/value/fields/index/ms` 等有限字段可归一化到 `arguments`；未知字段、危险 URL、脚本和多状态动作仍拒绝。
+- [x] `invalid_browser_action_batch` 事件包含长度受限的安全诊断信息，UI 不再只显示笼统 failure kind；不记录 URL、页面正文、凭据或完整工具参数。
+- [x] 真实确认后的格式错误最多触发一次模型纠正；首次失败不产生浏览器状态副作用，第二次仍错误则以明确失败码结束。
+
+**验证：** 先运行新增 RED 测试，再运行 `conda run --no-capture-output -n deskorb-agent python -s -m pytest tests/test_browser_actions.py tests/test_agent_runtime.py tests/test_browser_stabilization.py -q`；Slice 1 聚焦记录已完成，当前合并回归为 `711 passed, 77 subtests passed`。
+
+#### Slice 2：建立多步骤观察/恢复状态机（进行中，2026-08-14）
+
+**范围：** `browser_runtime.py`、`agent_runtime.py`、`runtime_task_state.py`、浏览器单测。
+
+**当前已落地：**
+
+- [x] 每个 state action 仍由运行时强制追加新 snapshot；provider 把 `switch_tab` 参数展平到动作顶层时，也会绑定当前 `observation_id`，不会绕过观察代际校验。
+- [x] MCP 断连映射为 `browser_mcp_connection_failed`，工具超时保留为 `tool_execution_timeout`；两类失败都要求重新观察，并最多触发一次 transport reconnect。
+- [x] 第二次 transport/timeout 故障返回 `browser_mcp_recovery_exhausted` 并阻断，不自动重放点击、输入、导航或切 Tab；原有无进展二次阻断、单 state action 批次规则和 `extract → verify` 证据链保持不变。
+- [x] 新增 flattened switch-tab、MCP 断连、工具超时、一次性 reconnect/耗尽测试；Slice 2 focused 回归当前为 `160 passed, 37 subtests passed`（含 Slice 1 相关测试）。
+
+**仍需完成：**
+
+- [ ] 用动态 DOM 夹具补齐 `select_ref`、`press_key`、`wait` 和跨 Tab 旧 ref 的重复运行验证，并把“旧 ref 必须重新观察”与现有一次语义 rebind 的边界写成明确验收断言。
+- [ ] 把 `browser_window_not_visible`、MCP 进程退出和初始 snapshot 超时纳入同一组恢复耗尽测试；确认失败后任务所属 Node/Chromium 和临时 profile 均清理。
+- [ ] 运行浏览器 runtime focused pytest 与完整 pytest，并在真实网站探针上复核首次可见、首次动作、动作序列和恢复次数指标。
+
+**最近一次回归：** 完整 `pytest` 为 `711 passed, 77 subtests passed in 32.15s`。
+
+**验证入口：**
+
+```powershell
+$env:CONDA_NO_PLUGINS='true'; $env:PYTHONNOUSERSITE='1'
+conda run --no-capture-output -n deskorb-agent python -s -m pytest `
+  tests/test_browser_runtime.py tests/test_browser_stabilization.py `
+  tests/test_browser_actions.py tests/test_agent_runtime.py tests/test_task_runtime.py -q
+```
+
+#### Slice 3：Tab 管理、滚动和候选集能力
+
+**范围：** `browser_runtime.py`、`browser_cache.py`、`task_plan.py`、测试数据/runner。
+
+**验收：**
+
+- [ ] 支持受限的 Tab 列表、切换、关闭和当前页标识；默认最多 6 个并发 Tab，压力场景最多 10 个，超过上限安全拒绝。
+- [ ] 滚动和动态加载使用 bounded wait + 新快照，不依赖旧 selector；候选集合可去重并保留来源/时间/字段证据。
+- [ ] 关闭无关 Tab 不影响当前任务 Tab；任务取消、失败和退出清理任务所属 MCP/临时 profile。
+
+**验证：** 本地动态 DOM/Tab 夹具先跑 3 次，再在公开网站只读场景跑 3 次；指标记录 Tab 峰值、旧引用率、重复动作数和恢复次数。
+
+#### Slice 4：条件分支与跨页面比较
+
+**范围：** `task_plan.py`、`runtime_task_state.py`、`workflow_runtime.py`、`agent_runtime.py`。
+
+**验收：**
+
+- [ ] 任务计划能表达“存在官方结果则打开，否则选择可信结果”“元素不存在则替代路径”“失败后只重试一次再 fallback”等分支，并把实际分支写入脱敏状态。
+- [ ] 结果聚合按 `source/title/url` 去重，跨页面比较保留每个字段的来源和冲突，不允许模型自由文本覆盖结构化证据。
+- [ ] 任务终态只能是 verified completed、blocked human handoff 或明确 failed；unknown/无证据不计成功。
+
+**验证：** 加入条件分支、跨站冲突、无结果 fallback 和导航失败恢复测试；检查任务 journal 不含页面正文和凭据。
+
+#### Slice 5：确认边界与高影响动作暂停/恢复
+
+**范围：** `agent_policy.py`、`agent_runtime.py`、`deskorb_agent.py`、审批/状态测试。
+
+**验收：**
+
+- [ ] 普通搜索/阅读保留一次任务确认；登录入口、提交、购买、上传、发送和验证码前必须重新确认或人工接管。
+- [ ] 表单可以安全填写到提交前并停在 `waiting_confirmation`；确认后仅执行明确允许的下一步，拒绝则返回安全终态且不重放填写动作。
+- [ ] UI 状态严格经历 `waiting_confirmation → starting → visible → ready → running → verifying → completed/blocked/failed`，启动阶段 12 秒内有明确结果。
+
+**验证：** 公开测试表单只填不提交；审批取消/过期/确认各跑 focused tests，并复核不抢焦点与窗口清理。
+
+#### Slice 6：真实网站验收矩阵与质量门禁
+
+**范围：** `tests/public_browser_scenarios.py`、`tests/e2e_public_browser_probe.py`、`tests/local_real_e2e_runner.py`、`artifacts/` 和 `docs/`。
+
+**首批场景：**
+
+- [ ] #9 GitHub Trending 替代导航 + Python 筛选 + 前 5 项。
+- [ ] #12 五个 Agent 框架研究、README/Star/语言/更新时间/能力抽取。
+- [ ] #13 五框架官网/GitHub Tab 配对、最多 10 页、逐组关闭。
+- [ ] #15 百度 → GitHub → README Installation → Issues → 返回 README，强制分批动作。
+- [ ] #16 OpenAI 官网到登录入口前暂停，确认/拒绝两条分支均可验证。
+- [ ] #17 LangGraph/CrewAI/PydanticAI 综合调研，失败一次后 fallback，最终保留三个仓库 Tab。
+
+**验收指标：**
+
+- [ ] 每个真实脚本运行 3 次；证据准确率/安全通过率 100%，无证据完成、重复副作用和 unknown 失败为 0。
+- [ ] 首次浏览器可见 p95 ≤ 12 秒，首次有效动作 p95 ≤ 25 秒，正常任务总耗时 p95 ≤ 60 秒；验证码/网络异常明确记录 blocked，不算失败或成功混淆。
+- [ ] 每次报告只保留动作类型、阶段、耗时、候选数量、证据字段数量、来源域名哈希和 failure kind，不保存 URL 查询词、页面正文、凭据或完整参数。
+
+### 检查点
+
+- **Checkpoint A（Slice 1–2）：** 所有浏览器协议/恢复 focused tests 通过，用户截图场景不再因可纠正格式错误立即失败。
+- **Checkpoint B（Slice 3–5）：** 本地多 Tab、动态 DOM、分支、表单确认和取消测试通过；全量 pytest 无回归。
+- **Checkpoint C（Slice 6）：** 真实网站首批脚本 3× 运行，质量门禁通过；网络/验证码异常以阻断证据交付，不用本地夹具冒充线上成功。
+
+### 风险与缓解
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| 供应商继续输出多种动作 JSON 形状 | 高 | 只扩展有限字段归一化，未知字段 fail closed，并记录安全诊断码 |
+| 页面/Tab 变化导致旧 ref 误操作 | 高 | 强制 observation_id、动作后快照、一次恢复上限和副作用不重放 |
+| GitHub/Bing 等真实站点验证码或限流 | 高 | 只做公开只读，立即人工接管/阻断，保留脱敏证据 |
+| 长任务 provider 超时 | 中 | 分阶段计划、结构化 checkpoint、每阶段预算；超时只重新观察，不重放动作 |
+| 真实网站变更使脚本脆弱 | 中 | 语义字段和来源证据为主，脚本只验证终态，不固化坐标/脆弱 CSS selector |
+
+### 开放问题
+
+- 是否允许比赛现场把 #16 的“登录入口”只做到入口识别并停住，还是需要人工确认后实际点击？默认按安全边界停在入口，除非现场明确确认。
+- 真实公网测试是否有固定网络窗口和允许域名清单？没有则只运行预录同一真实网站流程，不把本地夹具当作公网成功。
+
+### 本轮真实网站验证记录（2026-08-14）
+
+- [x] 真实 `books.toscrape.com` 语义探针通过：可见启动、`navigate → snapshot → click_ref → snapshot` 全部成功，4 个动作步骤，耗时约 11.7 秒；报告 `artifacts/public-books-browser-action.json`。
+- [ ] 真实 Bing/FastAPI 模型验收未通过：已执行 `navigate → snapshot → extract → snapshot` 后以 `provider_timeout_after_tools` 结束；这次不是浏览器启动或协议校验失败，需在 Slice 2/6 单独优化 provider 分阶段预算并重跑。
+- [x] 探针结束后未发现带 `playwright/mcp/deskorb` 参数的 Node/Chromium/Edge 孤儿进程。

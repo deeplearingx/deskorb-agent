@@ -14,8 +14,16 @@ app-server compatibility backend.
 
 1. Configure an API key and compatible endpoint in `volcengine.env`, the
    parent-folder `.env`, environment variables, or Connection settings.
-2. Run `setup.cmd` once.
-3. Run `Start DeskOrb Agent.cmd`.
+2. Run `setup-conda.cmd` once. This creates or updates the dedicated Conda
+   environment named `deskorb-agent` and installs the local Playwright MCP.
+3. Run `Start DeskOrb Agent.cmd` (it delegates to the Conda launcher).
+
+DeskOrb development and tests use the same isolated environment. From a
+PowerShell prompt, run commands as `conda run -n deskorb-agent python ...` or
+activate it with `conda activate deskorb-agent`. Do not use an unrelated
+environment such as `marketmind` for this project. The legacy `setup.cmd`
+portable-`.venv` flow remains available for compatibility, but it is not the
+default project runtime.
 
 The overlay starts with `workspace-write` sandboxing. The status-bar
 **Read-only** toggle switches subsequent turns to a read-only sandbox. The
@@ -197,10 +205,29 @@ not boot PowerToys, a PowerToys task does not boot Playwright, and an ordinary d
 task starts neither. Custom servers can declare lightweight intent metadata; DeskOrb
 then routes matching requests automatically. When a request is ambiguous, the model sees
 only the small configured capability catalog, selects one integration, and then loads
-only that server's real tools. Browser snapshots are read-only,
-while navigation, clicking, typing and scrolling run automatically in Full access.
-The current policy asks for confirmation only before deleting files. Submitting,
-publishing, and other requested actions continue automatically.
+only that server's real tools. Browser snapshots are read-only, while navigation,
+clicking, typing and scrolling run automatically after one task-level confirmation
+in Full access. After confirmation DeskOrb starts the isolated headed browser,
+performs a bounded initial snapshot, and reports `starting → visible → ready →
+running → verifying` in the overlay. The browser window is foregrounded once;
+later actions do not repeatedly steal focus. If Windows rejects foreground
+activation, the taskbar is flashed and the overlay offers a safe “switch to
+browser” hint. Startup failures return a specific diagnostic code instead of
+waiting for the full task timeout.
+
+Login, CAPTCHA, upload, submit, publish, purchase, and other high-risk browser
+actions remain separate confirmation or human-handoff boundaries. Completion is
+not inferred from model prose: structured extraction and an independent
+verification step are required before DeskOrb reports success. The current
+policy still asks for confirmation before deleting files as well.
+
+比赛答辩的真实网站脚本、量化指标和消融对比见
+[`docs/competition-demo-plan.md`](docs/competition-demo-plan.md)。
+
+当前稳定化进度和下一步切片记录在 [`tasks/plan.md`](tasks/plan.md) 与
+[`tasks/todo.md`](tasks/todo.md)。已验证的真实网站语义探针报告保存在
+`artifacts/public-books-browser-action.json`；真实模型若出现
+`provider_timeout_after_tools`，只计为供应商预算问题，不作为浏览器成功证据。
 
 The PowerToys MCP uses the locally installed `PowerToys.DSC.exe`, never a shell.
 It can inspect installed modules, settings, schemas, and backups; it can dry-run setting
@@ -258,7 +285,9 @@ The file uses the standard `mcpServers` JSON shape (`command`, `args`, optional
 to disable the default Playwright server. Chrome DevTools MCP can be configured this
 way when you explicitly want to attach to a Chrome instance started with remote
 debugging; Playwright MCP is the default because it runs in a separate local browser
-profile.
+profile. `DESKORB_AGENT_BROWSER_START_TIMEOUT` controls the headed-browser startup
+budget (default 12 seconds, bounded to 3–60 seconds); it is independent from the
+longer provider and tool execution budgets.
 
 For automatic routing of a custom integration, add the optional DeskOrb-only metadata
 (other MCP clients safely ignore it):

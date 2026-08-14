@@ -107,12 +107,9 @@ class BatchEntrypointTests(unittest.TestCase):
         self.assertIn("sys.version_info >= (3, 10)", setup)
         self.assertIn("from pil import image; import keyboard; import win32com.client", setup)
 
-    def test_launcher_checks_environment_before_starting(self):
+    def test_default_launcher_delegates_to_conda_environment(self):
         launcher = self._script("Start DeskOrb Agent.cmd")
-        check = 'python "tools\\venv_bootstrap.py" check --project-root "%cd%"'
-        launch = 'start "" ".venv\\scripts\\pythonw.exe" "deskorb_agent.py"'
-        self.assertIn(check, launcher)
-        self.assertLess(launcher.index(check), launcher.index(launch))
+        self.assertIn('start deskorb agent conda.cmd', launcher)
 
 
 if __name__ == "__main__":

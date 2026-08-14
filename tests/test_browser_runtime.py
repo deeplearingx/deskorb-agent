@@ -42,6 +42,20 @@ class InvalidResultBackend(FakeBackend):
         return super().call(action, arguments)
 
 
+class FailingActionBackend(FakeBackend):
+    def __init__(self, failure):
+        super().__init__([snapshot("search", "")])
+        self.failure = failure
+
+    def call(self, action, arguments):
+        if action == "click_ref":
+            self.calls.append((action, dict(arguments)))
+            if isinstance(self.failure, BaseException):
+                raise self.failure
+            return dict(self.failure)
+        return super().call(action, arguments)
+
+
 class ParentRebindBackend(FakeBackend):
     def __init__(self, page_snapshot, incomplete_extraction, complete_extraction):
         super().__init__([page_snapshot])
@@ -141,6 +155,20 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertNotEqual(result["tab_id"], first["tab_id"])
         self.assertEqual(result["tab_id"], "tab-2")
 
+    def test_flattened_switch_tab_is_bound_to_the_current_observation(self):
+        """Provider-flattened tab actions must retain the runtime observation binding."""
+        backend = FakeBackend([snapshot("search", ""), snapshot("search", "tab2")])
+        session = BrowserExecutionSession(backend)
+        first = session.execute([{"action": "snapshot"}])
+
+        result = session.execute([{"action": "switch_tab", "index": 1}])
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["tab_id"], "tab-2")
+        self.assertEqual(backend.calls[1], ("switch_tab", {
+            "index": 1, "observation_id": first["observation_id"],
+        }))
+
     def test_recovery_keeps_browser_session_and_tab_identity(self):
         backend = FakeBackend([snapshot("search", "")])
         session = BrowserExecutionSession(backend)
@@ -159,6 +187,55 @@ class BrowserExecutionSessionTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_kind"], "browser_backend_failure")
+        self.assertTrue(result["requires_reobservation"])
+
+    def test_mcp_disconnect_is_classified_and_never_replays_the_state_action(self):
+        backend = FailingActionBackend(RuntimeError("MCP server playwright disconnected"))
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot"}])["observation_id"]
+
+        failed = session.execute([{"action": "click_ref", "arguments": {
+            "ref": "search", "observation_id": observation_id,
+        }}])
+        repeated = session.execute([{"action": "click_ref", "arguments": {
+            "ref": "search", "observation_id": observation_id,
+        }}])
+
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["failure_kind"], "browser_mcp_connection_failed")
+        self.assertTrue(failed["requires_reobservation"])
+        self.assertEqual(repeated["failure_kind"], "browser_reobservation_required")
+        self.assertEqual([item[0] for item in backend.calls], ["snapshot", "click_ref"])
+
+    def test_mcp_process_exit_is_classified_as_connection_failure(self):
+        backend = FailingActionBackend(RuntimeError(
+            "MCP server playwright exited while running tools/call"
+        ))
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot"}])["observation_id"]
+
+        result = session.execute([{"action": "click_ref", "arguments": {
+            "ref": "search", "observation_id": observation_id,
+        }}])
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "browser_mcp_connection_failed")
+
+    def test_tool_timeout_requires_a_fresh_observation_before_retry(self):
+        backend = FailingActionBackend({
+            "ok": False,
+            "failure_kind": "tool_execution_timeout",
+            "error": "The browser action exceeded its bounded budget.",
+        })
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot"}])["observation_id"]
+
+        result = session.execute([{"action": "click_ref", "arguments": {
+            "ref": "search", "observation_id": observation_id,
+        }}])
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "tool_execution_timeout")
         self.assertTrue(result["requires_reobservation"])
 
     def test_invalid_backend_action_result_fails_closed(self):

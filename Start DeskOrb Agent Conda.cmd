@@ -1,6 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set "CONDA_NO_PLUGINS=true"
+set "PYTHONNOUSERSITE=1"
 
 where conda >nul 2>nul
 if errorlevel 1 (

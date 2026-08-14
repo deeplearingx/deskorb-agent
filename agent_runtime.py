@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
+import inspect
 import json
 import mimetypes
 import os
@@ -17,9 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
-                    MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
+                    BROWSER_START_TIMEOUT_SECONDS, MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
                     OFFICECLI_ENABLED, OFFICECLI_MAX_TOOL_ROUNDS, OFFICECLI_TIMEOUT_SECONDS,
                     API_MAX_TOOL_ROUNDS,
+                    FLAUI_MCP_SERVER,
                     MODEL_PROVIDER,
                     PLAYWRIGHT_MCP_ENABLED,
                     SYSTEM_APPEND, WORKING_DIR)
@@ -27,18 +30,23 @@ from agent_policy import ApprovalManager, Risk, ToolPolicy
 from desktop_tools import DesktopTools
 from desktop_uia import DesktopUIA
 from desktop_adapters import DesktopApplicationRegistry
+from fla_ui_backend import FlaUIBackend
+from desktop_app_adapters import DesktopAppAdapters
+from cross_domain_adapters import CrossDomainAdapters
 from mcp_client import MCPError, MCPToolBridge
 from model_adapter import ModelAdapter
 from conversation_context import ConversationContext
 from credential_store import get_api_key
 from desktop_activity_indicator import ACTIVITY_TOOLS, BROWSER_ACTIVITY_TOOLS, DesktopActivityEvent, DESKTOP_ACTIVITY_TOOLS
-from browser_actions import STATE_CHANGING_ACTIONS
+from browser_actions import ALLOWED_ACTIONS, STATE_CHANGING_ACTIONS
 from browser_cache import BrowserActionCache, parse_browser_task_intent
 from browser_runtime import BrowserExecutionSession, PlaywrightMCPBackend
+from browser_visibility import (flash_browser_window, focus_browser_window_once,
+                                visible_browser_windows)
 from task_plan import TaskPlan
 from responses_tool_protocol import continue_input, function_call_output, function_calls
 from runtime_task_state import RuntimeTaskState
-from task_runtime import InMemoryTaskJournal, classify_failure
+from task_runtime import ExecutionDeadline, InMemoryTaskJournal, classify_failure
 from win32utils import foreground_capture_window, window_bbox, window_process_name, window_title
 
 
@@ -355,6 +363,7 @@ class AgentRuntime:
     BROWSER_HANDOFF_TIMEOUT_SECONDS = 120
     HUMAN_VERIFICATION_CONTINUE = "__deskorb_human_verification_complete__"
     HUMAN_VERIFICATION_CANCEL = "__deskorb_human_verification_cancel__"
+    TIMEOUT_RECOVERY_SECONDS = 8
     CAPTCHA_MARKERS = (
         "快速验证身份", "我是人类", "人机验证", "滑块验证", "安全验证", "验证码",
         "captcha", "verify you are human", "verify you're human", "security verification",
@@ -388,6 +397,8 @@ class AgentRuntime:
         self.browser_cache = browser_cache if browser_cache is not None else BrowserActionCache.default()
         self.desktop = DesktopTools()
         self.uia = DesktopUIA()
+        self.desktop_adapters = DesktopAppAdapters(self)
+        self.cross_domain_adapters = CrossDomainAdapters(self)
         self.desktop_registry = DesktopApplicationRegistry()
         try:
             self.mcp = MCPToolBridge(MCP_CONFIG_PATH, enable_playwright=PLAYWRIGHT_MCP_ENABLED,
@@ -399,6 +410,18 @@ class AgentRuntime:
         except MCPError as exc:
             self.mcp = None
             self._mcp_configuration_error = str(exc)
+        self._fla_ui_backend = None
+        if FLAUI_MCP_SERVER:
+            self._fla_ui_backend = FlaUIBackend(
+                self.mcp, server_name=FLAUI_MCP_SERVER,
+                deadline_getter=lambda: self._execution_deadline,
+            )
+            # A configured backend owns the desktop semantic path.  It is
+            # intentionally installed even when discovery later fails so the
+            # runtime reports desktop_backend_unavailable instead of silently
+            # switching to pywinauto or coordinates.
+            self.uia = DesktopUIA(semantic_backend=self._fla_ui_backend,
+                                  application_registry=self.desktop_registry)
         self.full_access = bool(full_access)
         self._cancelled = threading.Event()
         self._active_response = None
@@ -417,12 +440,33 @@ class AgentRuntime:
         self._desktop_target_launches = 0
         self._desktop_keyboard_fallback_attempted: set[str] = set()
         self._browser_recovery_attempts = 0
+        self._browser_format_recovery_attempts = 0
         self._browser_reobservation_required = False
         self._browser_session: BrowserExecutionSession | None = None
         self._browser_stage_verified = False
+        self._browser_prepared = False
+        self._browser_window_hwnd = 0
+        self._browser_focus_attempted = False
+        self._browser_status_phase = "idle"
+        self._browser_status_started_at = 0.0
         self._task_plan: TaskPlan | None = None
+        self._verified_browser_fields: dict[str, str] = {}
+        self._cross_domain_handoff_active = False
         self._browser_activity_ids: dict[str, int] = {}
         self._next_desktop_activity_id = 0
+        self.execution_phase = "idle"
+        self.turn_action_dispatched = False
+        self.last_deadline_snapshot: dict[str, Any] = {}
+        self.provider_request_id_hash = ""
+        self._execution_deadline: ExecutionDeadline | None = None
+        self._last_action_name: str | None = None
+        self._last_action_arguments: dict[str, Any] = {}
+        self._last_action_result: dict[str, Any] = {}
+        self._last_action_signature: str | None = None
+        self._blocked_replay_signature: str | None = None
+        self._blocked_replay_attempts = 0
+        self.action_replayed = False
+        self.recovery_attempted = False
 
     def configure(self, model: str, api_base_url: str, api_proxy_url: str = "",
                   model_provider: str | None = None):
@@ -445,11 +489,28 @@ class AgentRuntime:
         self._desktop_target_launches = 0
         self._desktop_keyboard_fallback_attempted.clear()
         self._browser_recovery_attempts = 0
+        self._browser_format_recovery_attempts = 0
         self._browser_reobservation_required = False
         self._browser_session = None
         self._browser_stage_verified = False
+        self._browser_prepared = False
+        self._browser_window_hwnd = 0
+        self._browser_focus_attempted = False
+        self._browser_status_phase = "idle"
+        self._browser_status_started_at = 0.0
         self._task_plan = None
+        self._verified_browser_fields = {}
+        self._cross_domain_handoff_active = False
         self._browser_activity_ids.clear()
+        self._last_action_name = None
+        self._last_action_arguments = {}
+        self._last_action_result = {}
+        self._last_action_signature = None
+        self._blocked_replay_signature = None
+        self._blocked_replay_attempts = 0
+        self.action_replayed = False
+        self.recovery_attempted = False
+        self.provider_request_id_hash = ""
         self.desktop.clear_target_window()
         self.uia.reset()
 
@@ -467,11 +528,27 @@ class AgentRuntime:
         self._desktop_target_launches = 0
         self._desktop_keyboard_fallback_attempted.clear()
         self._browser_recovery_attempts = 0
+        self._browser_format_recovery_attempts = 0
         self._browser_reobservation_required = False
         self._browser_session = None
         self._browser_stage_verified = False
+        self._browser_prepared = False
+        self._browser_window_hwnd = 0
+        self._browser_focus_attempted = False
+        self._browser_status_phase = "idle"
+        self._browser_status_started_at = 0.0
         self._task_plan = None
+        self._verified_browser_fields = {}
+        self._cross_domain_handoff_active = False
         self._browser_activity_ids.clear()
+        self._last_action_name = None
+        self._last_action_arguments = {}
+        self._last_action_result = {}
+        self._last_action_signature = None
+        self._blocked_replay_signature = None
+        self._blocked_replay_attempts = 0
+        self.action_replayed = False
+        self.recovery_attempted = False
         self.desktop.clear_target_window()
         self.uia.reset()
 
@@ -509,17 +586,54 @@ class AgentRuntime:
                 response.close()
             except Exception:
                 pass
+        close = getattr(self.mcp, "close", None) if self.mcp else None
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        self._browser_prepared = False
+        self._browser_window_hwnd = 0
+        self._browser_status_started_at = 0.0
 
-    def run_turn(self, text: str, image_paths: list[str]):
+    def close(self) -> None:
+        """Close task-owned MCP processes and temporary browser artifacts."""
+        self._pending_human_verification = None
+        self._cancel_human_handoff_timer()
+        close = getattr(self.mcp, "close", None) if self.mcp else None
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        self._browser_prepared = False
+        self._browser_window_hwnd = 0
+        self._browser_status_started_at = 0.0
+
+    def run_turn(self, text: str, image_paths: list[str], *,
+                 deadline: ExecutionDeadline | None = None):
         if not str(text or "").strip():
             self._block_empty_input()
             return
+        active_deadline = deadline or ExecutionDeadline(API_TIMEOUT)
+        self._execution_deadline = active_deadline
+        active_deadline.timeout_for(active_deadline.total_seconds, phase="provider_total")
+        self.execution_phase = "provider_first_response"
+        self.turn_action_dispatched = False
         try:
-            return self._run_turn(text, image_paths)
+            return self._run_turn(text, image_paths, deadline=active_deadline)
         except BaseException as exc:
             self._task_authorized_until = 0.0
-            self._finish_task("failed", failure_kind=self._runtime_failure_kind(exc))
+            failure_kind = self._runtime_failure_kind(exc)
+            if self._task_plan is not None and self._task_plan.browser_required:
+                self._publish_browser_status("failed", failure_kind=failure_kind)
+            self._finish_task("failed", failure_kind=failure_kind)
             raise
+        finally:
+            self.last_deadline_snapshot = active_deadline.snapshot()
+            self._execution_deadline = None
+            if not self._cancelled.is_set():
+                self.execution_phase = "idle"
 
     def set_desktop_target_window(self, hwnd: int) -> dict[str, Any]:
         """Constrain this runtime to a disposable foreground window."""
@@ -544,7 +658,10 @@ class AgentRuntime:
             return self._run_turn(text, image_paths, ephemeral=True)
         except BaseException as exc:
             self._task_authorized_until = 0.0
-            self._finish_task("failed", failure_kind=self._runtime_failure_kind(exc))
+            failure_kind = self._runtime_failure_kind(exc)
+            if self._task_plan is not None and self._task_plan.browser_required:
+                self._publish_browser_status("failed", failure_kind=failure_kind)
+            self._finish_task("failed", failure_kind=failure_kind)
             raise
 
     def run_office_plan_turn(self, text: str):
@@ -583,6 +700,23 @@ class AgentRuntime:
         """Map an exception to the privacy-safe task failure taxonomy."""
         return classify_failure(str(error))
 
+    def _request_with_deadline(self, payload: dict[str, Any], api_key: str,
+                               deadline: ExecutionDeadline | None = None) -> dict[str, Any]:
+        """Call the provider while keeping lightweight test adapters compatible."""
+        request = self._request
+        if deadline is None:
+            return request(payload, api_key)
+        try:
+            parameters = inspect.signature(request).parameters
+            supports_deadline = "deadline" in parameters or any(
+                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+            )
+        except (TypeError, ValueError):
+            supports_deadline = True
+        if supports_deadline:
+            return request(payload, api_key, deadline=deadline)
+        return request(payload, api_key)
+
     def _task_requires_contract(self, text: str) -> bool:
         """Return whether a user request claims an external or local effect."""
         lowered = str(text or "").lower()
@@ -613,6 +747,31 @@ class AgentRuntime:
         self._task_state = None
         return progress
 
+    @staticmethod
+    def _safe_browser_failure_detail(result: dict[str, Any] | None) -> str:
+        """Return only deterministic, non-page diagnostics for browser errors."""
+        if not isinstance(result, dict):
+            return ""
+        kind = str(result.get("failure_kind") or "").strip()
+        if kind not in {
+            "invalid_browser_action_batch", "multiple_browser_state_actions",
+            "browser_action_not_allowed_for_stage", "stale_browser_observation",
+            "browser_reobservation_required", "browser_input_stage_locked",
+        }:
+            return ""
+        detail = str(result.get("error") or "").strip()
+        if not detail:
+            return ""
+        # Validator/runtime messages are bounded copy.  Redact anything that
+        # looks like a URL or credential before it can reach UI telemetry.
+        detail = re.sub(r"https?://[^\s]+", "<url>", detail, flags=re.IGNORECASE)
+        detail = re.sub(
+            r"(?i)\b(?:authorization|cookie|password|passwd|token|secret)\s*[=:]\s*[^\s]+",
+            "credential=<redacted>",
+            detail,
+        )
+        return detail[:160]
+
     def _publish_tool_result(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
         """Publish bounded tool telemetry without arguments or free-form output."""
         payload = {
@@ -628,13 +787,18 @@ class AgentRuntime:
             else:
                 category = classify_failure(result.get("error") if isinstance(result, dict) else None)
                 payload["failure_kind"] = "tool_failure" if category == "unknown" else category
+            if name == "browser_action_batch":
+                detail = self._safe_browser_failure_detail(result)
+                if detail:
+                    payload["failure_detail"] = detail
         if isinstance(result, dict) and isinstance(result.get("exit_code"), int):
             payload["exit_code"] = int(result["exit_code"])
         if name == "browser_action_batch":
             actions = arguments.get("actions") if isinstance(arguments, dict) else []
             payload.update({
-                "action_types": [str(item.get("action") or "") for item in actions
-                                if isinstance(item, dict)],
+                "action_types": [str(item.get("action") or "").strip().lower()
+                                 for item in actions if isinstance(item, dict)
+                                 and str(item.get("action") or "").strip().lower() in ALLOWED_ACTIONS],
                 "state_changed": bool(isinstance(result, dict) and result.get("state_changed")),
                 "extraction_count": int(bool(isinstance(result, dict) and result.get("extraction"))),
                 "verification_passed": bool(
@@ -657,6 +821,196 @@ class AgentRuntime:
                 "deterministic_steps": int(result.get("deterministic_steps") or 0) if isinstance(result, dict) else 0,
             })
         self.ui.put(("tool_result", payload))
+
+    def _publish_browser_status(self, phase: str, *, failure_kind: str | None = None,
+                                detail: str | None = None) -> None:
+        """Publish the bounded browser lifecycle protocol used by the overlay."""
+        allowed = {"waiting_confirmation", "starting", "visible", "ready", "running",
+                   "verifying", "completed", "blocked", "failed"}
+        normalized = str(phase or "").strip().lower()
+        if normalized not in allowed:
+            return
+        if normalized == "starting":
+            self._browser_status_started_at = time.monotonic()
+        self._browser_status_phase = normalized
+        payload: dict[str, Any] = {"phase": normalized}
+        if self._browser_status_started_at:
+            payload["elapsed_ms"] = max(
+                0, int(round((time.monotonic() - self._browser_status_started_at) * 1000))
+            )
+        if failure_kind:
+            payload["failure_kind"] = str(failure_kind)[:80]
+        if detail:
+            # Details are UI copy, never a raw exception or page string.
+            payload["detail"] = str(detail)[:160]
+        try:
+            self.ui.put(("browser_status", payload))
+        except Exception:
+            return
+
+    def _browser_start_failure(self, failure_kind: str, detail: str) -> dict[str, Any]:
+        safe_kind = str(failure_kind or "browser_mcp_start_failed")[:80]
+        self._browser_prepared = False
+        self._publish_browser_status("failed", failure_kind=safe_kind, detail=detail)
+        close = getattr(self.mcp, "close", None) if self.mcp else None
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return {"ok": False, "failure_kind": safe_kind, "error": str(detail)[:240]}
+
+    def _wait_for_browser_window(self, process_id: int | None, deadline: float) -> set[int] | None:
+        """Use one bounded visibility poll; never poll after the start budget."""
+        if not process_id:
+            return None
+        latest: set[int] | None = set()
+        while True:
+            latest = visible_browser_windows(int(process_id))
+            if latest is None or latest:
+                return latest
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return latest
+            time.sleep(min(0.05, remaining))
+
+    def _ensure_browser_session(self) -> BrowserExecutionSession:
+        if self._browser_session is None:
+            self._browser_session = BrowserExecutionSession(
+                PlaywrightMCPBackend(self.mcp, timeout_getter=self._browser_tool_timeout),
+                max_action_steps=20,
+                handoff_timeout_seconds=self.BROWSER_HANDOFF_TIMEOUT_SECONDS,
+                on_state_action=self._publish_browser_activity,
+                locator_key=self.browser_cache.key,
+            )
+        return self._browser_session
+
+    def _browser_tool_timeout(self) -> float | None:
+        """Return the remaining per-MCP budget for semantic browser actions."""
+        if self._execution_deadline is None:
+            return None
+        timeout = self._execution_deadline.timeout_for(
+            MCP_TIMEOUT_SECONDS, phase="tool_execution"
+        )
+        self.execution_phase = "tool_execution"
+        return timeout
+
+    def prepare_visible_browser(self) -> dict[str, Any]:
+        """Start the isolated headed browser and prove one visible snapshot.
+
+        This is deliberately a harness operation, not a model action.  The
+        snapshot is discarded after it proves that the real context exists;
+        the model still receives its own observation-bound semantic result.
+        """
+        if self._browser_prepared:
+            return {"ok": True, "phase": "ready", "window_visible": True}
+        if not self.mcp:
+            return self._browser_start_failure(
+                "browser_mcp_start_failed",
+                self._mcp_configuration_error or "The local browser backend is unavailable.",
+            )
+        isolated_check = getattr(self.mcp, "is_browser_isolated", None)
+        if callable(isolated_check) and not isolated_check():
+            return self._browser_start_failure(
+                "browser_mcp_start_failed",
+                "The browser backend is not configured with an isolated profile.",
+            )
+        self._publish_browser_status("starting")
+        startup_budget = float(BROWSER_START_TIMEOUT_SECONDS)
+        if self._execution_deadline is not None:
+            startup_budget = min(startup_budget, self._execution_deadline.remaining())
+        if startup_budget <= 0:
+            return self._browser_start_failure(
+                "browser_initial_snapshot_timeout",
+                "The task deadline was exhausted before browser startup.",
+            )
+        deadline = time.monotonic() + max(0.1, startup_budget)
+        try:
+            remaining = max(0.1, deadline - time.monotonic())
+            schemas_method = self.mcp.schemas
+            try:
+                parameters = inspect.signature(schemas_method).parameters
+                supports_timeout = (
+                    "timeout_seconds" in parameters
+                    or any(item.kind is inspect.Parameter.VAR_KEYWORD
+                           for item in parameters.values())
+                )
+            except (TypeError, ValueError):
+                supports_timeout = True
+            schemas = (schemas_method(("playwright",), timeout_seconds=remaining)
+                       if supports_timeout else schemas_method(("playwright",)))
+            if time.monotonic() >= deadline:
+                return self._browser_start_failure(
+                    "browser_mcp_start_failed", "The browser MCP server exceeded its startup budget.")
+            snapshot_name = next(
+                (str(item.get("name") or "") for item in schemas
+                 if str(item.get("name") or "") in {
+                     "mcp_playwright_browser_snapshot", "browser_snapshot",
+                 }),
+                "mcp_playwright_browser_snapshot",
+            )
+            remaining = max(0.1, deadline - time.monotonic())
+            call = getattr(self.mcp, "call")
+            try:
+                snapshot = call(snapshot_name, {}, timeout_seconds=remaining)
+            except TypeError:
+                snapshot = call(snapshot_name, {})
+            if time.monotonic() >= deadline:
+                return self._browser_start_failure(
+                    "browser_initial_snapshot_timeout",
+                    "The browser initial observation exceeded its startup budget.",
+                )
+        except Exception as exc:
+            message = str(exc).lower()
+            kind = ("browser_initial_snapshot_timeout" if "timed out" in message or "timeout" in message
+                    else "browser_mcp_start_failed")
+            return self._browser_start_failure(kind, "The browser backend did not become ready.")
+        if not isinstance(snapshot, dict) or not snapshot.get("ok"):
+            explicit = str(snapshot.get("failure_kind") or "") if isinstance(snapshot, dict) else ""
+            message = str(snapshot.get("error") or "").lower() if isinstance(snapshot, dict) else ""
+            kind = explicit if explicit in {
+                "browser_initial_snapshot_timeout", "browser_mcp_start_failed",
+            } else ("browser_initial_snapshot_timeout" if "timed out" in message or "timeout" in message
+                    else "browser_mcp_start_failed")
+            return self._browser_start_failure(kind, "The browser did not return its initial observation.")
+        process_getter = getattr(self.mcp, "browser_process_id", None)
+        process_id = process_getter() if callable(process_getter) else None
+        if process_id is None and callable(getattr(self.mcp, "browser_diagnostics", None)):
+            diagnostics = self.mcp.browser_diagnostics()
+            if (isinstance(diagnostics, dict)
+                    and (diagnostics.get("phase") in {"failed", "closed"}
+                         or diagnostics.get("exit_code") is not None)):
+                return self._browser_start_failure(
+                    "browser_mcp_start_failed", "The browser MCP process exited during startup."
+                )
+        windows = self._wait_for_browser_window(process_id, deadline)
+        if windows is None and os.name == "nt":
+            return self._browser_start_failure(
+                "browser_window_not_visible",
+                "Windows could not confirm a visible browser window.",
+            )
+        if windows is not None and not windows:
+            return self._browser_start_failure(
+                "browser_window_not_visible",
+                "The browser context started but no visible browser window was detected.",
+            )
+        self._publish_browser_status("visible")
+        self._browser_window_hwnd = min(windows) if windows else 0
+        focus_denied = False
+        if self._browser_window_hwnd and not self._browser_focus_attempted:
+            self._browser_focus_attempted = True
+            if not focus_browser_window_once(self._browser_window_hwnd):
+                focus_denied = True
+                flash_browser_window(self._browser_window_hwnd)
+        self._ensure_browser_session()
+        self._browser_prepared = True
+        self._publish_browser_status(
+            "ready",
+            detail=("Windows did not allow foreground activation; switch to the browser from the taskbar."
+                    if focus_denied else None),
+        )
+        return {"ok": True, "phase": "ready", "window_visible": True,
+                "focus_denied": focus_denied}
 
     def _browser_cache_lookup(self, text: str):
         """Look up only the narrow read-only search workflow cache."""
@@ -683,13 +1037,14 @@ class AgentRuntime:
         return snapshot(wanted) if callable(snapshot) else {"ok": False, "error": "Task journal is unavailable."}
 
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
-                  allow_tools: bool = True):
+                  allow_tools: bool = True,
+                  deadline: ExecutionDeadline | None = None):
         api_key = get_api_key(self.model_provider)
         if not api_key:
             raise RuntimeError("API Key is not configured")
         self._cancelled.clear()
         if not allow_tools:
-            return self._run_no_tools_ephemeral_turn(api_key, text)
+            return self._run_no_tools_ephemeral_turn(api_key, text, deadline=deadline)
         verification_status, continuation = self._resolve_human_verification(text)
         if verification_status == "cancelled":
             self._task_authorized_until = 0.0
@@ -733,11 +1088,14 @@ class AgentRuntime:
                 }]})
                 self.ui.put(("system", "✓ Manual verification acknowledged. Rechecking the page and continuing the task."))
             return self._run_task_loop(api_key, transcript, str(continuation["original_text"]),
-                                       bool(continuation["ephemeral"]))
+                                       bool(continuation["ephemeral"]), deadline=deadline)
         approval_status, approval = self.approvals.resolve(text)
         if approval_status in {"cancelled", "expired"}:
             self._pending_execution = None
             self._task_authorized_until = 0.0
+            if approval is not None and approval.tool_name == "browser_action_batch":
+                self._publish_browser_status("blocked", failure_kind="browser_task_unverified")
+                self._finish_task("blocked", failure_kind="browser_task_unverified")
             self.ui.put(("system", "Pending action cancelled." if approval_status == "cancelled" else "Pending action expired."))
             return
         if approval_status == "pending":
@@ -748,8 +1106,14 @@ class AgentRuntime:
             # CAPTCHA continuations retain their selected server(s).
             self._task_mcp_servers.clear()
             self._browser_recovery_attempts = 0
+            self._browser_format_recovery_attempts = 0
             self._browser_reobservation_required = False
             self._browser_session = None
+            self._browser_prepared = False
+            self._browser_window_hwnd = 0
+            self._browser_focus_attempted = False
+            self._browser_status_phase = "idle"
+            self._browser_status_started_at = 0.0
             if self._task_state is None:
                 self._desktop_target_launches = 0
             self._pending_cached_browser = None
@@ -768,6 +1132,9 @@ class AgentRuntime:
         original_text = "Answer the attached Word question" if ephemeral else self._clean_task_text(text)
         if not ephemeral:
             self._ensure_task_state(original_text)
+            if (self._task_plan is not None and self._task_plan.browser_required
+                    and approval_status == "none"):
+                self._publish_browser_status("waiting_confirmation")
         if not ephemeral and approval_status == "none":
             intent = self._browser_cache_intent(original_text)
             lookup = self.browser_cache.lookup(intent)
@@ -800,22 +1167,50 @@ class AgentRuntime:
                 arguments = json.loads(call.arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError("arguments must be an object")
-                result = self._run_desktop_action(call.name, arguments)
+                if call.name == "browser_action_batch":
+                    startup = self.prepare_visible_browser()
+                    result = (startup if not startup.get("ok")
+                              else self._run_desktop_action(call.name, arguments))
+                else:
+                    result = self._run_desktop_action(call.name, arguments)
             except (json.JSONDecodeError, ValueError) as exc:
                 result = {"ok": False, "error": f"Invalid confirmed function call: {exc}"}
             self._task_state.record_tool_result(call.name, result)
             self._publish_tool_result(call.name, arguments if isinstance(arguments, dict) else {}, result)
             transcript.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
             transcript = self._append_desktop_observation(transcript, call.name)
+            if call.name == "browser_action_batch" and not result.get("ok"):
+                failure_kind = str(result.get("failure_kind") or "")
+                if (failure_kind == "invalid_browser_action_batch"
+                        and self._browser_format_recovery_attempts < 1):
+                    # Validation failed before a browser state action was
+                    # dispatched. Keep the user's task authorization and let
+                    # the model repair its JSON exactly once; never replay a
+                    # click, input, navigation, or tab mutation here.
+                    self._browser_format_recovery_attempts += 1
+                    self.ui.put(("system", "浏览器动作格式未通过校验，正在按最新页面状态纠正一次。"))
+                    return self._run_task_loop(api_key, transcript, original_text,
+                                               ephemeral, deadline=deadline)
+                self._task_authorized_until = 0.0
+                self._finish_task("failed", failure_kind=failure_kind or "browser_mcp_start_failed")
+                return
         if approval_status == "approved" and self._pending_cached_browser:
             pending = self._pending_cached_browser
             self._pending_cached_browser = None
             self._task_authorized_until = time.monotonic() + self.TASK_AUTHORIZATION_SECONDS
             self.ui.put(("system", "? Task authorized. Replaying the verified browser workflow."))
+            startup = self.prepare_visible_browser()
+            if not startup.get("ok"):
+                self._publish_tool_result("browser_action_batch", {"actions": []}, startup)
+                self._task_authorized_until = 0.0
+                self._finish_task("failed", failure_kind=str(
+                    startup.get("failure_kind") or "browser_mcp_start_failed"))
+                return
             result = self._run_cached_browser_task(pending["intent"], pending["entry"], ephemeral=ephemeral)
             if result.get("ok"):
                 self._task_authorized_until = 0.0
                 self.ui.put(("delta", self._cached_browser_delta(result)))
+                self._publish_browser_status("completed")
                 if not ephemeral:
                     self._finish_task("completed")
             else:
@@ -827,11 +1222,14 @@ class AgentRuntime:
                              + "\nThe deterministic browser workflow could not prove the current page state. "
                              "Re-plan with a fresh browser snapshot."),
                 }]}]
-                return self._run_task_loop(api_key, fallback_content, str(pending.get("original_text") or original_text), ephemeral)
+                return self._run_task_loop(api_key, fallback_content,
+                                           str(pending.get("original_text") or original_text),
+                                           ephemeral, deadline=deadline)
             return
-        return self._run_task_loop(api_key, transcript, original_text, ephemeral)
+        return self._run_task_loop(api_key, transcript, original_text, ephemeral, deadline=deadline)
 
-    def _run_no_tools_ephemeral_turn(self, api_key: str, text: str) -> None:
+    def _run_no_tools_ephemeral_turn(self, api_key: str, text: str,
+                                     deadline: ExecutionDeadline | None = None) -> None:
         """One isolated text response; function calls are an error, never dispatched."""
         payload = {
             "model": self.model,
@@ -840,7 +1238,7 @@ class AgentRuntime:
             "tools": [],
             "stream": False,
         }
-        response = self._request(payload, api_key)
+        response = self._request_with_deadline(payload, api_key, deadline)
         if function_calls(response):
             raise RuntimeError("Office planning responses must not contain tool calls")
         answer = self._extract_text(response)
@@ -850,7 +1248,7 @@ class AgentRuntime:
         self.ui.put(("office_delta", (token, answer)) if token is not None else ("delta", answer))
 
     def _run_task_loop(self, api_key: str, transcript: list[dict[str, Any]], original_text: str,
-                       ephemeral: bool) -> None:
+                       ephemeral: bool, deadline: ExecutionDeadline | None = None) -> None:
         """Run (or resume) an agent task against its existing tool transcript."""
         if not ephemeral:
             self._ensure_task_state(original_text)
@@ -867,11 +1265,16 @@ class AgentRuntime:
         for _ in range(self._tool_round_limit(original_text)):
             if self._cancelled.is_set():
                 self._task_authorized_until = 0.0
+                if self._task_plan is not None and self._task_plan.browser_required:
+                    self._publish_browser_status("blocked", failure_kind="browser_task_unverified")
                 self._finish_task("failed", failure_kind="cancelled")
                 self.ui.put(("system", "stopped."))
                 return
-            response = self._request({"model": self.model, "instructions": instructions, "input": transcript,
-                                      "tools": self._available_schemas(original_text), "parallel_tool_calls": False, "stream": False}, api_key)
+            response = self._request_with_deadline(
+                {"model": self.model, "instructions": instructions, "input": transcript,
+                 "tools": self._available_schemas(original_text), "parallel_tool_calls": False, "stream": False},
+                api_key, deadline,
+            )
             calls = function_calls(response)
             if not calls:
                 answer = self._extract_text(response)
@@ -903,7 +1306,14 @@ class AgentRuntime:
                         }]})
                         continue
                     self._task_authorized_until = 0.0
-                    self._finish_task("failed", failure_kind="required_action_missing")
+                    if self._task_plan is not None and self._task_plan.browser_required:
+                        self._publish_browser_status("failed", failure_kind="browser_task_unverified")
+                    self._finish_task(
+                        "failed",
+                        failure_kind=("browser_task_unverified"
+                                      if self._task_plan is not None and self._task_plan.browser_required
+                                      else "required_action_missing"),
+                    )
                     self.ui.put(("system", "Task stopped because the required action or verification was not completed."))
                     return
                 if not ephemeral:
@@ -913,6 +1323,8 @@ class AgentRuntime:
                 if not ephemeral:
                     self._record_browser_cache_success(original_text)
                     self.ui.put(("ctx", self.context.usage_percent()))
+                    if self._task_plan is not None and self._task_plan.browser_required:
+                        self._publish_browser_status("completed")
                     self._finish_task("completed")
                 return
             outputs = []
@@ -948,9 +1360,16 @@ class AgentRuntime:
                         result = self._run_desktop_action(call.name, arguments)
                     else:
                         high_risk = self._high_risk_call(call.name, arguments)
+                        execution_requested = self._execution_requested(original_text)
+                        if call.name == "browser_action_batch":
+                            # TaskPlan already classified explicit search/web
+                            # intent as an external browser task.  Do not make
+                            # a user say “open” or “click” just to pass the
+                            # execution gate and receive the one task prompt.
+                            execution_requested = execution_requested or self._browser_task_requested(original_text)
                         decision = self.policy.decide(
                             self._policy_name(call.name, arguments),
-                            execution_requested=self._execution_requested(original_text),
+                            execution_requested=execution_requested,
                             full_access=self.full_access,
                             task_authorized=self._task_authorized(),
                             high_risk=high_risk,
@@ -974,6 +1393,21 @@ class AgentRuntime:
                     self._task_state.record_tool_result(call.name, result)
                     self._publish_tool_result(call.name, arguments, result)
                 outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
+                if (call.name == "browser_action_batch" and not result.get("ok")
+                        and str(result.get("failure_kind") or "") == "invalid_browser_action_batch"):
+                    if self._browser_format_recovery_attempts >= 1:
+                        self._task_authorized_until = 0.0
+                        self._publish_browser_status(
+                            "failed",
+                            failure_kind="invalid_browser_action_batch",
+                            detail=self._safe_browser_failure_detail(result) or None,
+                        )
+                        self._finish_task("failed", failure_kind="invalid_browser_action_batch")
+                        return
+                    # This rejection occurs before a state action reaches the
+                    # backend, so one model correction is safe. Subsequent
+                    # invalid batches take the bounded failure path above.
+                    self._browser_format_recovery_attempts += 1
                 if (call.name == "browser_action_batch"
                         and isinstance(result, dict)
                         and result.get("postcondition_passed") is True
@@ -1036,6 +1470,7 @@ class AgentRuntime:
     def _pause_for_human_verification(self, transcript: list[dict[str, Any]], original_text: str,
                                       ephemeral: bool, marker: str, arguments: dict[str, Any]) -> None:
         self._cancel_human_handoff_timer()
+        self._publish_browser_status("blocked", failure_kind="human_verification")
         self._pending_human_verification = {
             "transcript": transcript,
             "original_text": original_text,
@@ -1055,6 +1490,7 @@ class AgentRuntime:
         """Pause a browser task for a bounded, non-CAPTCHA manual handoff."""
         timeout = self.BROWSER_HANDOFF_TIMEOUT_SECONDS
         self._cancel_human_handoff_timer()
+        self._publish_browser_status("blocked", failure_kind=reason or "browser_no_progress")
         pending = {
             "transcript": transcript,
             "original_text": original_text,
@@ -1081,6 +1517,7 @@ class AgentRuntime:
         self._pending_human_verification = None
         self._human_handoff_timer = None
         self._task_authorized_until = 0.0
+        self._publish_browser_status("blocked", failure_kind="browser_handoff_timeout")
         self.ui.put(("human_handoff_timeout", {"reason": "browser_no_progress", "terminal": "blocked"}))
         self._finish_task("blocked", failure_kind="browser_handoff_timeout")
 
@@ -1140,6 +1577,8 @@ class AgentRuntime:
             checker = getattr(self._browser_session, "batch_requires_confirmation", None)
             if callable(checker) and checker(arguments.get("actions") or []):
                 return True
+        if name == "browser_action_batch" and self._browser_batch_has_high_risk_target(arguments):
+            return True
         if self.mcp and self.mcp.owns(name):
             server_name = getattr(self.mcp, "server_name", lambda _name: None)(name)
             if server_name == "officecli" and self._officecli_deletes_file(arguments.get("command")):
@@ -1150,6 +1589,28 @@ class AgentRuntime:
         risk_level = str(arguments.get("_deskorb_risk_level") or arguments.get("risk_level") or "").lower()
         return risk_level == "high" and (name in self.DESKTOP_ACTION_TOOLS or
                                           bool(self.mcp and self.mcp.owns(name)))
+
+    @staticmethod
+    def _browser_batch_has_high_risk_target(arguments: dict[str, Any]) -> bool:
+        """Gate obvious submit/login/upload targets even before the first snapshot."""
+        if not isinstance(arguments, dict):
+            return False
+        markers = (
+            "send", "submit", "publish", "purchase", "buy", "checkout", "delete",
+            "upload", "login", "password", "credential", "发送", "提交", "发布",
+            "购买", "结算", "删除", "上传", "登录", "密码",
+        )
+        for item in arguments.get("actions") or ():
+            if not isinstance(item, dict):
+                continue
+            args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if bool(args.get("submit")) or bool(args.get("doubleClick")):
+                return True
+            target_text = " ".join(str(args.get(key) or "").lower()
+                                    for key in ("ref", "element", "button", "label"))
+            if any(marker in target_text for marker in markers):
+                return True
+        return False
 
     @staticmethod
     def _shell_deletes_file(command: Any) -> bool:
@@ -1216,7 +1677,17 @@ class AgentRuntime:
                 schemas.append(self._browser_action_batch_schema(self._browser_allowed_actions()))
             other_servers = servers - {"playwright"}
             if other_servers:
-                schemas.extend(self.mcp.schemas(other_servers))
+                internal_schemas = self.mcp.schemas(other_servers)
+                exposed_checker = getattr(self.mcp, "is_model_exposed_server", None)
+                server_resolver = getattr(self.mcp, "server_name", None)
+                if callable(exposed_checker) and callable(server_resolver):
+                    schemas.extend(item for item in internal_schemas
+                                   if exposed_checker(server_resolver(str(item.get("name") or ""))))
+                else:
+                    # Preserve compatibility with small in-process bridges
+                    # used by embedders and tests; only the real bridge knows
+                    # which configured servers are internal adapters.
+                    schemas.extend(internal_schemas)
             discovery = self._mcp_discovery_schema()
             if discovery:
                 schemas.append(discovery)
@@ -1424,6 +1895,9 @@ class AgentRuntime:
             name = str(item.get("name") or "").strip()
             description = str(item.get("description") or "").strip()
             keywords = [str(keyword).strip() for keyword in item.get("keywords") or [] if str(keyword).strip()]
+            if (name and self.mcp
+                    and getattr(self.mcp, "is_internal_backend_server", lambda _name: False)(name)):
+                continue
             if name and name not in {"playwright", "powertoys"} and (description or keywords):
                 hint = description or ", ".join(keywords)
                 choices.append({"name": name, "hint": hint[:240]})
@@ -1534,20 +2008,163 @@ class AgentRuntime:
             raise RuntimeError("Agent context changed while compaction was running")
         return {"pre_tokens": candidate.pre_tokens, "post_tokens": self.context.estimated_tokens()}
 
-    def _request(self, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+    def _provider_timeout_error(self, phase: str) -> RuntimeError:
+        category = ("provider_timeout_after_tools"
+                    if self.turn_action_dispatched else "provider_timeout_before_tools")
+        self.execution_phase = str(phase or "provider_total")
+        return RuntimeError(f"{category} phase={self.execution_phase}")
+
+    @staticmethod
+    def _action_signature(name: str, arguments: dict[str, Any]) -> str:
+        material = json.dumps({"name": str(name), "arguments": arguments},
+                              ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                              default=str)
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _browser_batch_has_state_action(arguments: dict[str, Any]) -> bool:
+        return any(
+            isinstance(item, dict)
+            and str(item.get("action") or "") in STATE_CHANGING_ACTIONS
+            for item in arguments.get("actions") or ()
+        )
+
+    def _is_state_action(self, name: str, arguments: dict[str, Any]) -> bool:
+        if name == "browser_action_batch":
+            return self._browser_batch_has_state_action(arguments)
+        if name in self.DESKTOP_ACTION_TOOLS:
+            return True
+        return bool(self.mcp and self.mcp.owns(name) and self.mcp.is_action(name))
+
+    def recover_after_timeout(self, failure_kind: str) -> dict[str, Any]:
+        """Take one fresh observation after a timeout without replaying an action."""
+        allowed = {
+            "provider_timeout", "provider_timeout_after_tools", "tool_execution_timeout",
+            "desktop_observation_timeout", "postcondition_verification_timeout",
+        }
+        if failure_kind not in allowed or not self._last_action_name:
+            return {"resume_required": False, "failure_kind": failure_kind}
+
+        self.recovery_attempted = True
+
+        if self._last_action_signature:
+            self._blocked_replay_signature = self._last_action_signature
+            self._blocked_replay_attempts = 0
+
+        self.execution_phase = "postcondition_verification"
+        action_name = self._last_action_name
+        arguments = self._last_action_arguments
+        if action_name == "browser_action_batch":
+            observe_name = "browser_action_batch"
+            observe_arguments = {"actions": [{"action": "snapshot", "arguments": {}}]}
+        elif action_name in {"desktop_uia_invoke", "desktop_uia_set_value", "desktop_uia_observe"}:
+            observe_name = "desktop_uia_observe"
+            observe_arguments = {
+                "window_handle": int(arguments.get("window_handle") or 0),
+                "max_elements": 80,
+            }
+        else:
+            observe_name = "desktop_capture_state"
+            observe_arguments = {}
+        observation = self._run_recovery_observation_bounded(observe_name, observe_arguments)
+        safe_result = {
+            "tool": observe_name,
+            "ok": bool(isinstance(observation, dict) and observation.get("ok")),
+            "recovery_attempted": True,
+            "failure_kind": (str(observation.get("failure_kind") or "")[:80]
+                              if isinstance(observation, dict) and not observation.get("ok") else ""),
+        }
+        self.ui.put(("tool_result", safe_result))
+        self.ui.put(("execution_timing", {
+            "deadline": self.last_deadline_snapshot if isinstance(self.last_deadline_snapshot, dict) else {},
+            "execution_phase": "postcondition_verification",
+            "action_dispatched": bool(self.turn_action_dispatched),
+            "action_replayed": bool(self.action_replayed),
+            "recovery_attempted": True,
+        }))
+        if not safe_result["ok"]:
+            return {"resume_required": False, "failure_kind": "postcondition_verification_timeout"}
+        self.execution_phase = "provider_first_response"
+        return {
+            "resume_required": True,
+            "resume_prompt": (
+                "上一动作已经发送，但模型回合超时。已获取新的状态观察；先验证当前状态，"
+                "不要重复上一动作。若后置条件未满足，只执行新的必要动作。"
+            ),
+        }
+
+    def _run_recovery_observation_bounded(self, name: str,
+                                          arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run the one timeout recovery observation without an unbounded wait."""
+        result: dict[str, Any] = {}
+        completed = threading.Event()
+
+        def worker() -> None:
+            nonlocal result
+            previous_deadline = self._execution_deadline
+            self._execution_deadline = ExecutionDeadline(self.TIMEOUT_RECOVERY_SECONDS)
+            self.execution_phase = "postcondition_verification"
+            try:
+                value = self._run_local_tool(name, arguments)
+                result = value if isinstance(value, dict) else {"ok": False}
+            except Exception:
+                result = {"ok": False, "failure_kind": "postcondition_verification_timeout"}
+            finally:
+                self._execution_deadline = previous_deadline
+                completed.set()
+
+        thread = threading.Thread(target=worker, name="deskorb-timeout-recovery", daemon=True)
+        thread.start()
+        completed.wait(timeout=max(0.1, float(self.TIMEOUT_RECOVERY_SECONDS)))
+        if not completed.is_set():
+            return {"ok": False, "failure_kind": "postcondition_verification_timeout",
+                    "error": "The postcondition observation timed out."}
+        return result
+
+    def _request(self, payload: dict[str, Any], api_key: str,
+                 *, deadline: ExecutionDeadline | None = None) -> dict[str, Any]:
+        deadline = deadline or self._execution_deadline
         body = self.adapter.prepare_request(payload)
         request = urllib.request.Request(self.adapter.endpoint, data=json.dumps(body).encode("utf-8"), method="POST",
             headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json",
                      "Accept": "application/json", "User-Agent": "deskorb-agent/0.2"})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": self.api_proxy_url, "https": self.api_proxy_url})) if self.api_proxy_url else None
-        timeout = min(API_TIMEOUT, self.REQUEST_TIMEOUT)
+        base_timeout = min(API_TIMEOUT, self.REQUEST_TIMEOUT)
         transient_error: BaseException | None = None
         for attempt in range(API_REQUEST_RETRIES + 1):
+            if deadline is not None:
+                connect_timeout = deadline.timeout_for(base_timeout, phase="provider_connect")
+                if connect_timeout <= 0:
+                    raise self._provider_timeout_error("provider_connect")
+            else:
+                connect_timeout = base_timeout
             try:
-                response = opener.open(request, timeout=timeout) if opener else urllib.request.urlopen(request, timeout=timeout)
+                self.execution_phase = "provider_connect"
+                response = (opener.open(request, timeout=connect_timeout)
+                            if opener else urllib.request.urlopen(request, timeout=connect_timeout))
+                headers = getattr(response, "headers", None)
+                request_id = ""
+                if headers is not None:
+                    for header_name in ("x-request-id", "request-id"):
+                        try:
+                            request_id = str(headers.get(header_name) or "").strip()
+                        except Exception:
+                            request_id = ""
+                        if request_id:
+                            break
+                if request_id:
+                    self.provider_request_id_hash = hashlib.sha256(
+                        request_id.encode("utf-8", "replace")
+                    ).hexdigest()
                 with self._response_lock:
                     self._active_response = response
                 try:
+                    if deadline is not None:
+                        body_timeout = deadline.timeout_for(base_timeout, phase="provider_first_response")
+                        if body_timeout <= 0:
+                            raise self._provider_timeout_error("provider_first_response")
+                        self._set_response_timeout(response, body_timeout)
+                    self.execution_phase = "provider_first_response"
                     result = json.loads(response.read(4 * 1024 * 1024).decode("utf-8", "replace"))
                 finally:
                     response.close()
@@ -1558,6 +2175,8 @@ class AgentRuntime:
                 return self.adapter.normalize_response(result)
             except urllib.error.HTTPError as exc:
                 detail = exc.read(64 * 1024).decode("utf-8", "replace")[:500]
+                if deadline is not None and deadline.expired():
+                    raise self._provider_timeout_error("provider_total") from exc
                 if exc.code in self.TRANSIENT_HTTP_STATUS and attempt < API_REQUEST_RETRIES:
                     # Upstream gateways commonly use 429/5xx for short overloads. Do
                     # not retry other 4xx responses: those are request/auth/config bugs.
@@ -1566,7 +2185,12 @@ class AgentRuntime:
                         retry_after = float(exc.headers.get("Retry-After", "0")) if exc.headers else 0.0
                     except (TypeError, ValueError):
                         retry_after = 0.0
-                    time.sleep(max(0.5 * (attempt + 1), min(10.0, retry_after)))
+                    delay = max(0.5 * (attempt + 1), min(10.0, retry_after))
+                    if deadline is not None:
+                        delay = min(delay, deadline.remaining())
+                        if delay <= 0:
+                            raise self._provider_timeout_error("provider_total") from exc
+                    time.sleep(delay)
                     continue
                 if exc.code == 401 and "/api/coding/v3" in self.api_base_url.lower():
                     detail += (
@@ -1576,11 +2200,37 @@ class AgentRuntime:
                 raise RuntimeError(f"API HTTP {exc.code}: {detail}") from exc
             except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
                 transient_error = exc
+                if deadline is not None and deadline.expired():
+                    raise self._provider_timeout_error("provider_total") from exc
                 if attempt < API_REQUEST_RETRIES:
-                    time.sleep(0.5 * (attempt + 1))
+                    delay = 0.5 * (attempt + 1)
+                    if deadline is not None:
+                        delay = min(delay, deadline.remaining())
+                        if delay <= 0:
+                            raise self._provider_timeout_error("provider_total") from exc
+                    time.sleep(delay)
                     continue
         detail = getattr(transient_error, "reason", transient_error)
         raise RuntimeError(f"API network connection failed after {API_REQUEST_RETRIES + 1} attempt(s): {str(detail)[:300]}") from transient_error
+
+    @staticmethod
+    def _set_response_timeout(response: Any, timeout_seconds: float) -> None:
+        """Best-effortly cap the socket read timeout for the current response."""
+        candidates = [response]
+        for attr in ("fp", "raw"):
+            value = getattr(response, attr, None)
+            if value is not None:
+                candidates.append(value)
+                nested = getattr(value, "raw", None)
+                if nested is not None:
+                    candidates.append(nested)
+        for candidate in candidates:
+            setter = getattr(candidate, "settimeout", None)
+            if callable(setter):
+                try:
+                    setter(max(0.1, float(timeout_seconds)))
+                except (OSError, TypeError, ValueError):
+                    continue
 
     @staticmethod
     def _extract_text(response: dict[str, Any]) -> str:
@@ -1619,11 +2269,31 @@ class AgentRuntime:
     def _is_browser_connection_failure(result: dict[str, Any]) -> bool:
         if not isinstance(result, dict) or result.get("ok"):
             return False
+        if str(result.get("failure_kind") or "") == "browser_mcp_connection_failed":
+            return True
         text = str(result.get("error") or result.get("message") or "").lower()
         return any(marker in text for marker in (
             "target closed", "browser closed", "page closed", "context closed",
             "connection closed", "disconnected", "broken pipe", "transport",
+            "process exited", "server exited", "exited while", "not running",
+            "stopped while",
         ))
+
+    @classmethod
+    def _browser_recovery_failure_kind(cls, result: dict[str, Any]) -> str | None:
+        """Return the bounded one-recovery category for a semantic browser call."""
+        if not isinstance(result, dict) or result.get("ok"):
+            return None
+        explicit = str(result.get("failure_kind") or "").strip()
+        if explicit in {"browser_mcp_connection_failed", "tool_execution_timeout"}:
+            return explicit
+        if cls._is_browser_connection_failure(result):
+            return "browser_mcp_connection_failed"
+        text = str(result.get("error") or result.get("message") or "").lower()
+        if any(marker in text for marker in (
+                "timed out", "timeout", "deadline was exhausted", "bounded budget")):
+            return "tool_execution_timeout"
+        return None
 
     def _reconnect_browser_mcp(self) -> None:
         close = getattr(self.mcp, "close", None) if self.mcp else None
@@ -1635,7 +2305,50 @@ class AgentRuntime:
                 # subsequent fresh snapshot is still required before action.
                 pass
 
+    def run_desktop_adapter(self, application: str, **kwargs: Any) -> dict[str, Any]:
+        """Run an internal deterministic app adapter; never exposed as a tool."""
+        name = str(application or "").strip().lower()
+        if name == "notepad":
+            return self.desktop_adapters.notepad(str(kwargs.get("value") or ""),
+                                                 window_handle=kwargs.get("window_handle"))
+        if name == "calculator":
+            return self.desktop_adapters.calculator(str(kwargs.get("expression") or "2+2"),
+                                                   window_handle=kwargs.get("window_handle"))
+        if name == "explorer":
+            return self.desktop_adapters.explorer(str(kwargs.get("path") or ""),
+                                                 window_handle=kwargs.get("window_handle"))
+        return {"ok": False, "failure_kind": "desktop_application_not_allowlisted",
+                "error": "The requested internal desktop adapter is not allowlisted."}
+
+    def write_verified_browser_to_file(self, path: str) -> dict[str, Any]:
+        return self.cross_domain_adapters.write_file(
+            self._verified_browser_fields, path,
+            evidence_verified=bool(self._browser_stage_verified),
+        )
+
+    def write_verified_browser_to_notepad(self, *, window_handle: int | None = None) -> dict[str, Any]:
+        return self.cross_domain_adapters.write_notepad(
+            self._verified_browser_fields,
+            evidence_verified=bool(self._browser_stage_verified),
+            window_handle=window_handle,
+        )
+
     def _run_local_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        plan = self._task_plan
+        if plan and plan.browser_required and plan.follow_up_kind:
+            file_stage_tools = {"filesystem_write"}
+            desktop_stage_tools = {"desktop_uia_invoke", "desktop_uia_set_value"}
+            stage_tools = file_stage_tools if plan.follow_up_kind == "file" else desktop_stage_tools
+            if name in stage_tools and not self._browser_stage_verified:
+                return {"ok": False, "failure_kind": "task_stage_not_ready",
+                        "error": "The browser evidence contract must be verified before the next stage."}
+            if (not self._cross_domain_handoff_active
+                    and name == "filesystem_write" and plan.follow_up_kind == "file"):
+                return self.write_verified_browser_to_file(str(arguments.get("path") or ""))
+            if (not self._cross_domain_handoff_active
+                    and name == "desktop_uia_set_value" and plan.follow_up_kind == "desktop"):
+                return self.write_verified_browser_to_notepad(
+                    window_handle=int(arguments.get("window_handle") or 0) or None)
         if name == "mcp_enable_server":
             server = str(arguments.get("server_name") or "").strip()
             available = set(getattr(self.mcp, "available_servers", ())) if self.mcp else set()
@@ -1651,22 +2364,59 @@ class AgentRuntime:
             if is_browser and self._browser_reobservation_required \
                     and not self._is_browser_observation_tool(name):
                 return {"ok": False,
+                        "failure_kind": "browser_reobservation_required",
                         "error": "Fresh browser observation is required before retrying this action.",
                         "requires_reobservation": True}
-            result = self.mcp.call(name, arguments)
-            if is_browser and self._is_browser_connection_failure(result):
-                self._browser_reobservation_required = True
-                if self._browser_recovery_attempts < 1:
-                    self._browser_recovery_attempts += 1
-                    self._reconnect_browser_mcp()
-                return {**result, "requires_reobservation": True,
-                        "recovery_attempts": self._browser_recovery_attempts}
+            tool_timeout = None
+            if self._execution_deadline is not None:
+                tool_timeout = self._execution_deadline.timeout_for(
+                    MCP_TIMEOUT_SECONDS, phase="tool_execution")
+                self.execution_phase = "tool_execution"
+                if tool_timeout <= 0:
+                    return {"ok": False, "failure_kind": "tool_execution_timeout",
+                            "error": "The task deadline was exhausted before the MCP action started."}
+            mcp_call = self.mcp.call
+            try:
+                if tool_timeout is None:
+                    result = mcp_call(name, arguments)
+                else:
+                    try:
+                        parameters = inspect.signature(mcp_call).parameters
+                        accepts_timeout = ("timeout_seconds" in parameters
+                                           or any(parameter.kind is inspect.Parameter.VAR_KEYWORD
+                                                  for parameter in parameters.values()))
+                    except (TypeError, ValueError):
+                        accepts_timeout = True
+                    result = (mcp_call(name, arguments, timeout_seconds=tool_timeout)
+                              if accepts_timeout else mcp_call(name, arguments))
+            except Exception as exc:
+                failure_kind = self._browser_recovery_failure_kind({"error": str(exc)})
+                result = {
+                    "ok": False,
+                    "failure_kind": failure_kind or "browser_tool_failure",
+                    "error": ("The local browser MCP action timed out."
+                               if failure_kind == "tool_execution_timeout"
+                               else "The local browser MCP action failed."),
+                }
+            if is_browser:
+                recovery_kind = self._browser_recovery_failure_kind(result)
+                if recovery_kind:
+                    self._browser_reobservation_required = True
+                    if self._browser_recovery_attempts < 1:
+                        self._browser_recovery_attempts += 1
+                        self._reconnect_browser_mcp()
+                    return {**result, "failure_kind": recovery_kind,
+                            "requires_reobservation": True,
+                            "recovery_attempts": self._browser_recovery_attempts}
             if is_browser and self._is_browser_observation_tool(name) and isinstance(result, dict) and result.get("ok"):
                 self._browser_reobservation_required = False
             return result
         if name == "filesystem_write":
             return self.tools.write_text(arguments)
         if name == "application_launch":
+            semantic_launch = self.uia.launch_application(str(arguments.get("application") or ""))
+            if semantic_launch is not None:
+                return semantic_launch
             target = self.desktop.target_window
             application = str(arguments.get("application") or "").strip().lower()
             if target and application == "notepad":
@@ -1729,6 +2479,7 @@ class AgentRuntime:
         if name == "desktop_verify_state":
             return self.desktop.verify_state(str(arguments.get("snapshot_id", "")))
         if name == "desktop_uia_observe":
+            self.execution_phase = "desktop_observation"
             hwnd = arguments.get("window_handle") or self.desktop.target_window or foreground_capture_window()
             if self.desktop.target_window is not None and int(hwnd or 0) != int(self.desktop.target_window):
                 return {"ok": False, "error": "UI Automation target is outside the configured target window."}
@@ -1742,12 +2493,19 @@ class AgentRuntime:
                 return {"ok": False, "failure_kind": "desktop_modal_dialog", "error": "A modal dialog requires user attention before UIA actions can continue."}
             result = self.uia.invoke(str(arguments.get("control_id") or ""), int(arguments.get("window_handle") or 0), observation_id)
             if result.get("ok"):
+                self.execution_phase = "desktop_observation"
                 after = self.uia.observe_active_window(int(arguments.get("window_handle") or 0), max_elements=80)
                 if not after.get("ok"):
                     return {"ok": False, "failure_kind": str(after.get("failure_kind") or "desktop_reobserve_failed"),
                             "error": str(after.get("error") or "Post-action UI Automation observation failed.")}
                 self.desktop.set_modal_blocked(bool(after.get("requires_user_attention")))
-                process_name = str(after.get("process_name") or window_process_name(int(arguments.get("window_handle") or 0)))
+                self.execution_phase = "postcondition_verification"
+                window_handle = int(arguments.get("window_handle") or 0)
+                process_name = str(
+                    after.get("process_name")
+                    or self.uia.application_process_name(window_handle)
+                    or window_process_name(window_handle)
+                )
                 postcondition = self.desktop_registry.verify_action(
                     process_name, "invoke", result, after,
                 )
@@ -1782,12 +2540,18 @@ class AgentRuntime:
                 if fallback is not None:
                     return fallback
             if result.get("ok"):
+                self.execution_phase = "desktop_observation"
                 after = self.uia.observe_active_window(window_handle, max_elements=80)
                 if not after.get("ok"):
                     return {"ok": False, "failure_kind": str(after.get("failure_kind") or "desktop_reobserve_failed"),
                             "error": str(after.get("error") or "Post-action UI Automation observation failed.")}
                 self.desktop.set_modal_blocked(bool(after.get("requires_user_attention")))
-                process_name = str(after.get("process_name") or window_process_name(window_handle))
+                self.execution_phase = "postcondition_verification"
+                process_name = str(
+                    after.get("process_name")
+                    or self.uia.application_process_name(window_handle)
+                    or window_process_name(window_handle)
+                )
                 postcondition = self.desktop_registry.verify_action(
                     process_name, "set_value", result, after,
                     requested_value=value,
@@ -1908,15 +2672,40 @@ class AgentRuntime:
         except Exception as exc:
             return {"ok": False, "failure_kind": "browser_backend_unavailable",
                     "error": f"The local browser backend could not be prepared: {exc}"}
-        if self._browser_session is None:
-            self._browser_session = BrowserExecutionSession(
-                PlaywrightMCPBackend(self.mcp),
-                max_action_steps=20,
-                handoff_timeout_seconds=self.BROWSER_HANDOFF_TIMEOUT_SECONDS,
-                on_state_action=self._publish_browser_activity,
-                locator_key=self.browser_cache.key,
+        self._publish_browser_status("running")
+        result = self._ensure_browser_session().execute(arguments.get("actions"))
+        recovery_kind = self._browser_recovery_failure_kind(result)
+        if recovery_kind:
+            # A transport timeout/close can happen after a state action has
+            # already reached the browser.  Reconnect at most once, report the
+            # fresh-observation requirement, and never replay this batch.
+            if self._browser_recovery_attempts >= 1:
+                result = {
+                    **(result if isinstance(result, dict) else {}),
+                    "ok": False,
+                    "failure_kind": "browser_mcp_recovery_exhausted",
+                    "error": "The browser MCP recovery budget was exhausted; the task is blocked.",
+                    "recovery_attempts": self._browser_recovery_attempts,
+                    "requires_reobservation": False,
+                }
+            else:
+                result = {**result, "failure_kind": recovery_kind,
+                          "requires_reobservation": True}
+                self._browser_recovery_attempts += 1
+                self._reconnect_browser_mcp()
+                result["recovery_attempts"] = self._browser_recovery_attempts
+        if result.get("ok") and (result.get("verification") or result.get("extraction")):
+            self._publish_browser_status("verifying")
+        elif not result.get("ok"):
+            detail = self._safe_browser_failure_detail(result)
+            self._publish_browser_status(
+                "blocked" if result.get("failure_kind") in {
+                    "browser_no_progress", "browser_handoff_required",
+                    "browser_mcp_recovery_exhausted",
+                } else "failed",
+                failure_kind=str(result.get("failure_kind") or "browser_task_unverified"),
+                detail=detail or None,
             )
-        result = self._browser_session.execute(arguments.get("actions"))
         self._record_browser_stage_result(result)
         return result
 
@@ -1944,6 +2733,7 @@ class AgentRuntime:
             self.ui.put(("ctx", self.context.usage_percent()))
         self._task_authorized_until = 0.0
         self.ui.put(("delta", answer))
+        self._publish_browser_status("completed")
         if not ephemeral:
             self._finish_task("completed")
 
@@ -1954,6 +2744,16 @@ class AgentRuntime:
         if self._browser_stage_verified:
             return
         self._browser_stage_verified = bool(result.get("postcondition_passed") is True)
+        if not self._browser_stage_verified:
+            self._verified_browser_fields = {}
+            return
+        extraction = result.get("extraction")
+        fields = extraction.get("fields") if isinstance(extraction, dict) else None
+        self._verified_browser_fields = {
+            key: str(value)[:400]
+            for key, value in (fields.items() if isinstance(fields, dict) else ())
+            if key in CrossDomainAdapters.ALLOWED_FIELDS and str(value).strip()
+        }
 
     def _run_cached_browser_task(self, intent: Any, entry: Any, *, ephemeral: bool = False) -> dict[str, Any]:
         """Replay one persisted, read-only browser workflow through the same backend."""
@@ -1977,14 +2777,23 @@ class AgentRuntime:
                     "execution_source": "cache", "cache_status": "fallback",
                     "model_fallback": True, "postcondition_passed": False}
         self._browser_session = BrowserExecutionSession(
-            PlaywrightMCPBackend(self.mcp),
+            PlaywrightMCPBackend(self.mcp, timeout_getter=self._browser_tool_timeout),
             max_action_steps=20,
             handoff_timeout_seconds=self.BROWSER_HANDOFF_TIMEOUT_SECONDS,
             on_state_action=self._publish_browser_activity,
             locator_key=self.browser_cache.key,
         )
+        self._publish_browser_status("running")
         status = self._browser_cache_status if self._browser_cache_status in {"exact_hit", "template_hit"} else "hit"
         result = self._browser_session.execute_cached_search(intent, entry.template, cache_status=status)
+        if result.get("ok") and (result.get("verification") or result.get("extraction")):
+            self._publish_browser_status("verifying")
+        elif not result.get("ok"):
+            self._publish_browser_status(
+                "blocked" if result.get("failure_kind") in {"browser_no_progress", "browser_handoff_required"}
+                else "failed",
+                failure_kind=str(result.get("failure_kind") or "browser_task_unverified"),
+            )
         safe_arguments = {"actions": [
             {"action": str(step.get("action") or "")}
             for step in entry.template.get("steps", [])
@@ -2063,16 +2872,54 @@ class AgentRuntime:
         publisher is best effort so an unavailable indicator can never change the
         tool's execution or result semantics.
         """
+        is_state_action = self._is_state_action(name, arguments)
+        previous_phase = self.execution_phase
+        if is_state_action:
+            action_signature = self._action_signature(name, arguments)
+            if action_signature == self._blocked_replay_signature:
+                self.action_replayed = True
+                self._blocked_replay_attempts += 1
+                if self._blocked_replay_attempts > 1:
+                    self._cancelled.set()
+                    self._finish_task("blocked", failure_kind="duplicate_prevented")
+                return {
+                    "ok": False,
+                    "failure_kind": "duplicate_action_prevented",
+                    "error": "The last timed-out action cannot be replayed; use the fresh observation.",
+                    "replayed": False,
+                }
+            if self._blocked_replay_signature and action_signature != self._blocked_replay_signature:
+                self._blocked_replay_signature = None
+                self._blocked_replay_attempts = 0
+            self.turn_action_dispatched = True
+            self.execution_phase = "tool_execution"
+            self._last_action_name = name
+            self._last_action_arguments = dict(arguments)
+            self._last_action_signature = action_signature
         if name not in DESKTOP_ACTIVITY_TOOLS:
-            return self._run_local_tool(name, arguments)
+            try:
+                result = self._run_local_tool(name, arguments)
+                if is_state_action:
+                    self._last_action_result = result if isinstance(result, dict) else {}
+                return result
+            finally:
+                if is_state_action and self._execution_deadline is not None and not self._cancelled.is_set():
+                    self.execution_phase = "provider_first_response"
+                elif not is_state_action:
+                    self.execution_phase = previous_phase
 
         self._next_desktop_activity_id += 1
         activity_id = self._next_desktop_activity_id
         self._publish_desktop_activity("begin", name, activity_id)
         try:
-            return self._run_local_tool(name, arguments)
+            result = self._run_local_tool(name, arguments)
+            if is_state_action:
+                self._last_action_result = result if isinstance(result, dict) else {}
+            return result
         finally:
             self._publish_desktop_activity("end", name, activity_id)
+            if is_state_action and self._execution_deadline is not None and not self._cancelled.is_set():
+                self.execution_phase = "provider_first_response"
 
     def _publish_desktop_activity(self, phase: str, tool: str, activity_id: int) -> None:
         """Publish only the safe fields needed by the local UI indicator."""
@@ -2099,6 +2946,8 @@ class AgentRuntime:
                                                    "open", "launch", "start", "click", "type", "press", "hotkey"))
 
     def _summary(self, name: str, arguments: dict[str, Any]) -> str:
+        if name == "browser_action_batch" and self._browser_batch_has_high_risk_target(arguments):
+            return "Authorize high-risk browser action (submit, login, upload, purchase, or delete)"
         if self.mcp and self.mcp.owns(name) and hasattr(self.mcp, "command_summary"):
             return self.mcp.command_summary(name, arguments)
         if name == "shell_run":

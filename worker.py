@@ -1031,6 +1031,12 @@ class CodexWorker(threading.Thread):
             proc, self._proc = self._proc, None
         if proc and proc.poll() is None:
             self._terminate_process_tree(proc)
+        close = getattr(self._agent, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     @staticmethod
     def _terminate_process_tree(proc: subprocess.Popen[str]):

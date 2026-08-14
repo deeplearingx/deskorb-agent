@@ -4601,6 +4601,32 @@ class Overlay:
             self._handle_meeting_minutes_event(kind[len("meeting_minutes_"):], payload)
         elif kind == "status":
             self._set_status(str(payload))
+        elif kind == "browser_status":
+            info = payload if isinstance(payload, dict) else {"phase": str(payload)}
+            phase = str(info.get("phase") or "").strip().lower()
+            labels = {
+                "waiting_confirmation": "browser: waiting for confirmation",
+                "starting": "browser: starting…",
+                "visible": "browser: window visible",
+                "ready": "browser: ready",
+                "running": "browser: running",
+                "verifying": "browser: verifying evidence…",
+                "completed": "browser: completed",
+                "blocked": "browser: blocked; manual review needed",
+                "failed": "browser: failed",
+            }
+            if phase in labels:
+                self._set_status(labels[phase])
+            if phase in {"failed", "blocked"} and info.get("failure_kind"):
+                kind = str(info["failure_kind"])[:80]
+                detail = str(info.get("detail") or "").strip()[:160]
+                suffix = f"：{detail}" if detail else ""
+                self.add_err(f"浏览器任务未完成（{kind}）{suffix}。")
+            if phase == "ready" and info.get("detail"):
+                # Windows can deny foreground activation.  The browser remains
+                # open; give the user a one-shot, safe recovery hint instead of
+                # repeatedly stealing focus.
+                self.add_sys("浏览器已打开；如窗口未前置，请从任务栏切换到浏览器。")
         elif kind == "permission_mode":
             self._apply_permission_mode(str(payload))
         elif kind == "system":

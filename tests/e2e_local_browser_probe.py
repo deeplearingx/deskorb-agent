@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 import json
 import re
 import sys
@@ -26,6 +27,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from agent_runtime import AgentRuntime
 from config import API_BASE_URL, API_MODEL, API_PROXY_URL, API_TIMEOUT, MODEL_PROVIDER
+from task_runtime import ExecutionDeadline, classify_failure
 
 
 ROOT = Path(__file__).with_name("fixtures") / "web"
@@ -114,10 +116,18 @@ def _run_turn_bounded(runtime: AgentRuntime, text: str, timeout_seconds: int | N
     """
     timeout = max(1, int(timeout_seconds if timeout_seconds is not None else API_TIMEOUT + 5))
     errors: list[BaseException] = []
+    deadline = ExecutionDeadline(timeout)
 
     def invoke() -> None:
         try:
-            runtime.run_turn(text, [])
+            parameters = inspect.signature(runtime.run_turn).parameters
+            supports_deadline = "deadline" in parameters or any(
+                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+            )
+            if supports_deadline:
+                runtime.run_turn(text, [], deadline=deadline)
+            else:
+                runtime.run_turn(text, [])
         except BaseException as exc:  # surfaced as a bounded failure category below
             errors.append(exc)
 
@@ -127,9 +137,25 @@ def _run_turn_bounded(runtime: AgentRuntime, text: str, timeout_seconds: int | N
     if worker.is_alive():
         runtime.interrupt()
         worker.join(2)
-        return False, "provider_or_tool_timeout"
+        try:
+            runtime.last_deadline_snapshot = deadline.snapshot()
+        except Exception:
+            pass
+        phase = str(getattr(runtime, "execution_phase", "") or "")
+        if phase == "tool_execution":
+            failure = "tool_execution_timeout"
+        elif phase == "desktop_observation":
+            failure = "desktop_observation_timeout"
+        elif phase == "postcondition_verification":
+            failure = "postcondition_verification_timeout"
+        elif bool(getattr(runtime, "turn_action_dispatched", False)):
+            failure = "provider_timeout_after_tools"
+        else:
+            failure = "provider_timeout_before_tools"
+        return False, failure
     if errors:
-        return False, type(errors[0]).__name__.lower()
+        category = classify_failure(str(errors[0]))
+        return False, category if category != "unknown" else type(errors[0]).__name__.lower()
     return True, None
 
 

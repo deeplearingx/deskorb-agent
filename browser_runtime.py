@@ -8,6 +8,7 @@ needed, but state fingerprints, refs, and extraction history stay in memory.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import secrets
 import time
@@ -45,8 +46,9 @@ class PlaywrightMCPBackend:
         "extract": "mcp_playwright_browser_snapshot",
     }
 
-    def __init__(self, bridge: Any):
+    def __init__(self, bridge: Any, *, timeout_getter: Callable[[], float | None] | None = None):
         self.bridge = bridge
+        self.timeout_getter = timeout_getter
 
     def call(self, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if action == "verify":
@@ -62,6 +64,26 @@ class PlaywrightMCPBackend:
         if action in STATE_CHANGING_ACTIONS:
             payload.setdefault("_deskorb_risk_level", "normal")
             payload.setdefault("_deskorb_risk_reason", "bounded browser task action")
+        timeout = self.timeout_getter() if callable(self.timeout_getter) else None
+        if timeout is not None and float(timeout) <= 0:
+            return {"ok": False, "failure_kind": "tool_execution_timeout",
+                    "error": "The task deadline was exhausted before the browser action started."}
+        if timeout is None:
+            return self.bridge.call(tool_name, payload)
+        try:
+            parameters = inspect.signature(self.bridge.call).parameters
+            supports_timeout = (
+                "timeout_seconds" in parameters
+                or any(item.kind is inspect.Parameter.VAR_KEYWORD
+                       for item in parameters.values())
+            )
+        except (TypeError, ValueError):
+            supports_timeout = True
+        if supports_timeout:
+            return self.bridge.call(tool_name, payload, timeout_seconds=float(timeout))
+        # Small in-process bridges used by embedders may retain the legacy
+        # two-argument call signature; the runtime still keeps its outer
+        # deadline and fail-closed semantics.
         return self.bridge.call(tool_name, payload)
 
     @staticmethod
@@ -118,6 +140,10 @@ class PlaywrightMCPBackend:
 
 class BrowserExecutionSession:
     """Execute bounded semantic browser batches with fail-closed recovery."""
+
+    _REOBSERVATION_FAILURES = frozenset({
+        "browser_mcp_connection_failed", "tool_execution_timeout",
+    })
 
     def __init__(self, backend: BrowserBackend, *, max_action_steps: int = 20,
                  handoff_timeout_seconds: int = 120, clock=time.monotonic,
@@ -222,15 +248,24 @@ class BrowserExecutionSession:
         if isinstance(value, list) and self._observation_id:
             prepared: list[Any] = []
             for item in value:
-                if (isinstance(item, dict) and str(item.get("action") or "").strip().lower() == "switch_tab"
-                        and isinstance(item.get("arguments"), dict)
-                        and not str(item["arguments"].get("observation_id") or "").strip()):
-                    prepared.append({
-                        **item,
-                        "arguments": {**item["arguments"], "observation_id": self._observation_id},
-                    })
-                else:
-                    prepared.append(item)
+                if (isinstance(item, dict)
+                        and str(item.get("action") or "").strip().lower() == "switch_tab"):
+                    nested = item.get("arguments")
+                    if isinstance(nested, dict) and not str(nested.get("observation_id") or "").strip():
+                        prepared.append({
+                            **item,
+                            "arguments": {**nested, "observation_id": self._observation_id},
+                        })
+                        continue
+                    # Responses-compatible gateways sometimes flatten the
+                    # arguments object into the action item.  Keep the same
+                    # harmless tab-switch binding as the nested form, while
+                    # leaving malformed non-object ``arguments`` untouched so
+                    # the validator can reject it explicitly.
+                    if nested is None and not str(item.get("observation_id") or "").strip():
+                        prepared.append({**item, "observation_id": self._observation_id})
+                        continue
+                prepared.append(item)
             value = prepared
         actions, error = validate_browser_action_batch(value)
         if error:
@@ -315,12 +350,15 @@ class BrowserExecutionSession:
     def _observe(self, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
             result = self.backend.call("snapshot", arguments)
-        except Exception:
-            return self._failure(
-                "browser_backend_failure",
-                "The local browser backend failed while obtaining a fresh observation.",
-                requires_reobservation=True,
-            )
+        except Exception as exc:
+            failure_kind = self._classify_backend_failure_kind(str(exc))
+            failure = self._backend_failure({
+                "ok": False,
+                "failure_kind": failure_kind,
+                "error": self._backend_failure_message(failure_kind, phase="observation"),
+            })
+            failure.setdefault("requires_reobservation", True)
+            return failure
         if not isinstance(result, dict):
             return self._failure(
                 "browser_backend_failure",
@@ -492,9 +530,13 @@ class BrowserExecutionSession:
         result: dict[str, Any] = {"ok": False, "failure_kind": "browser_backend_failure"}
         try:
             result = self.backend.call(action.action, action.arguments)
-        except Exception:
-            result = {"ok": False, "failure_kind": "browser_backend_failure",
-                      "error": "The local browser backend failed while executing the action."}
+        except Exception as exc:
+            failure_kind = self._classify_backend_failure_kind(str(exc))
+            result = {
+                "ok": False,
+                "failure_kind": failure_kind,
+                "error": self._backend_failure_message(failure_kind, phase="action"),
+            }
         finally:
             self._emit_state_activity("end", action.action)
         if not isinstance(result, dict):
@@ -1128,9 +1170,42 @@ class BrowserExecutionSession:
         return "read_the_bounded_error_and_retry_once_with_the_semantic_schema"
 
     @staticmethod
-    def _backend_failure(result: dict[str, Any]) -> dict[str, Any]:
-        return {**result, "ok": False,
-                "failure_kind": str(result.get("failure_kind") or "browser_tool_failure")}
+    def _classify_backend_failure_kind(value: Any) -> str:
+        """Map local MCP failures to stable, observation-safe categories."""
+        if isinstance(value, dict):
+            explicit = str(value.get("failure_kind") or "").strip()
+            text = " ".join(str(value.get(key) or "") for key in ("error", "message")).lower()
+        else:
+            explicit = ""
+            text = str(value or "").lower()
+        if explicit == "tool_execution_timeout" or any(marker in text for marker in (
+                "timed out", "timeout", "deadline was exhausted", "bounded budget")):
+            return "tool_execution_timeout"
+        if explicit == "browser_mcp_connection_failed" or any(marker in text for marker in (
+                "target closed", "browser closed", "page closed", "context closed",
+                "connection closed", "disconnected", "broken pipe", "transport",
+                "process exited", "server exited", "exited while", "not running",
+                "stopped while")):
+            return "browser_mcp_connection_failed"
+        return explicit or "browser_backend_failure"
+
+    @staticmethod
+    def _backend_failure_message(failure_kind: str, *, phase: str) -> str:
+        if failure_kind == "tool_execution_timeout":
+            return f"The browser {phase} exceeded its bounded execution budget."
+        if failure_kind == "browser_mcp_connection_failed":
+            return "The local browser MCP connection closed; obtain a fresh browser observation before retrying."
+        if phase == "observation":
+            return "The local browser backend failed while obtaining a fresh observation."
+        return "The local browser backend failed while executing the action."
+
+    def _backend_failure(self, result: dict[str, Any]) -> dict[str, Any]:
+        failure_kind = self._classify_backend_failure_kind(result)
+        failed = {**result, "ok": False, "failure_kind": failure_kind}
+        if failure_kind in self._REOBSERVATION_FAILURES:
+            self._reobservation_required = True
+            failed["requires_reobservation"] = True
+        return failed
 
     @staticmethod
     def _fingerprint(content: Any) -> str:

@@ -6,3 +6,5 @@ dependencies:
   - pip
   - pip:
       - -r requirements.txt
+      - pytest>=8.0
+      - typing-extensions>=4.12

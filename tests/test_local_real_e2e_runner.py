@@ -137,6 +137,21 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         self.assertEqual(len(result["trace_hash"]), 64)
         self.assertNotIn("ready_to_choose", json.dumps(result))
 
+    def test_event_normalization_keeps_only_hashed_provider_request_identity(self):
+        result = normalize_runtime_events([
+            ("execution_timing", {
+                "provider_request_id_hash": "a" * 64,
+                "execution_phase": "provider_first_response",
+                "deadline": {"total_budget_ms": 1000, "phases": []},
+            }),
+        ], started_at=0.0, finished_at=1.0)
+        self.assertEqual(result["provider_request_id_hash"], "a" * 64)
+
+        invalid = normalize_runtime_events([
+            ("execution_timing", {"provider_request_id_hash": "raw-provider-request-id"}),
+        ], started_at=0.0, finished_at=1.0)
+        self.assertIsNone(invalid["provider_request_id_hash"])
+
     def test_finish_record_adds_environment_and_stability_metrics(self):
         case = next(item for item in load_matrix_cases() if item["id"] == "research-001")
         baselines = load_step_baselines(Path(__file__).with_name("e2e_step_baselines.json"))
@@ -520,6 +535,82 @@ class LocalRealE2ERunnerTests(unittest.TestCase):
         ok, failure = _run_turn_bounded(FakeRuntime(), "continue the task", 1)
         self.assertFalse(ok)
         self.assertEqual(failure, "transient_network")
+
+    def test_bounded_turn_classifies_a_stuck_desktop_tool_separately(self):
+        class FakeRuntime:
+            execution_phase = "tool_execution"
+            turn_action_dispatched = True
+
+            def __init__(self):
+                self.stop = threading.Event()
+
+            def run_turn(self, _text, _images, **_kwargs):
+                self.stop.wait(2.0)
+
+            def interrupt(self):
+                self.stop.set()
+
+        ok, failure = _run_turn_bounded(FakeRuntime(), "continue the task", 0.01)
+        self.assertFalse(ok)
+        self.assertEqual(failure, "tool_execution_timeout")
+
+    def test_bounded_turn_classifies_provider_timeout_after_an_action(self):
+        class FakeRuntime:
+            execution_phase = "provider_first_response"
+            turn_action_dispatched = True
+
+            def __init__(self):
+                self.stop = threading.Event()
+
+            def run_turn(self, _text, _images, **_kwargs):
+                self.stop.wait(2.0)
+
+            def interrupt(self):
+                self.stop.set()
+
+        ok, failure = _run_turn_bounded(FakeRuntime(), "continue the task", 0.01)
+        self.assertFalse(ok)
+        self.assertEqual(failure, "provider_timeout_after_tools")
+
+    def test_timeout_runs_one_safe_recovery_before_model_continuation(self):
+        class FakeRuntime:
+            def __init__(self):
+                self.ui = Queue()
+                self.recovery_calls = []
+
+            def interrupt(self):
+                return None
+
+            def recover_after_timeout(self, failure_kind):
+                self.recovery_calls.append(failure_kind)
+                self.ui.put(("tool_result", {
+                    "tool": "desktop_uia_observe", "ok": True,
+                    "recovery_attempted": True,
+                }))
+                return {
+                    "resume_required": True,
+                    "resume_prompt": "先重新观察当前状态，不要重复上一动作。",
+                }
+
+        runtime = FakeRuntime()
+        calls = []
+
+        def bounded(_runtime, text, _timeout):
+            calls.append(text)
+            if len(calls) == 1:
+                return False, "provider_timeout_after_tools"
+            runtime.ui.put(("task_progress", {"terminal": "completed", "verified": True}))
+            return True, None
+
+        with patch("local_real_e2e_runner._run_turn_bounded", side_effect=bounded):
+            metrics, failure = _run_runtime_task(
+                runtime, "完成隔离任务", 5, 0, False, allow_automatic_confirmation=True,
+            )
+
+        self.assertIsNone(failure)
+        self.assertEqual(runtime.recovery_calls, ["provider_timeout_after_tools"])
+        self.assertEqual(calls, ["完成隔离任务", "先重新观察当前状态，不要重复上一动作。"])
+        self.assertTrue(metrics["completed"])
 
 
 if __name__ == "__main__":

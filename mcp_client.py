@@ -15,6 +15,7 @@ import sys
 import threading
 import re
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,38 @@ def local_playwright_diagnostics() -> list[str]:
 
 class MCPError(RuntimeError):
     """A user-facing error from a local MCP process."""
+
+
+def _safe_mcp_diagnostic(value: Any) -> str:
+    """Keep process diagnostics useful without retaining page data or secrets."""
+    text = str(value or "").replace("\x00", " ").strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?i)\b(?:https?|file)://[^\s\"'<>]+", "<url>", text)
+    def redact_secret(match: re.Match[str]) -> str:
+        prefix = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
+        return f"{prefix}=<redacted>"
+
+    text = re.sub(r"(?i)\b(?:authorization|cookie|token|api[_-]?key|password|secret)\s*[:=]\s*[^\s,;]+",
+                  redact_secret, text)
+    text = re.sub(r"(?i)\b[A-Za-z]:\\[^\s\"'<>]+", "<path>", text)
+    text = text[:240]
+    # Chromium/Playwright can echo arbitrary page text on stderr.  Retain only
+    # bounded diagnostic vocabulary rather than copying that text into memory.
+    allowed = {
+        "error", "warn", "warning", "failed", "failure", "launch", "browser", "chromium",
+        "playwright", "mcp", "node", "process", "server", "start", "started", "stopped",
+        "exit", "exited", "initialize", "initialization", "tool", "timeout", "timed", "out",
+        "missing", "closed", "disconnect", "disconnected", "transport", "error:",
+    }
+    tokens: list[str] = []
+    for token in text.split():
+        cleaned = token.strip("[](){}.,;:")
+        if token.startswith("<") and token.endswith(">"):
+            tokens.append(token)
+        elif cleaned.casefold() in allowed or cleaned.isdigit():
+            tokens.append(token)
+    return " ".join(tokens)[:240]
 
 
 @dataclass(frozen=True)
@@ -302,6 +335,8 @@ class StdioMCPClient:
     """Serial JSON-RPC client for one local MCP stdio server."""
 
     PROTOCOL_VERSION = "2024-11-05"
+    MAX_STDERR_LINES = 80
+    MAX_STDERR_BYTES = 16 * 1024
 
     def __init__(self, spec: MCPServerSpec, *, timeout_seconds: int = 30):
         self.spec = spec
@@ -310,11 +345,87 @@ class StdioMCPClient:
         self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self._lock = threading.RLock()
         self._next_id = 1
+        self._stderr_lines: list[str] = []
+        self._stderr_bytes = 0
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
+        self._startup_phase = "not_started"
+        self._startup_error_code = ""
+        self._exit_code: int | None = None
+        self._started_at = 0.0
 
-    def start(self) -> None:
+    @property
+    def process_id(self) -> int | None:
+        process = self._process
+        try:
+            return int(process.pid) if process and process.poll() is None else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @property
+    def startup_phase(self) -> str:
+        return self._startup_phase
+
+    @property
+    def startup_error_code(self) -> str:
+        return self._startup_error_code
+
+    @property
+    def exit_code(self) -> int | None:
+        try:
+            return self._process.poll() if self._process is not None else self._exit_code
+        except Exception:
+            return self._exit_code
+
+    @property
+    def stderr_diagnostics(self) -> tuple[str, ...]:
+        with self._stderr_lock:
+            return tuple(self._stderr_lines)
+
+    def diagnostics(self) -> dict[str, Any]:
+        process = self._process
+        exit_code = self._exit_code
+        if process is not None:
+            try:
+                exit_code = process.poll()
+            except Exception:
+                pass
+        with self._stderr_lock:
+            stderr = list(self._stderr_lines)
+        return {
+            "server": self.spec.name,
+            "phase": self._startup_phase,
+            "running": bool(process and process.poll() is None),
+            "exit_code": exit_code,
+            "stderr": stderr,
+        }
+
+    def _capture_stderr_line(self, line: str) -> None:
+        safe = _safe_mcp_diagnostic(line)
+        if not safe:
+            return
+        encoded_size = len(safe.encode("utf-8", errors="replace"))
+        if encoded_size > self.MAX_STDERR_BYTES:
+            safe = safe[: self.MAX_STDERR_BYTES]
+            encoded_size = len(safe.encode("utf-8", errors="replace"))
+        with self._stderr_lock:
+            while (self._stderr_lines and
+                   (len(self._stderr_lines) >= self.MAX_STDERR_LINES or
+                    self._stderr_bytes + encoded_size > self.MAX_STDERR_BYTES)):
+                removed = self._stderr_lines.pop(0)
+                self._stderr_bytes -= len(removed.encode("utf-8", errors="replace"))
+            if len(self._stderr_lines) < self.MAX_STDERR_LINES:
+                self._stderr_lines.append(safe)
+                self._stderr_bytes += encoded_size
+
+    def start(self, timeout_seconds: int | float | None = None) -> None:
         with self._lock:
             if self._process and self._process.poll() is None:
                 return
+            self._startup_phase = "starting_process"
+            self._startup_error_code = ""
+            self._exit_code = None
+            self._started_at = time.monotonic()
             managed_output_dir = _managed_playwright_output_dir(self.spec)
             created_output_dir = False
             if managed_output_dir is not None and not managed_output_dir.exists():
@@ -322,6 +433,8 @@ class StdioMCPClient:
                     managed_output_dir.mkdir(parents=True, exist_ok=False)
                     created_output_dir = True
                 except OSError as exc:
+                    self._startup_phase = "failed"
+                    self._startup_error_code = "browser_mcp_start_failed"
                     raise MCPError(
                         f"Could not prepare the private Playwright output directory: {exc}"
                     ) from exc
@@ -334,32 +447,60 @@ class StdioMCPClient:
             try:
                 self._process = subprocess.Popen(
                     [command, *self.spec.args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
                     cwd=self.spec.cwd, env=env, creationflags=flags,
                 )
             except OSError as exc:
+                self._startup_phase = "failed"
+                self._startup_error_code = "browser_mcp_start_failed"
                 if created_output_dir:
                     shutil.rmtree(managed_output_dir, ignore_errors=True)
                 raise MCPError(f"Could not start MCP server {self.spec.name}: {exc}") from exc
+            self._startup_phase = "initializing"
             threading.Thread(target=self._read_stdout, daemon=True, name=f"mcp-{self.spec.name}").start()
-            self._request("initialize", {
-                "protocolVersion": self.PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "deskorb-agent", "version": "0.2.0"},
-            })
+            self._stderr_thread = threading.Thread(
+                target=self._read_stderr, daemon=True, name=f"mcp-stderr-{self.spec.name}"
+            )
+            self._stderr_thread.start()
+            try:
+                self._request("initialize", {
+                    "protocolVersion": self.PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "deskorb-agent", "version": "0.2.0"},
+                }, timeout_seconds=timeout_seconds)
+            except MCPError:
+                self._startup_phase = "failed"
+                self._startup_error_code = "browser_mcp_start_failed"
+                try:
+                    self._exit_code = self._process.poll() if self._process else None
+                except Exception:
+                    self._exit_code = None
+                # Do not leave a half-initialized node process or its private
+                # Playwright output directory behind after a bounded startup
+                # failure.  The bridge can retry once by rediscovering tools.
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                if created_output_dir and managed_output_dir is not None:
+                    shutil.rmtree(managed_output_dir, ignore_errors=True)
+                raise
             self._notify("notifications/initialized", {})
+            self._startup_phase = "ready"
 
-    def list_tools(self) -> list[dict[str, Any]]:
-        self.start()
-        result = self._request("tools/list", {})
+    def list_tools(self, timeout_seconds: int | float | None = None) -> list[dict[str, Any]]:
+        self.start(timeout_seconds=timeout_seconds)
+        result = self._request("tools/list", {}, timeout_seconds=timeout_seconds)
         tools = result.get("tools", []) if isinstance(result, dict) else []
         if not isinstance(tools, list):
             raise MCPError(f"MCP server {self.spec.name} returned an invalid tool list.")
         return [tool for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        self.start()
-        result = self._request("tools/call", {"name": name, "arguments": arguments})
+    def call_tool(self, name: str, arguments: dict[str, Any],
+                  timeout_seconds: int | float | None = None) -> dict[str, Any]:
+        self.start(timeout_seconds=timeout_seconds)
+        result = self._request("tools/call", {"name": name, "arguments": arguments},
+                               timeout_seconds=timeout_seconds)
         return result if isinstance(result, dict) else {"content": result}
 
     def close(self) -> None:
@@ -375,6 +516,12 @@ class StdioMCPClient:
                     process.kill()
                 except Exception:
                     pass
+            try:
+                self._exit_code = process.poll()
+            except Exception:
+                self._exit_code = None
+            if self._startup_phase not in {"failed", "not_started"}:
+                self._startup_phase = "closed"
 
     def _read_stdout(self) -> None:
         process = self._process
@@ -388,10 +535,28 @@ class StdioMCPClient:
             if isinstance(message, dict):
                 self._messages.put(message)
 
-    def _request(self, method: str, params: dict[str, Any]) -> Any:
+    def _read_stderr(self) -> None:
+        process = self._process
+        if not process or not process.stderr:
+            return
+        try:
+            for line in process.stderr:
+                self._capture_stderr_line(line)
+        except (OSError, ValueError):
+            return
+
+    def _request(self, method: str, params: dict[str, Any],
+                 *, timeout_seconds: int | float | None = None) -> Any:
         process = self._process
         if not process or not process.stdin:
             raise MCPError(f"MCP server {self.spec.name} is not running.")
+        try:
+            exit_code = process.poll()
+        except Exception:
+            exit_code = None
+        if exit_code is not None:
+            self._exit_code = exit_code
+            raise MCPError(f"MCP server {self.spec.name} exited before {method}.")
         request_id = self._next_id
         self._next_id += 1
         try:
@@ -402,7 +567,15 @@ class StdioMCPClient:
             raise MCPError(f"MCP server {self.spec.name} stopped while sending {method}.") from exc
         while True:
             try:
-                message = self._messages.get(timeout=self.timeout_seconds)
+                exit_code = process.poll()
+            except Exception:
+                exit_code = None
+            if exit_code is not None:
+                self._exit_code = exit_code
+                raise MCPError(f"MCP server {self.spec.name} exited while running {method}.")
+            try:
+                timeout = self.timeout_seconds if timeout_seconds is None else max(0.1, float(timeout_seconds))
+                message = self._messages.get(timeout=timeout)
             except queue.Empty as exc:
                 raise MCPError(f"MCP server {self.spec.name} timed out while running {method}.") from exc
             if message.get("id") != request_id:
@@ -432,6 +605,9 @@ class MCPToolBridge:
                      "terminal", "command", "execute", "file_write", "filesystem", "download")
     HIGH_RISK_WORDS = ("upload", "drop", "handle_dialog", "apply", "restore", "submit",
                        "send", "purchase", "delete", "permission", "login")
+    INTERNAL_BACKEND_CAPABILITIES = frozenset({
+        "desktop_uia", "windows_ui_automation", "fla_ui", "flaui",
+    })
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
                  enable_officecli: bool = True, officecli_binary: str | Path | None = None,
@@ -488,7 +664,8 @@ class MCPToolBridge:
                 return "--isolated" in spec.args
         return False
 
-    def schemas(self, server_names: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    def schemas(self, server_names: Iterable[str] | None = None,
+                timeout_seconds: int | float | None = None) -> list[dict[str, Any]]:
         """Return schemas for selected servers, starting only those servers.
 
         ``None`` retains the public bridge's legacy behaviour and discovers all
@@ -496,7 +673,7 @@ class MCPToolBridge:
         to the current task.
         """
         selected = self._selected_servers(server_names)
-        self._discover(selected)
+        self._discover(selected, timeout_seconds=timeout_seconds)
         schemas: list[dict[str, Any]] = []
         for exposed, (server, original, schema, action) in self._tools.items():
             if server not in selected:
@@ -535,6 +712,26 @@ class MCPToolBridge:
             result.append(schema)
         return result
 
+    def browser_process_id(self) -> int | None:
+        """Return the local Playwright MCP root PID, without exposing process args."""
+        client = self.clients.get("playwright")
+        value = getattr(client, "process_id", None) if client is not None else None
+        value = value() if callable(value) else value
+        try:
+            return int(value) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def browser_diagnostics(self) -> dict[str, Any]:
+        """Return bounded, privacy-safe diagnostics for the browser server."""
+        client = self.clients.get("playwright")
+        if client is None:
+            return {"server": "playwright", "phase": "not_configured", "running": False,
+                    "exit_code": None, "stderr": []}
+        getter = getattr(client, "diagnostics", None)
+        value = getter() if callable(getter) else {}
+        return value if isinstance(value, dict) else {"server": "playwright"}
+
     def server_catalog(self) -> list[dict[str, Any]]:
         """Safe, process-free capability hints for intent routing.
 
@@ -565,6 +762,24 @@ class MCPToolBridge:
         item = self._tools.get(exposed_name)
         return item[0] if item else None
 
+    def is_internal_backend_server(self, server_name: str | None) -> bool:
+        """Return whether a configured server is an internal runtime backend.
+
+        Internal servers may be discovered and called by a semantic adapter,
+        but their raw MCP functions must never enter the model tool schema.
+        Capability metadata is preferred; the name fallback keeps the common
+        ``windows`` FlaUI configuration safe when older config files omit it.
+        """
+        name = str(server_name or "").strip().lower()
+        spec = next((candidate for candidate in self.specs
+                     if candidate.name.lower() == name), None)
+        if spec is not None and spec.capability in self.INTERNAL_BACKEND_CAPABILITIES:
+            return True
+        return name in {"windows", "flaui", "fla-ui", "fla_ui", "windows_uia"}
+
+    def is_model_exposed_server(self, server_name: str | None) -> bool:
+        return not self.is_internal_backend_server(server_name)
+
     def is_read_only_call(self, exposed_name: str, arguments: dict[str, Any]) -> bool:
         """Classify a call whose risk depends on its OfficeCLI command verb."""
         item = self._tools.get(exposed_name)
@@ -582,7 +797,8 @@ class MCPToolBridge:
             return False
         return _officecli_command_verb(arguments.get("command")) in OFFICECLI_AUTO_APPROVE_VERBS
 
-    def call(self, exposed_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call(self, exposed_name: str, arguments: dict[str, Any],
+             timeout_seconds: int | float | None = None) -> dict[str, Any]:
         item = self._tools.get(exposed_name)
         if not item:
             return {"ok": False, "error": "Unknown MCP tool."}
@@ -602,7 +818,13 @@ class MCPToolBridge:
         if self._blocked_url(spec, clean) or self._blocked_path(spec, clean):
             return {"ok": False, "error": "MCP arguments violate the local capability boundary."}
         try:
-            result = self.clients[server].call_tool(original, clean)
+            client = self.clients[server]
+            if timeout_seconds is not None and isinstance(client, StdioMCPClient):
+                result = client.call_tool(original, clean, timeout_seconds=timeout_seconds)
+            else:
+                # In-process adapters used by tests and embedders retain the
+                # historical two-argument contract.
+                result = client.call_tool(original, clean)
         except MCPError as exc:
             message = str(exc)
             if server == "officecli":
@@ -622,7 +844,16 @@ class MCPToolBridge:
 
     def close(self) -> None:
         for client in self.clients.values():
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                # Cleanup is best effort per client; never skip the owned
+                # output-directory sweep because one adapter misbehaved.
+                continue
+        # A reconnect after a failed startup must rediscover tools on the next
+        # bounded attempt; stale discovery is not a reason to reuse a dead MCP.
+        self._discovered_servers.clear()
+        self._tools.clear()
         for output_dir in self._owned_output_dirs:
             try:
                 if output_dir.name.startswith("deskorb-playwright-output-") and output_dir.parent == Path(tempfile.gettempdir()).resolve():
@@ -654,7 +885,7 @@ class MCPToolBridge:
             return MCPServerSpec(name=server, command="", args=(), env={}, allow_safe_tools=True)
         return None
 
-    def _discover(self, servers: Iterable[str]) -> None:
+    def _discover(self, servers: Iterable[str], *, timeout_seconds: int | float | None = None) -> None:
         for server in servers:
             if server in self._discovered_servers:
                 continue
@@ -666,7 +897,13 @@ class MCPToolBridge:
             # model round; a new AgentRuntime gets a fresh attempt.
             self._discovered_servers.add(server)
             try:
-                for tool in client.list_tools():
+                try:
+                    tools = (client.list_tools(timeout_seconds=timeout_seconds)
+                             if timeout_seconds is not None else client.list_tools())
+                except TypeError:
+                    # In-process test adapters retain the original no-argument API.
+                    tools = client.list_tools()
+                for tool in tools:
                     original = str(tool["name"])
                     spec = self._spec_for_server(server)
                     if spec is None or not self._tool_allowed(spec, original):
@@ -675,7 +912,13 @@ class MCPToolBridge:
                     self._tools[exposed] = (server, original, dict(tool.get("inputSchema") or {}),
                                             self._is_action(spec, original, tool))
             except MCPError as exc:
-                self.diagnostics.append(str(exc))
+                # Keep readiness output stable and free of command lines, URLs,
+                # arguments, and process stderr.  Detailed bounded diagnostics
+                # remain available through ``browser_diagnostics``.
+                message = str(exc).lower()
+                code = ("browser_initial_snapshot_timeout" if "timed out" in message
+                        else "browser_mcp_start_failed")
+                self.diagnostics.append(code)
 
     def _is_action(self, spec: MCPServerSpec, tool_name: str,
                    tool: dict[str, Any] | None = None) -> bool:

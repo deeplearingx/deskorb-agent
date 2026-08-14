@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from real_stability_runner import (
     _browser_definition,
+    _real_desktop_adapter_case,
     _real_notepad_case,
     _safe_trace_hash,
     _stage_transition_total,
@@ -98,6 +99,17 @@ class RealStabilityRunnerTests(unittest.TestCase):
         # successful completion and never an unlabeled failure.
         from real_stability_runner import _REAL_BROWSER_SCENARIOS
         self.assertIn("flagship-browser-no-progress", _REAL_BROWSER_SCENARIOS)
+
+    def test_non_notepad_desktop_case_reports_backend_unavailable_explicitly(self):
+        scenario = next(item for item in load_flagship_scenarios()
+                        if item["id"] == "flagship-desktop-calculator")
+        with patch("local_real_e2e_runner.preflight_current_desktop",
+                   return_value={"ok": True}):
+            result = _real_desktop_adapter_case(
+                scenario, 1, working_dir=".", allow_current_desktop=True,
+            )
+        self.assertEqual(result["outcome"], "blocked")
+        self.assertEqual(result["failure_kind"], "desktop_backend_unavailable")
 
 
 if __name__ == "__main__":

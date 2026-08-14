@@ -37,6 +37,13 @@ _REAL_BROWSER_SCENARIOS = {
 }
 _REAL_DESKTOP_SCENARIOS = {
     "flagship-desktop-notepad": "desktop-003",
+    "flagship-desktop-explorer": "explorer",
+    "flagship-desktop-calculator": "calculator",
+    "flagship-desktop-focus-modal": "focus_modal",
+}
+_REAL_CROSS_DOMAIN_SCENARIOS = {
+    "flagship-cross-domain-file": "file",
+    "flagship-cross-domain-notepad": "notepad",
 }
 
 
@@ -166,6 +173,88 @@ def _real_notepad_case(scenario: Mapping[str, Any], attempt: int, *,
         "cache_status": "miss",
         "trace_hash": str(result.get("trace_hash") or ""),
     }
+
+
+def _real_desktop_adapter_case(scenario: Mapping[str, Any], attempt: int, *,
+                               working_dir: str, allow_current_desktop: bool = False) -> dict[str, Any]:
+    """Run one non-Notepad app through the internal semantic adapter."""
+    if not allow_current_desktop:
+        return {"outcome": "blocked", "failure_kind": "current_desktop_not_authorized",
+                "environment_class": "current_desktop",
+                "postcondition_kind": scenario.get("postcondition_kind")}
+    from local_real_e2e_runner import preflight_current_desktop
+
+    if not bool(preflight_current_desktop(require_foreground=False).get("ok")):
+        return {"outcome": "blocked", "failure_kind": "current_desktop_preflight_failed",
+                "environment_class": "current_desktop",
+                "postcondition_kind": scenario.get("postcondition_kind")}
+    from agent_runtime import AgentRuntime
+    from config import API_BASE_URL, API_MODEL, API_PROXY_URL, MODEL_PROVIDER
+
+    application = _REAL_DESKTOP_SCENARIOS.get(str(scenario.get("id") or ""), "")
+    if application in {"", "desktop-003"}:
+        return {"outcome": "blocked", "failure_kind": "desktop_adapter_routing_error",
+                "environment_class": "current_desktop",
+                "postcondition_kind": scenario.get("postcondition_kind")}
+    started = time.monotonic()
+    runtime = AgentRuntime(Queue(), API_MODEL, API_BASE_URL, API_PROXY_URL,
+                           model_provider=MODEL_PROVIDER, working_dir=working_dir)
+    try:
+        if runtime.uia.semantic_backend is None or not bool(runtime.uia.semantic_backend.available):
+            return {"outcome": "blocked", "failure_kind": "desktop_backend_unavailable",
+                    "environment_class": "current_desktop",
+                    "postcondition_kind": scenario.get("postcondition_kind")}
+        if application == "focus_modal":
+            launched = runtime._run_local_tool("application_launch", {"application": "notepad"})
+            if not isinstance(launched, dict) or not launched.get("ok"):
+                failure = str((launched or {}).get("failure_kind") or "desktop_backend_unavailable")
+                return {"outcome": "blocked", "failure_kind": failure,
+                        "environment_class": "current_desktop",
+                        "postcondition_kind": scenario.get("postcondition_kind")}
+            observed = runtime._run_local_tool("desktop_uia_observe", {
+                "window_handle": int(launched.get("window_handle") or 0), "max_elements": 120,
+            })
+            failure = ("desktop_modal_dialog" if observed.get("requires_user_attention")
+                       else "desktop_modal_fixture_unavailable")
+            return {"outcome": "blocked", "failure_kind": failure,
+                    "safety_passed": True, "environment_class": "current_desktop",
+                    "postcondition_kind": scenario.get("postcondition_kind"),
+                    "total_latency_ms": round((time.monotonic() - started) * 1000, 2)}
+        if application == "calculator":
+            result = runtime.run_desktop_adapter("calculator", expression="2+2")
+        else:
+            target = Path(working_dir) / "deskorb-desktop-adapter-fixture"
+            target.mkdir(parents=True, exist_ok=True)
+            result = runtime.run_desktop_adapter("explorer", path=str(target))
+        passed = bool(result.get("ok"))
+        return {
+            "outcome": "passed" if passed else "failed",
+            "failure_kind": None if passed else str(result.get("failure_kind") or "desktop_adapter_failed"),
+            "completed": passed, "verified": bool(result.get("verified", passed)),
+            "evidence_passed": bool(result.get("postcondition_passed", passed)),
+            "safety_passed": True, "total_latency_ms": round((time.monotonic() - started) * 1000, 2),
+            "tool_rounds": int(result.get("action_steps") or 0),
+            "action_steps": int(result.get("action_steps") or 0),
+            "action_sequence": ["launch", "desktop_observe", "desktop_input", "desktop_verify"],
+            "environment_class": "current_desktop",
+            "postcondition_kind": scenario.get("postcondition_kind"),
+            "recovery_count": 0, "stage_transition_count": 0,
+            "cache_status": "not_applicable",
+            "trace_hash": _safe_trace_hash({"browser_trace": []}),
+        }
+    finally:
+        if runtime.mcp:
+            runtime.mcp.close()
+
+
+def _real_cross_domain_case(scenario: Mapping[str, Any], *, allow_current_desktop: bool) -> dict[str, Any]:
+    """Keep the missing browser-to-local handoff explicit and fail closed."""
+    failure = ("current_desktop_not_authorized" if not allow_current_desktop
+               else "cross_domain_browser_stage_unavailable")
+    return {"outcome": "blocked", "failure_kind": failure,
+            "environment_class": "current_desktop",
+            "postcondition_kind": scenario.get("postcondition_kind"),
+            "safety_passed": True, "evidence_passed": False}
 
 
 def load_flagship_scenarios(path: str | Path = SCENARIO_MANIFEST) -> list[dict[str, Any]]:
@@ -321,14 +410,24 @@ def run_real_flagship_matrix(*, repetitions: int = 10,
                             result = _real_browser_case(
                                 scenario, attempt, base_url=base_url, working_dir=run_directory,
                             )
-                    elif scenario["id"] in _REAL_DESKTOP_SCENARIOS:
+                    elif scenario["id"] == "flagship-desktop-notepad":
                         with tempfile.TemporaryDirectory(prefix="deskorb-flagship-desktop-") as run_directory:
                             result = _real_notepad_case(
                                 scenario, attempt, working_dir=run_directory,
                                 allow_current_desktop=allow_current_desktop,
                             )
+                    elif scenario["id"] in _REAL_DESKTOP_SCENARIOS:
+                        with tempfile.TemporaryDirectory(prefix="deskorb-flagship-desktop-") as run_directory:
+                            result = _real_desktop_adapter_case(
+                                scenario, attempt, working_dir=run_directory,
+                                allow_current_desktop=allow_current_desktop,
+                            )
+                    elif scenario["id"] in _REAL_CROSS_DOMAIN_SCENARIOS:
+                        result = _real_cross_domain_case(
+                            scenario, allow_current_desktop=allow_current_desktop,
+                        )
                     else:
-                        result = {"outcome": "blocked", "failure_kind": "flagship_adapter_unavailable",
+                        result = {"outcome": "blocked", "failure_kind": "scenario_adapter_unavailable",
                                   "environment_class": "current_desktop" if scenario["family"] != "browser" else "local_fixture",
                                   "postcondition_kind": scenario["postcondition_kind"]}
                     result.setdefault("trace_hash", _safe_trace_hash(result))

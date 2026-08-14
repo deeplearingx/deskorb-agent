@@ -40,10 +40,11 @@ class DesktopUIA:
 
     def __init__(self, desktop_factory=None, clock=time.monotonic,
                  application_registry: DesktopApplicationRegistry | None = None,
-                 foreground_getter=None):
+                 foreground_getter=None, semantic_backend=None):
         self._desktop_factory = desktop_factory or Desktop
         self._clock = clock
         self._foreground_getter = foreground_getter or self._foreground_window
+        self._semantic_backend = semantic_backend
         self._controls: dict[str, CachedControl] = {}
         self._high_risk_controls: dict[str, float] = {}
         self._observation_fingerprints: dict[int, tuple[str, float]] = {}
@@ -55,9 +56,27 @@ class DesktopUIA:
 
     @property
     def available(self) -> bool:
+        if self._semantic_backend is not None:
+            return bool(getattr(self._semantic_backend, "available", False))
         return self._desktop_factory is not None
 
+    @property
+    def semantic_backend(self) -> Any | None:
+        return self._semantic_backend
+
+    def launch_application(self, application: str) -> dict[str, Any] | None:
+        """Launch through a configured semantic backend when one owns desktop UI."""
+        if self._semantic_backend is None:
+            return None
+        method = getattr(self._semantic_backend, "launch_application", None)
+        if not callable(method):
+            return {"ok": False, "failure_kind": "desktop_backend_unavailable",
+                    "error": "The configured desktop backend cannot launch applications."}
+        return method(application)
+
     def observe_active_window(self, hwnd: int, *, max_elements: int = 80) -> dict[str, Any]:
+        if self._semantic_backend is not None:
+            return self._semantic_backend.observe_active_window(hwnd, max_elements=max_elements)
         if not self.available:
             return {"ok": False, "error": "Windows UI Automation is unavailable. Install pywinauto and restart DeskOrb."}
         if not hwnd:
@@ -112,10 +131,14 @@ class DesktopUIA:
 
     def is_high_risk(self, control_id: str) -> bool:
         """Return the risk declared by the most recent bounded observation."""
+        if self._semantic_backend is not None:
+            return bool(self._semantic_backend.is_high_risk(control_id))
         self._prune()
         return str(control_id or "") in self._high_risk_controls
 
     def invoke(self, control_id: str, hwnd: int, observation_id: str | None = None) -> dict[str, Any]:
+        if self._semantic_backend is not None:
+            return self._semantic_backend.invoke(control_id, hwnd, observation_id)
         wrapper, error = self._valid(control_id, hwnd, observation_id)
         if error:
             return {"ok": False, "error": error}
@@ -158,6 +181,8 @@ class DesktopUIA:
 
     def set_value(self, control_id: str, hwnd: int, value: str,
                   observation_id: str | None = None) -> dict[str, Any]:
+        if self._semantic_backend is not None:
+            return self._semantic_backend.set_value(control_id, hwnd, value, observation_id)
         wrapper, error = self._valid(control_id, hwnd, observation_id)
         if error:
             return {"ok": False, "error": error}
@@ -187,6 +212,8 @@ class DesktopUIA:
     def focus_control(self, control_id: str, hwnd: int,
                       observation_id: str | None = None) -> dict[str, Any]:
         """Focus one observed control without using coordinates."""
+        if self._semantic_backend is not None:
+            return self._semantic_backend.focus_control(control_id, hwnd, observation_id)
         wrapper, error = self._valid(control_id, hwnd, observation_id)
         if error:
             return {"ok": False, "failure_kind": "desktop_uia_stale_control", "error": error}
@@ -206,6 +233,8 @@ class DesktopUIA:
 
     def control_descriptor(self, control_id: str, observation_id: str | None = None) -> dict[str, str] | None:
         """Return non-content identity fields for one observed control."""
+        if self._semantic_backend is not None:
+            return self._semantic_backend.control_descriptor(control_id, observation_id)
         item = self._controls.get(str(control_id))
         if item is None or (observation_id and str(observation_id) != item.observation_id):
             return None
@@ -222,6 +251,8 @@ class DesktopUIA:
     def find_control(self, descriptor: dict[str, str] | None,
                      observation_id: str | None = None) -> str | None:
         """Find the same semantic control in the latest observation."""
+        if self._semantic_backend is not None:
+            return self._semantic_backend.find_control(descriptor, observation_id)
         if not isinstance(descriptor, dict):
             return None
         wanted_type = str(descriptor.get("control_type") or "").casefold()
@@ -250,6 +281,8 @@ class DesktopUIA:
     def read_value(self, control_id: str, hwnd: int,
                    observation_id: str | None = None) -> dict[str, Any]:
         """Read one current control value for an exact, in-memory postcondition."""
+        if self._semantic_backend is not None:
+            return self._semantic_backend.read_value(control_id, hwnd, observation_id)
         wrapper, error = self._valid(control_id, hwnd, observation_id)
         if error:
             return {"ok": False, "failure_kind": "desktop_uia_stale_control", "error": error}
@@ -261,11 +294,26 @@ class DesktopUIA:
             "characters": len(observed) if observed is not None else 0,
         }
 
+    def application_process_name(self, hwnd: int) -> str:
+        """Return a semantic backend's known application identity, if any."""
+        if self._semantic_backend is not None:
+            getter = getattr(self._semantic_backend, "application_process_name", None)
+            if callable(getter):
+                try:
+                    return str(getter(int(hwnd or 0)) or "")
+                except Exception:
+                    return ""
+        return str(window_process_name(int(hwnd or 0)) or "")
+
     def is_blocking_observation(self, observation_id: str) -> bool:
+        if self._semantic_backend is not None:
+            return bool(self._semantic_backend.is_blocking_observation(observation_id))
         return str(observation_id or "") in self._blocking_observations
 
     def coordinate_fallback_eligible(self, observation_id: str) -> bool:
         """Allow coordinate fallback only after a fresh, non-modal UIA observation."""
+        if self._semantic_backend is not None:
+            return bool(self._semantic_backend.coordinate_fallback_eligible(observation_id))
         if not self.available:
             return True
         current = str(observation_id or "")
@@ -273,6 +321,8 @@ class DesktopUIA:
                     and current not in self._blocking_observations)
 
     def reset(self) -> None:
+        if self._semantic_backend is not None:
+            self._semantic_backend.reset()
         self._controls.clear()
         self._high_risk_controls.clear()
         self._observation_fingerprints.clear()

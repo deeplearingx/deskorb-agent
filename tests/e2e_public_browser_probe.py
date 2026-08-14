@@ -103,6 +103,14 @@ def _current_browser_url(runtime: AgentRuntime | None) -> str:
     return str(getattr(runtime, "_browser_current_url", "") or "").strip()
 
 
+def _browser_action_arguments(item: dict[str, Any]) -> dict[str, Any]:
+    """Read nested or bounded provider-flattened action arguments."""
+    nested = item.get("arguments")
+    if isinstance(nested, dict):
+        return nested
+    return {key: value for key, value in item.items() if key != "action"}
+
+
 def _action_from_tool(name: object, arguments: object | None = None) -> str | None:
     lowered = str(name or "").lower()
     if isinstance(arguments, dict) and isinstance(arguments.get("name"), str):
@@ -171,11 +179,12 @@ def _public_browser_policy_failure(runtime: AgentRuntime | None, scenario: Publi
             action = str(item.get("action") or "").lower()
             if action not in _PUBLIC_BROWSER_ACTIONS:
                 return "forbidden_browser_action"
+            item_arguments = _browser_action_arguments(item)
             if action == "navigate" and not _read_only_navigation_allowed(
-                    (item.get("arguments") or {}).get("url"), scenario.allowed_domains):
+                    item_arguments.get("url"), scenario.allowed_domains):
                 return "unapproved_navigation"
             if action == "navigate":
-                candidate_url = str((item.get("arguments") or {}).get("url") or "").strip()
+                candidate_url = str(item_arguments.get("url") or "").strip()
             elif action == "switch_tab":
                 # The newly selected tab is unknown until a fresh snapshot.
                 candidate_url = ""

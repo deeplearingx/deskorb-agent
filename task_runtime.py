@@ -20,6 +20,66 @@ from pathlib import Path
 from typing import Any
 
 
+@dataclass
+class ExecutionDeadline:
+    """A monotonic total budget with structural phase timing only."""
+
+    total_seconds: float
+    clock: Any = time.monotonic
+    started_at: float | None = None
+    current_phase: str = "idle"
+    _phase_started_at: float | None = None
+    _phases: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        self.total_seconds = max(0.0, float(self.total_seconds))
+        if self.started_at is None:
+            self.started_at = float(self.clock())
+        if self._phases is None:
+            self._phases = []
+
+    def elapsed(self) -> float:
+        return max(0.0, float(self.clock()) - float(self.started_at or 0.0))
+
+    def remaining(self) -> float:
+        return max(0.0, self.total_seconds - self.elapsed())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def _enter_phase(self, phase: str) -> None:
+        name = str(phase or "unknown")[:64] or "unknown"
+        now = float(self.clock())
+        if self.current_phase == name and self._phase_started_at is not None:
+            return
+        if self._phase_started_at is not None and self._phases:
+            self._phases[-1]["elapsed_ms"] = max(
+                0, int(round((now - self._phase_started_at) * 1000))
+            )
+        self.current_phase = name
+        self._phase_started_at = now
+        self._phases.append({"phase": name, "elapsed_ms": 0})
+
+    def timeout_for(self, requested_seconds: float, *, phase: str) -> float:
+        self._enter_phase(phase)
+        return min(max(0.0, float(requested_seconds)), self.remaining())
+
+    def snapshot(self) -> dict[str, Any]:
+        now = float(self.clock())
+        phases = [dict(item) for item in (self._phases or [])]
+        if self._phase_started_at is not None and phases:
+            phases[-1]["elapsed_ms"] = max(
+                0, int(round((now - self._phase_started_at) * 1000))
+            )
+        return {
+            "total_budget_ms": int(round(self.total_seconds * 1000)),
+            "elapsed_ms": int(round(self.elapsed() * 1000)),
+            "remaining_ms": int(round(self.remaining() * 1000)),
+            "current_phase": self.current_phase,
+            "phases": phases,
+        }
+
+
 TASK_STATUS_ACTIVE = "active"
 TASK_STATUS_PAUSED = "paused"
 TASK_STATUS_WAITING_APPROVAL = "waiting_approval"
@@ -60,6 +120,20 @@ def classify_failure(value: Any) -> str:
         ("empty_model_input", "empty_model_input"),
         ("model_not_configured", "model_not_configured"),
         ("api key is not configured", "model_not_configured"),
+        ("provider_timeout_before_tools", "provider_timeout_before_tools"),
+        ("provider_timeout_after_tools", "provider_timeout_after_tools"),
+        ("tool_execution_timeout", "tool_execution_timeout"),
+        ("desktop_observation_timeout", "desktop_observation_timeout"),
+        ("postcondition_verification_timeout", "postcondition_verification_timeout"),
+        ("browser_mcp_start_failed", "browser_mcp_start_failed"),
+        ("browser_mcp_connection_failed", "browser_mcp_connection_failed"),
+        ("browser_mcp_recovery_exhausted", "browser_mcp_recovery_exhausted"),
+        ("browser_window_not_visible", "browser_window_not_visible"),
+        ("browser_initial_snapshot_timeout", "browser_initial_snapshot_timeout"),
+        ("browser_task_unverified", "browser_task_unverified"),
+        ("desktop_backend_unavailable", "desktop_backend_unavailable"),
+        ("flagship_adapter_unavailable", "flagship_adapter_unavailable"),
+        ("duplicate_action_prevented", "duplicate_action_prevented"),
         ("provider_timeout", "provider_timeout"),
         ("locator_failure", "locator_failure"),
         ("stale locator", "locator_failure"),

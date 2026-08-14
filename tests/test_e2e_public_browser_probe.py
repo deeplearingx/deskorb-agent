@@ -391,6 +391,13 @@ class PublicBrowserProbeTests(unittest.TestCase):
             })
         self.assertIsNone(failure_kind)
 
+    def test_public_guard_matches_provider_flattened_navigation_arguments(self):
+        failure_kind = probe._public_browser_policy_failure(
+            None, probe.SCENARIOS["bing-fastapi"], "browser_action_batch", {
+                "actions": [{"action": "navigate", "url": "https://www.bing.com/search?q=FastAPI"}],
+            })
+        self.assertIsNone(failure_kind)
+
     def test_public_guard_rejects_bing_click_before_minimum_evidence(self):
         runtime = SimpleNamespace(_browser_current_url="https://www.bing.com/search?q=FastAPI",
                                  _public_candidate_count=0)

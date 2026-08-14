@@ -75,12 +75,14 @@ OFFICE_MAX_RENDERED_CHARS = _env_int("DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS", 
 # to replace or add trusted local servers; set PLAYWRIGHT_MCP=0 to disable the default.
 MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
 PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
+FLAUI_MCP_SERVER = os.environ.get("DESKORB_AGENT_FLAUI_MCP_SERVER", "").strip()
 OFFICECLI_ENABLED = _env_bool("DESKORB_AGENT_OFFICECLI", True)
 OFFICECLI_BINARY = os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "").strip()
 # Retained for configuration compatibility. In Full access, all non-delete actions
 # are automatic; file deletion confirmation cannot be disabled by this setting.
 OFFICECLI_AUTO_APPROVE = _env_bool("DESKORB_AGENT_OFFICECLI_AUTO_APPROVE", True)
 MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
+BROWSER_START_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_BROWSER_START_TIMEOUT", 12, 3, 60)
 OFFICECLI_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_OFFICECLI_TIMEOUT", 180, 30, 900)
 OFFICECLI_MAX_TOOL_ROUNDS = _env_int("DESKORB_AGENT_OFFICECLI_MAX_TOOL_ROUNDS", 300, 20, 1000)
 PERMISSION_MODE = "workspace-write"

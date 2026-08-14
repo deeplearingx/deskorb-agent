@@ -16,6 +16,7 @@ import ctypes
 import ctypes.wintypes
 import functools
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -46,7 +47,7 @@ from e2e_metrics import (
     load_step_baselines,
     summarize_runs,
 )
-from task_runtime import InMemoryTaskJournal, classify_failure
+from task_runtime import ExecutionDeadline, InMemoryTaskJournal, classify_failure
 from tests.e2e_support.datasets import (
     E2E_DATASET_PATH,
     E2E_EXPANSIONS_PATH,
@@ -65,6 +66,11 @@ STEP_BASELINES = E2E_STEP_BASELINES_PATH
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 _HANDOFF_CASE_MARKERS = ("captcha", "login", "qr", "manual_handoff")
+_TIMEOUT_FAILURES = {
+    "provider_timeout_before_tools", "provider_timeout_after_tools",
+    "tool_execution_timeout", "desktop_observation_timeout",
+    "postcondition_verification_timeout", "provider_timeout",
+}
 _DESKTOP_CATEGORIES = ("desktop_", "window_management")
 _SAFETY_CATEGORIES = {
     "high_risk_message_boundary", "destructive_action_boundary", "privacy_boundary",
@@ -453,6 +459,15 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
     stage_transition_count = 0
     last_stage = ""
     postcondition_kind = "none"
+    execution_phase = ""
+    turn_deadline_ms: int | None = None
+    provider_first_response_ms: int | None = None
+    tool_elapsed_ms = 0
+    postcondition_elapsed_ms = 0
+    action_dispatched = False
+    action_replayed = False
+    recovery_attempted = False
+    provider_request_id_hash = ""
     trace_material: list[str] = []
     for kind, value in events:
         if kind == "approval":
@@ -503,6 +518,7 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
             execution_source_counts[source] = execution_source_counts.get(source, 0) + 1
             cache_status_counts[status] = cache_status_counts.get(status, 0) + 1
             model_fallback_count += int(bool(value.get("model_fallback")))
+            recovery_count += int(bool(value.get("recovery_attempted")))
             if "postcondition_passed" in value:
                 postcondition_seen = True
                 postcondition_passed = postcondition_passed or bool(value.get("postcondition_passed"))
@@ -518,6 +534,30 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
             if value.get("postcondition_kind"):
                 postcondition_kind = str(value.get("postcondition_kind"))
             trace_material.append("tool_result:" + str(bool(value.get("ok"))))
+        if kind == "execution_timing" and isinstance(value, dict):
+            execution_phase = str(value.get("execution_phase") or execution_phase)[:64]
+            action_dispatched = action_dispatched or bool(value.get("action_dispatched"))
+            action_replayed = action_replayed or bool(value.get("action_replayed"))
+            recovery_attempted = recovery_attempted or bool(value.get("recovery_attempted"))
+            candidate_hash = value.get("provider_request_id_hash")
+            if (not provider_request_id_hash and isinstance(candidate_hash, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", candidate_hash)):
+                provider_request_id_hash = candidate_hash
+            deadline = value.get("deadline")
+            if isinstance(deadline, dict):
+                if isinstance(deadline.get("total_budget_ms"), int):
+                    turn_deadline_ms = max(turn_deadline_ms or 0, int(deadline["total_budget_ms"]))
+                for phase in deadline.get("phases") or ():
+                    if not isinstance(phase, dict):
+                        continue
+                    name = str(phase.get("phase") or "")
+                    elapsed = max(0, int(phase.get("elapsed_ms") or 0))
+                    if name == "provider_first_response":
+                        provider_first_response_ms = max(provider_first_response_ms or 0, elapsed)
+                    elif name == "tool_execution":
+                        tool_elapsed_ms += elapsed
+                    elif name == "postcondition_verification":
+                        postcondition_elapsed_ms += elapsed
         elif kind in {"human_handoff", "human_verification"}:
             recovery_count += 1
             trace_material.append("handoff")
@@ -547,6 +587,15 @@ def normalize_runtime_events(events: list[tuple[str, object]], *,
         "recovery_count": recovery_count,
         "stage_transition_count": stage_transition_count,
         "postcondition_kind": postcondition_kind,
+        "execution_phase": execution_phase,
+        "turn_deadline_ms": turn_deadline_ms,
+        "provider_first_response_ms": provider_first_response_ms,
+        "tool_elapsed_ms": tool_elapsed_ms,
+        "postcondition_elapsed_ms": postcondition_elapsed_ms,
+        "action_dispatched": action_dispatched,
+        "action_replayed": action_replayed,
+        "recovery_attempted": recovery_attempted,
+        "provider_request_id_hash": provider_request_id_hash or None,
         "trace_hash": trace_hash,
     }
 
@@ -980,6 +1029,7 @@ def _run_runtime_task(runtime: AgentRuntime, task: str, timeout_seconds: int,
     started = time.monotonic()
     failure: str | None = None
     prompt = str(task or "").strip()
+    timeout_recovery_attempted = False
     if not prompt:
         failure = "empty_task_input"
         prompt = "继续执行原任务，并先重新观察当前状态。"
@@ -997,6 +1047,20 @@ def _run_runtime_task(runtime: AgentRuntime, task: str, timeout_seconds: int,
             )
             if terminal_completed:
                 failure = None
+            elif failure in _TIMEOUT_FAILURES and not timeout_recovery_attempted:
+                recover = getattr(runtime, "recover_after_timeout", None)
+                if callable(recover):
+                    timeout_recovery_attempted = True
+                    recovery = recover(failure)
+                    recovery_events = _drain(events)
+                    all_events.extend(recovery_events)
+                    if isinstance(recovery, dict) and recovery.get("terminal") == "completed":
+                        failure = None
+                    elif isinstance(recovery, dict) and recovery.get("resume_required"):
+                        candidate = str(recovery.get("resume_prompt") or "").strip()
+                        if candidate:
+                            prompt = candidate
+                            continue
             break
         if any(kind in {"human_verification", "human_handoff"} for kind, _ in new_events):
             resume_event = threading.Event()
@@ -1055,33 +1119,85 @@ def _run_runtime_task(runtime: AgentRuntime, task: str, timeout_seconds: int,
     return metrics, failure
 
 
-def _run_turn_bounded(runtime: AgentRuntime, text: str, timeout_seconds: int) -> tuple[bool, str | None]:
+def _bounded_timeout_failure_kind(runtime: Any) -> str:
+    """Classify a watchdog timeout from the last trusted runtime phase."""
+    phase = str(getattr(runtime, "execution_phase", "") or "")
+    if phase == "tool_execution":
+        return "tool_execution_timeout"
+    if phase == "desktop_observation":
+        return "desktop_observation_timeout"
+    if phase == "postcondition_verification":
+        return "postcondition_verification_timeout"
+    if bool(getattr(runtime, "turn_action_dispatched", False)):
+        return "provider_timeout_after_tools"
+    return "provider_timeout_before_tools"
+
+
+def _run_turn_bounded(runtime: AgentRuntime, text: str, timeout_seconds: int | float) -> tuple[bool, str | None]:
     if not str(text or "").strip():
         return False, "empty_model_input"
     errors: list[BaseException] = []
+    deadline = ExecutionDeadline(max(0.01, float(timeout_seconds)))
 
     def target() -> None:
         try:
-            runtime.run_turn(text, [])
+            parameters = inspect.signature(runtime.run_turn).parameters
+            supports_deadline = "deadline" in parameters or any(
+                item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+            )
+            if supports_deadline:
+                runtime.run_turn(text, [], deadline=deadline)
+            else:
+                runtime.run_turn(text, [])
         except BaseException as exc:
             errors.append(exc)
 
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
-    thread.join(max(1, int(timeout_seconds)))
+    thread.join(max(0.01, float(timeout_seconds)))
+
+    def publish_timing() -> None:
+        try:
+            snapshot = getattr(runtime, "last_deadline_snapshot", None)
+            if not isinstance(snapshot, dict) or not snapshot:
+                snapshot = deadline.snapshot()
+            payload = {
+                "deadline": snapshot,
+                "execution_phase": str(getattr(runtime, "execution_phase", "") or "")[:64],
+                "action_dispatched": bool(getattr(runtime, "turn_action_dispatched", False)),
+                "action_replayed": bool(getattr(runtime, "action_replayed", False)),
+                "recovery_attempted": bool(getattr(runtime, "recovery_attempted", False)),
+                "provider_request_id_hash": str(
+                    getattr(runtime, "provider_request_id_hash", "") or ""
+                )[:64],
+            }
+            queue = getattr(runtime, "ui", None)
+            if queue is not None and callable(getattr(queue, "put", None)):
+                queue.put(("execution_timing", payload))
+        except Exception:
+            return
+
     if thread.is_alive():
         try:
             runtime.interrupt()
         except Exception:
             pass
         thread.join(2)
-        return False, "provider_timeout"
+        try:
+            runtime.last_deadline_snapshot = deadline.snapshot()
+        except Exception:
+            pass
+        publish_timing()
+        return False, _bounded_timeout_failure_kind(runtime)
     if errors:
         message = str(errors[0])
         if "empty_model_input" in message:
+            publish_timing()
             return False, "empty_model_input"
         category = classify_failure(message)
+        publish_timing()
         return False, category if category != "unknown" else "runtime_error"
+    publish_timing()
     return True, None
 
 

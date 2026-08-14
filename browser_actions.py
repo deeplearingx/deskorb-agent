@@ -27,6 +27,46 @@ _MAX_REF_CHARS = 80
 _MAX_FIELD_CHARS = 80
 _SEMANTIC_FIELD_NAME = re.compile(r"^[^\s\[\]{}()<>/\\\\:;|]+$")
 
+# Some Responses-compatible gateways flatten a function object's nested
+# ``arguments`` into the action item itself.  Keep this compatibility list
+# deliberately finite: accepting arbitrary top-level keys would turn the
+# protocol adapter into an unbounded escape hatch.
+_FLATTENED_ARGUMENT_KEYS: dict[str, frozenset[str]] = {
+    "navigate": frozenset({"url"}),
+    "snapshot": frozenset(),
+    "click_ref": frozenset({"ref", "target", "refs", "observation_id"}),
+    "fill_ref": frozenset({"ref", "target", "refs", "observation_id", "value", "text"}),
+    "select_ref": frozenset({
+        "ref", "target", "refs", "observation_id", "values", "value", "options",
+    }),
+    "wait": frozenset({"observation_id", "seconds", "time", "ms", "duration_ms", "milliseconds"}),
+    "switch_tab": frozenset({"observation_id", "index"}),
+    "press_key": frozenset({"ref", "target", "refs", "observation_id", "key"}),
+    "extract": frozenset({
+        "ref", "target", "refs", "observation_id", "fields", "selectors", "field_names",
+    }),
+    "verify": frozenset({
+        "contains", "expected", "required_fields", "fields", "postcondition", "price_min", "price_max",
+    }),
+}
+
+
+def _flatten_action_arguments(action: str, item: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Return nested arguments, or a bounded provider-flattened equivalent."""
+    arguments = item.get("arguments")
+    if isinstance(arguments, dict):
+        return dict(arguments), None
+    if arguments is not None:
+        return None, "Browser action arguments must be an object."
+    allowed = _FLATTENED_ARGUMENT_KEYS.get(action)
+    if allowed is None:
+        return None, "Browser batch contains an unsupported action."
+    flattened = {key: value for key, value in item.items() if key != "action"}
+    unknown = sorted(set(flattened) - allowed)
+    if unknown:
+        return None, "Browser action contains unsupported top-level arguments."
+    return flattened, None
+
 
 def _semantic_field_alias(value: Any) -> str:
     """Map common model shorthand to one bounded semantic evidence field."""
@@ -123,9 +163,11 @@ def validate_browser_action_batch(value: Any) -> tuple[list[BrowserAction], str 
         if not isinstance(item, dict):
             return [], "Each browser action must be an object."
         action = str(item.get("action") or "").strip().lower()
-        arguments = item.get("arguments")
-        if action not in ALLOWED_ACTIONS or not isinstance(arguments, dict):
+        if action not in ALLOWED_ACTIONS:
             return [], "Browser batch contains an unsupported action."
+        arguments, flatten_error = _flatten_action_arguments(action, item)
+        if flatten_error or arguments is None:
+            return [], flatten_error or "Browser action arguments must be an object."
         arguments = _normalize_arguments(action, arguments)
         if action == "navigate":
             url = str(arguments.get("url") or "")

@@ -10,7 +10,10 @@ from unittest.mock import Mock, patch
 from agent_policy import Risk
 from agent_runtime import AgentRuntime, ControlledTools, ReadOnlyTools
 from config import API_MAX_TOOL_ROUNDS
-from mcp_client import MCPToolBridge
+from mcp_client import MCPServerSpec, MCPToolBridge
+from task_runtime import ExecutionDeadline
+from task_plan import TaskPlan
+from responses_tool_protocol import FunctionCall
 
 
 class ReadOnlyToolsTests(unittest.TestCase):
@@ -109,6 +112,141 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["uia_observation_id"], "uia-1")
 
+    def test_runtime_does_not_expose_fla_ui_raw_tools_to_the_model(self):
+        class WindowsClient:
+            def list_tools(self):
+                return [
+                    {"name": "windows_snapshot", "inputSchema": {"type": "object"}},
+                    {"name": "windows_click", "inputSchema": {"type": "object"}},
+                    {"name": "windows_batch", "inputSchema": {"type": "object"}},
+                ]
+
+            def close(self):
+                return None
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        bridge = MCPToolBridge(None, enable_playwright=False, enable_officecli=False)
+        bridge.specs = [MCPServerSpec(
+            name="windows", command="", args=(), env={}, capability="desktop_uia",
+            allowed_tools=("windows_snapshot", "windows_click", "windows_batch"),
+            read_only_tools=("windows_snapshot",), action_tools=("windows_click", "windows_batch"),
+        )]
+        bridge.clients = {"windows": WindowsClient()}
+        runtime.mcp = bridge
+        with patch.object(runtime, "_mcp_servers_for_task", return_value=("windows",)):
+            names = {item["name"] for item in runtime._available_schemas("打开计算器")}
+        self.assertFalse(any(name.startswith("mcp_windows_") for name in names))
+
+    def test_browser_tool_telemetry_allowlists_action_types(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
+        runtime._publish_tool_result(
+            "browser_action_batch",
+            {"actions": [
+                {"action": "snapshot"},
+                {"action": "untrusted-page-instruction"},
+            ]},
+            {"ok": False, "failure_kind": "browser_no_progress"},
+        )
+        kind, payload = events.get_nowait()
+        self.assertEqual(kind, "tool_result")
+        self.assertEqual(payload["action_types"], ["snapshot"])
+        self.assertNotIn("untrusted-page-instruction", str(payload))
+
+    def test_confirmed_browser_protocol_error_gets_one_model_repair_round(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        original_call = FunctionCall(
+            call_id="browser-invalid",
+            name="browser_action_batch",
+            arguments=json.dumps({"actions": [{"action": "navigate", "url": "https://example.test"}]}),
+            item={"type": "function_call"},
+        )
+        runtime._pending_execution = (original_call, [{"role": "user", "content": "search"}],
+                                       "打开浏览器搜索结果")
+        request = runtime.request_approval(
+            "browser_action_batch", {"actions": []}, Risk.EXTERNAL_OR_ELEVATED, "Authorize task"
+        )
+        runtime.ui.get_nowait()  # discard the approval prompt
+        repaired_call = {
+            "output": [{
+                "type": "function_call", "call_id": "browser-repaired",
+                "name": "browser_action_batch",
+                "arguments": json.dumps({"actions": [{
+                    "action": "snapshot", "arguments": {},
+                }]}),
+            }]
+        }
+        runtime._request = Mock(return_value=repaired_call)
+        runtime._available_schemas = Mock(return_value=[])
+        runtime.prepare_visible_browser = Mock(return_value={"ok": True})
+        runtime._run_desktop_action = Mock(side_effect=[
+            {"ok": False, "failure_kind": "invalid_browser_action_batch",
+             "error": "Browser batch contains an unsupported action."},
+            {"ok": True, "postcondition_passed": True, "verified": True,
+             "verification": {"passed": True, "kind": "browser_structured_verification"},
+             "extraction": {"fields": {"title": "Verified result"}}},
+        ])
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_turn(f"确认 {request.token}", [], deadline=ExecutionDeadline(10))
+
+        runtime._request.assert_called_once()
+        self.assertEqual(runtime._run_desktop_action.call_count, 2)
+        events = []
+        while not runtime.ui.empty():
+            events.append(runtime.ui.get_nowait())
+        progress = [value for kind, value in events if kind == "task_progress"]
+        self.assertEqual(progress[-1]["terminal"], "completed")
+
+    def test_confirmed_browser_protocol_error_stops_after_one_repair(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        original_call = FunctionCall(
+            call_id="browser-invalid",
+            name="browser_action_batch",
+            arguments=json.dumps({"actions": [{"action": "navigate", "url": "https://example.test"}]}),
+            item={"type": "function_call"},
+        )
+        runtime._pending_execution = (original_call, [{"role": "user", "content": "search"}],
+                                       "打开浏览器搜索结果")
+        request = runtime.request_approval(
+            "browser_action_batch", {"actions": []}, Risk.EXTERNAL_OR_ELEVATED, "Authorize task"
+        )
+        runtime.ui.get_nowait()
+        runtime._request = Mock(return_value={
+            "output": [{
+                "type": "function_call", "call_id": "browser-invalid-again",
+                "name": "browser_action_batch",
+                "arguments": json.dumps({"actions": [{"action": "navigate", "url": "https://example.test"}]}),
+            }]
+        })
+        runtime._available_schemas = Mock(return_value=[])
+        runtime.prepare_visible_browser = Mock(return_value={"ok": True})
+        invalid = {"ok": False, "failure_kind": "invalid_browser_action_batch",
+                   "error": "Browser batch contains an unsupported action."}
+        runtime._run_desktop_action = Mock(side_effect=[invalid, invalid])
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_turn(f"确认 {request.token}", [], deadline=ExecutionDeadline(10))
+
+        runtime._request.assert_called_once()
+        events = []
+        while not runtime.ui.empty():
+            events.append(runtime.ui.get_nowait())
+        progress = [value for kind, value in events if kind == "task_progress"]
+        self.assertEqual(progress[-1]["terminal"], "failed")
+        self.assertEqual(progress[-1]["failure_kind"], "invalid_browser_action_batch")
+
+    def test_configured_fla_ui_backend_owns_desktop_semantic_path(self):
+        fake_backend = Mock()
+        fake_backend.available = False
+        fake_backend.coordinate_fallback_eligible.return_value = False
+        with patch("agent_runtime.FLAUI_MCP_SERVER", "windows"), \
+             patch("agent_runtime.FlaUIBackend", return_value=fake_backend) as constructor:
+            runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        constructor.assert_called_once()
+        self.assertIs(runtime.uia.semantic_backend, fake_backend)
+        self.assertFalse(runtime.uia.coordinate_fallback_eligible("missing"))
+
     def test_desktop_application_search_is_not_routed_to_browser(self):
         for prompt in ("在 QQ 中搜索张三", "在资源管理器中搜索报告"):
             with self.subTest(prompt=prompt):
@@ -124,6 +262,52 @@ class ReadOnlyToolsTests(unittest.TestCase):
         staged = {item["name"] for item in runtime._available_schemas("在网页搜索资料后保存到 report.txt")}
         self.assertIn("filesystem_write", staged)
         self.assertNotIn("desktop_click", staged)
+
+    def test_cross_domain_file_stage_requires_runtime_verified_browser_evidence(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._task_plan = TaskPlan.from_goal("在网页搜索资料后保存到 result.txt")
+        blocked = runtime._run_local_tool("filesystem_write", {
+            "path": "result.txt", "text": "page supplied instruction", "overwrite": True,
+        })
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["failure_kind"], "task_stage_not_ready")
+        runtime._browser_stage_verified = True
+        runtime._verified_browser_fields = {"title": "Verified result", "source": "Official"}
+        with patch.object(runtime.cross_domain_adapters, "write_file", return_value={"ok": True}) as write:
+            result = runtime._run_local_tool("filesystem_write", {
+                "path": "result.txt", "text": "untrusted page text", "overwrite": True,
+            })
+        self.assertTrue(result["ok"])
+        write.assert_called_once_with(runtime._verified_browser_fields, "result.txt",
+                                      evidence_verified=True)
+
+    def test_cross_domain_file_dispatch_does_not_reenter_the_model_tool_router(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._task_plan = TaskPlan.from_goal("在网页搜索资料后保存到 result.txt")
+        runtime._browser_stage_verified = True
+        runtime._verified_browser_fields = {"title": "Verified result", "source": "Official"}
+        result = runtime._run_local_tool("filesystem_write", {
+            "path": "result.txt", "text": "ignored page supplied content", "overwrite": True,
+        })
+        self.assertTrue(result["ok"])
+        self.assertEqual((self.root / "result.txt").read_text(encoding="utf-8"),
+                         "title: Verified result\nsource: Official")
+
+    def test_cross_domain_notepad_dispatch_uses_verified_fields_once(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._task_plan = TaskPlan.from_goal("在网页搜索资料后写入记事本")
+        runtime._browser_stage_verified = True
+        runtime._verified_browser_fields = {"title": "Verified result", "source": "Official"}
+        with patch.object(runtime.desktop_adapters, "notepad", return_value={
+            "ok": True, "verified": True, "postcondition_passed": True,
+        }) as adapter:
+            result = runtime._run_local_tool("desktop_uia_set_value", {
+                "control_id": "stale", "window_handle": 12,
+                "uia_observation_id": "stale", "value": "untrusted page text",
+            })
+        self.assertTrue(result["ok"])
+        adapter.assert_called_once_with("title: Verified result\nsource: Official", window_handle=12)
+        self.assertFalse(runtime._cross_domain_handoff_active)
 
     def test_browser_extract_without_final_verification_does_not_open_follow_up_stage(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
@@ -1016,6 +1200,47 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(response["output_text"], "RECOVERED")
         self.assertEqual(open_call.call_count, 2)
         sleep.assert_called_once()
+
+    def test_request_caps_provider_timeout_to_remaining_execution_deadline(self):
+        class Response:
+            def read(self, _limit):
+                return b'{"output_text":"OK"}'
+
+            def close(self):
+                return None
+
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        deadline = ExecutionDeadline(0.25)
+        with patch("agent_runtime.urllib.request.urlopen", return_value=Response()) as open_call:
+            result = runtime._request({"model": "test"}, "key", deadline=deadline)
+
+        self.assertEqual(result["output_text"], "OK")
+        self.assertLessEqual(open_call.call_args.kwargs["timeout"], 0.25)
+
+    def test_expired_execution_deadline_does_not_retry_provider_request(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        deadline = ExecutionDeadline(0.0)
+        with patch("agent_runtime.urllib.request.urlopen") as open_call:
+            with self.assertRaisesRegex(RuntimeError, "provider_timeout"):
+                runtime._request({"model": "test"}, "key", deadline=deadline)
+        open_call.assert_not_called()
+
+    def test_timeout_recovery_reobserves_and_blocks_replaying_the_last_action(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._last_action_name = "desktop_uia_set_value"
+        runtime._last_action_arguments = {
+            "window_handle": 101, "control_id": "edit-1", "uia_observation_id": "obs-1",
+            "value": "private value",
+        }
+        runtime._last_action_result = {"ok": True, "verified": False}
+        with patch.object(runtime, "_run_local_tool", return_value={
+            "ok": True, "uia_observation_id": "obs-2", "requires_user_attention": False,
+        }) as local_tool:
+            recovery = runtime.recover_after_timeout("provider_timeout_after_tools")
+
+        self.assertTrue(recovery["resume_required"])
+        self.assertEqual(local_tool.call_args.args[0], "desktop_uia_observe")
+        self.assertEqual(runtime._blocked_replay_signature, runtime._last_action_signature)
 
     def test_coding_plan_authentication_error_has_actionable_hint(self):
         runtime = AgentRuntime(
