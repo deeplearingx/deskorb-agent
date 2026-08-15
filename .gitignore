@@ -30,6 +30,7 @@ venv/
 _*.log
 _*.py
 !tests/__init__.py
+!whisperX-main/whisperx/vads/__init__.py
 _*.png
 app-server-schema/
 
@@ -37,6 +38,7 @@ app-server-schema/
 claude_overlay_shots/
 deskorb_agent_shots/
 .playwright-mcp/
+/runtime/
 .deskorb-agent/
 .deskorb-playwright-*/
 .mcp-probe-*/

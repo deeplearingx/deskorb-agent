@@ -81,6 +81,15 @@ OFFICE_MAX_RENDERED_CHARS = _env_int("DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS", 
 # to replace or add trusted local servers; set PLAYWRIGHT_MCP=0 to disable the default.
 MCP_CONFIG_PATH = os.environ.get("DESKORB_AGENT_MCP_CONFIG", "").strip()
 PLAYWRIGHT_MCP_ENABLED = _env_bool("DESKORB_AGENT_PLAYWRIGHT_MCP", True)
+# Browser Use is an opt-in alternative backend for the semantic browser
+# runtime.  It never becomes the default merely because its MCP server is
+# configured; the A/B runner selects it explicitly per runtime.
+BROWSER_BACKEND = os.environ.get("DESKORB_AGENT_BROWSER_BACKEND", "playwright").strip().lower() or "playwright"
+if BROWSER_BACKEND not in {"playwright", "browser_use", "browser-use"}:
+    BROWSER_BACKEND = "playwright"
+BROWSER_USE_MCP_SERVER = os.environ.get(
+    "DESKORB_AGENT_BROWSER_USE_MCP_SERVER", "browser-use"
+).strip() or "browser-use"
 FLAUI_MCP_SERVER = os.environ.get("DESKORB_AGENT_FLAUI_MCP_SERVER", "").strip()
 OFFICECLI_ENABLED = _env_bool("DESKORB_AGENT_OFFICECLI", True)
 OFFICECLI_BINARY = os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "").strip()
@@ -89,6 +98,12 @@ OFFICECLI_BINARY = os.environ.get("DESKORB_AGENT_OFFICECLI_BINARY", "").strip()
 OFFICECLI_AUTO_APPROVE = _env_bool("DESKORB_AGENT_OFFICECLI_AUTO_APPROVE", True)
 MCP_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_MCP_TIMEOUT", 30, 5, 120)
 BROWSER_START_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_BROWSER_START_TIMEOUT", 12, 3, 60)
+# Browser Use starts a Python MCP process, launches its own browser session,
+# and only then returns the first state. Its cold path is materially slower
+# than Playwright MCP, so keep a separate explicit bounded budget.
+BROWSER_USE_START_TIMEOUT_SECONDS = _env_int(
+    "DESKORB_AGENT_BROWSER_USE_START_TIMEOUT", 60, 12, 120
+)
 OFFICECLI_TIMEOUT_SECONDS = _env_int("DESKORB_AGENT_OFFICECLI_TIMEOUT", 180, 30, 900)
 OFFICECLI_MAX_TOOL_ROUNDS = _env_int("DESKORB_AGENT_OFFICECLI_MAX_TOOL_ROUNDS", 300, 20, 1000)
 PERMISSION_MODE = "workspace-write"
@@ -211,10 +226,13 @@ IMAGE_INPUT = "inline"           # "inline" → attach screenshots as base64 ima
                                  # (no per-turn Read round-trip); "read" → legacy path:
                                  # save PNG + ask Codex to Read it. Flip to "read" if a
                                  # future CLI rejects inline images.
-API_IMAGE_INPUT_ENABLED = _env_bool("DESKORB_AGENT_API_IMAGE_INPUT", False)
-                                 # API-backed models are text-only by default; set this to
-                                 # 1 only after verifying the selected endpoint accepts
-                                 # Responses API input_image blocks.
+API_IMAGE_INPUT_ENABLED = _env_bool(
+    "DESKORB_AGENT_API_IMAGE_INPUT",
+    True,
+)
+                                 # Screenshots are sent by default. Set this explicitly to 0
+                                 # for a text-only endpoint; set it to 1 explicitly when
+                                 # documenting an endpoint that has been independently tested.
 PRECAPTURE_ON_TYPING = True      # grab the screen ~as you type (off the send path) so
                                  # send latency excludes the capture.
 PRECAPTURE_MAX_AGE = 6.0         # seconds a pre-captured frame stays reusable; older than

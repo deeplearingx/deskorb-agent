@@ -14,6 +14,22 @@ from typing import Any
 PROVIDERS = ("auto", "openai", "responses", "openai-compatible", "qwen", "deepseek")
 
 
+def is_stream_keepalive_event(event: Any) -> bool:
+    """Return whether a provider text delta is transport keepalive data.
+
+    The configured Responses gateway emits a zero-width ``output_text.delta``
+    with these markers before real content. It must never enter the assistant
+    transcript because structured consumers (for example Office JSON plans)
+    need the first byte of the model response to remain meaningful.
+    """
+    if not isinstance(event, dict):
+        return False
+    marker = event.get("SSE-Keep-Alive")
+    if marker is True or str(marker or "").strip().casefold() in {"true", "1", "yes"}:
+        return True
+    return str(event.get("item_id") or "").strip().casefold() == "sse-keep-alive"
+
+
 @dataclass(frozen=True)
 class ProviderProfile:
     name: str

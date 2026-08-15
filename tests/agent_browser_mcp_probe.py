@@ -20,6 +20,12 @@ from agent_runtime import AgentRuntime
 from browser_evidence import safe_http_url
 from config import API_BASE_URL, API_MODEL, API_PROXY_URL
 
+if hasattr(sys.stdout, "reconfigure"):
+    # Real browser evidence can contain currency symbols and non-ASCII book
+    # titles.  Windows' legacy console code page must not turn a completed
+    # browser run into a test-harness UnicodeEncodeError.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 
 DEFAULT_TASK = (
     "使用本地 MCP 浏览器完成测试：打开 https://books.toscrape.com/，从商品列表找到任意一本"
@@ -118,6 +124,16 @@ def main() -> int:
                 "ok": bool(isinstance(result, dict) and result.get("ok")),
                 "failure_kind": str(result.get("failure_kind") or "")[:80]
                 if isinstance(result, dict) else "",
+                "verified": bool(result.get("verified")) if isinstance(result, dict) else False,
+                "verification_passed": bool(
+                    isinstance(result, dict)
+                    and isinstance(result.get("verification"), dict)
+                    and result["verification"].get("passed")
+                ),
+                "postcondition_passed": bool(result.get("postcondition_passed"))
+                if isinstance(result, dict) else False,
+                "next_allowed_actions": list(result.get("next_allowed_actions") or ())[:12]
+                if isinstance(result, dict) else [],
                 "action_steps": int(result.get("action_steps") or 0)
                 if isinstance(result, dict) else 0,
                 "page_url": safe_http_url(getattr(session, "_current_page_url", ""), strip_query=True)

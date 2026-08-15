@@ -721,6 +721,7 @@ def _normalized_run(case_id: str, attempt: int, *, status: str, failure_kind: st
         "model": str(metrics.get("model") or "")[:120],
         "model_provider": str(metrics.get("model_provider") or "")[:80],
         "mcp_version": str(metrics.get("mcp_version") or "")[:80],
+        "browser_backend": str(metrics.get("browser_backend") or "playwright")[:40],
         "status": status,
         "failure_kind": str(failure_kind or "")[:80] or None,
         "total_latency_ms": round((time.monotonic() - started) * 1000, 2),
@@ -752,13 +753,15 @@ def _normalized_run(case_id: str, attempt: int, *, status: str, failure_kind: st
         "tab_timeline": list(metrics.get("tab_timeline") or ())[:120],
         "confirmation_events": list(metrics.get("confirmation_events") or ())[:32],
         "evidence_ledger": _safe_evidence_ledger(metrics.get("evidence_ledger")),
+        "browser_result_summaries": list(metrics.get("browser_result_summaries") or ())[:120],
         "screenshot_refs": list(metrics.get("screenshot_refs") or ())[:16],
     }
     return safe
 
 
 def run_case(case_id: str, attempt: int, *, working_dir: Path,
-             interactive_human: bool = False) -> dict[str, Any]:
+             interactive_human: bool = False,
+             browser_backend: str = "playwright") -> dict[str, Any]:
     scenario = SCENARIOS[case_id]
     prompt = build_acceptance_prompt(str(scenario["prompt"]), case_id=case_id)
     started = time.monotonic()
@@ -768,7 +771,12 @@ def run_case(case_id: str, attempt: int, *, working_dir: Path,
     metrics: dict[str, Any] = {"run_id": uuid.uuid4().hex,
                                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
                                "model": API_MODEL, "model_provider": MODEL_PROVIDER,
-                               "mcp_version": f"playwright-mcp@{PLAYWRIGHT_MCP_VERSION}",
+                               "mcp_version": (
+                                   f"playwright-mcp@{PLAYWRIGHT_MCP_VERSION}"
+                                   if str(browser_backend).strip().lower() == "playwright"
+                                   else "browser-use-mcp"
+                               ),
+                               "browser_backend": str(browser_backend).strip().lower(),
                                "state_violations": 0, "forbidden_actions": 0,
                                "login_before_confirmation": False, "max_tabs_seen": 0,
                                "login_click_after_confirmation": False,
@@ -779,11 +787,12 @@ def run_case(case_id: str, attempt: int, *, working_dir: Path,
                                "action_steps": 0, "return_after_rejection": False,
                                "recovery_attempts": 0, "tab_timeline": [],
                                "confirmation_events": [], "evidence_ledger": None,
-                               "screenshot_refs": []}
+                               "screenshot_refs": [], "browser_result_summaries": []}
     runtime = AgentRuntime(
         events, API_MODEL, API_BASE_URL, API_PROXY_URL,
         model_provider=MODEL_PROVIDER, working_dir=working_dir,
         task_journal=InMemoryTaskJournal(),
+        browser_backend=browser_backend,
     )
     runtime._semantic_browser_only = True
     run_deadline = ExecutionDeadline(int(scenario["timeout_seconds"]))
@@ -871,6 +880,38 @@ def run_case(case_id: str, attempt: int, *, working_dir: Path,
                     str(key) for key, value in record.fields.items()
                     if str(value).strip() and str(key).casefold() not in _PRIVATE_KEYS
                 )
+        if isinstance(result, dict):
+            verification = result.get("verification")
+            metrics["browser_result_summaries"].append({
+                "action_types": list(analysis["action_types"])[:8],
+                "ok": bool(result.get("ok")),
+                "failure_kind": str(result.get("failure_kind") or "")[:80],
+                "matched": bool(result.get("matched")),
+                "matched_ref_count": int(result.get("matched_ref_count") or 0),
+                "required_action": str(result.get("required_action") or "")[:40],
+                "target_ref_count": len(result.get("target_refs") or ())
+                if isinstance(result.get("target_refs"), (list, tuple, set)) else 0,
+                "verified": bool(result.get("verified")),
+                "postcondition_passed": bool(result.get("postcondition_passed")),
+                "verification_passed": bool(
+                    isinstance(verification, dict) and verification.get("passed")
+                ),
+                "verification_kind": str(verification.get("kind") or "")[:80]
+                if isinstance(verification, dict) else "",
+                "verification_failure_kind": str(verification.get("failure_kind") or "")[:80]
+                if isinstance(verification, dict) else "",
+                "verification_missing_fields": [
+                    str(field)[:80] for field in (verification.get("missing_fields") or ())
+                    if str(field).strip()
+                ][:16] if isinstance(verification, dict) else [],
+                "verification_required_fields": len(
+                    verification.get("required_fields") or ()
+                ) if isinstance(verification, dict) else 0,
+                "evidence_count": int(metrics.get("evidence_records") or 0),
+                "cache_verified": bool(getattr(session, "cache_verified", False))
+                if session is not None else False,
+                "interaction_stage": str(result.get("interaction_stage") or "")[:40],
+            })
         return result
 
     def postflight_tab_check() -> dict[str, Any]:
@@ -903,7 +944,7 @@ def run_case(case_id: str, attempt: int, *, working_dir: Path,
 
     runtime._run_local_tool = guarded
     try:
-        if not runtime.mcp or not bool(getattr(runtime.mcp, "is_browser_isolated", lambda: False)()):
+        if not runtime.mcp or not runtime._browser_isolated():
             return _normalized_run(case_id, attempt, status="invalid_environment",
                                    failure_kind="browser_not_isolated", started=started,
                                    events=[], calls=[], real_site=False, metrics=metrics)

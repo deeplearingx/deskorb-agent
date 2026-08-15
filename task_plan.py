@@ -12,6 +12,8 @@ from browser_task_spec import BrowserTaskSpec
 
 _DESKTOP_MARKERS = (
     "qq", "资源管理器", "文件管理器", "记事本", "计算器", "explorer", "notepad", "calculator",
+    "chrome", "edge", "firefox",
+    "桌面", "窗口", "屏幕", "鼠标", "键盘", "点击", "双击", "右键", "最大化", "最小化",
 )
 _WEB_MARKERS = (
     "浏览器", "网页", "网站", "淘宝", "京东", "百度", "google", "browser", "website",

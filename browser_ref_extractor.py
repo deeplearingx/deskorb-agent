@@ -32,6 +32,16 @@ _NODE_VALUE = re.compile(
 )
 _FIELD_VALUE = re.compile(r"^\s*(?P<label>[^\s:：]{1,80})\s*[:：]\s*(?P<value>.+?)\s*$")
 _HEADING = re.compile(r"^\s*-\s+heading\s+(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')")
+_NAMED_NODE = re.compile(
+    r"^\s*-\s+(?P<role>heading|link|img|strong)\b"
+    r"(?:\s+\[[^\]]+\])*\s+"
+    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
+)
+_PRICE_VALUE = re.compile(
+    r"(?<![\w])(?:[$€£¥￥₹]\s*\d+(?:[.,]\d{1,2})?"
+    r"|\d+(?:[.,]\d{1,2})?\s*(?:USD|EUR|GBP|CNY|RMB|元|人民币))(?![\w])",
+    re.IGNORECASE,
+)
 _PAGE_URL = re.compile(r"^\s*-\s+Page URL:\s*(?P<url>https?://\S+)\s*$", re.IGNORECASE)
 _SNAPSHOT_LIMIT = 128 * 1024
 _FIELD_ALIASES = {
@@ -196,8 +206,9 @@ def parse_ref_snapshot(content: Any, ref: str, fields: list[str] | tuple[str, ..
 
     This is intentionally a parser for the adapter's generated snapshot
     envelope, not a general YAML or HTML parser.  The first YAML node must be
-    the requested ref, and only labelled ``title``, ``price``, ``source`` and
-    ``url`` values inside that node are projected.
+    the requested ref.  Explicit field labels are preferred; standard
+    accessibility names and currency values are also accepted for real DOM
+    cards whose title and price are represented by nested link/paragraph nodes.
     """
     requested = [field for field in requested_fields({"fields": list(fields)})]
     empty = {field: "" for field in requested}
@@ -250,10 +261,20 @@ def parse_ref_snapshot(content: Any, ref: str, fields: list[str] | tuple[str, ..
 
     values_by_canonical: dict[str, str] = {}
     heading_title = ""
+    named_titles: list[tuple[int, str]] = []
     for line in body:
         heading = _HEADING.match(line)
         if heading and not heading_title:
             heading_title = _unquote_scalar(heading.group("value"))
+        named = _NAMED_NODE.match(line)
+        if named:
+            role = named.group("role").casefold()
+            title = _unquote_scalar(named.group("value"))
+            if title:
+                named_titles.append((
+                    {"heading": 0, "strong": 0, "link": 1, "img": 2}.get(role, 3),
+                    title,
+                ))
         node = _NODE_VALUE.match(line)
         if not node:
             continue
@@ -275,6 +296,9 @@ def parse_ref_snapshot(content: Any, ref: str, fields: list[str] | tuple[str, ..
                 field_value = _safe_http_url(field_value, base_url=safe_base_url)
             if field_value and canonical not in values_by_canonical:
                 values_by_canonical[canonical] = field_value
+        price_match = _PRICE_VALUE.search(value)
+        if price_match and "price" not in values_by_canonical:
+            values_by_canonical["price"] = price_match.group(0).strip()
         if _canonical_field(label) not in _FIELD_ALIASES and label.casefold() in {"heading", "strong"}:
             title_value = _unquote_scalar(value)
             if title_value and "title" not in values_by_canonical:
@@ -299,6 +323,8 @@ def parse_ref_snapshot(content: Any, ref: str, fields: list[str] | tuple[str, ..
 
     if heading_title and "title" not in values_by_canonical:
         values_by_canonical["title"] = heading_title[:MAX_VALUE_CHARS]
+    if named_titles and "title" not in values_by_canonical:
+        values_by_canonical["title"] = sorted(named_titles, key=lambda item: item[0])[0][1][:MAX_VALUE_CHARS]
     projected: dict[str, str] = {}
     for field in requested:
         canonical = _canonical_field(field)

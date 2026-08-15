@@ -58,11 +58,37 @@ class CodexWorkerTests(unittest.TestCase):
 
     def test_api_backend_does_not_send_images_to_text_only_provider(self):
         self.worker._backend = "api"
-        with patch.object(self.worker, "_run_api_turn") as run_api:
+        with patch("worker.API_IMAGE_INPUT_ENABLED", False), \
+             patch.object(self.worker, "_run_api_turn") as run_api:
             self.worker._run_turn("请回答这个问题", ["C:/tmp/auto-shot.png"])
         run_api.assert_called_once_with(
             "请回答这个问题", [], ephemeral=False, office_plan=False, office_generation=None,
         )
+
+    def test_api_backend_sends_images_when_visual_input_is_enabled(self):
+        self.worker._backend = "api"
+        image_paths = ["C:/tmp/auto-shot.png"]
+        with patch("worker.API_IMAGE_INPUT_ENABLED", True), \
+             patch.object(self.worker, "_run_api_turn") as run_api:
+            self.worker._run_turn("请识别这个截图", image_paths)
+        run_api.assert_called_once_with(
+            "请识别这个截图", image_paths, ephemeral=False, office_plan=False,
+            office_generation=None,
+        )
+
+    def test_api_backend_routes_browser_and_desktop_tasks_to_agent_runtime(self):
+        self.worker._backend = "api"
+        for text in ("打开浏览器搜索百度", "打开 Chrome"):
+            with self.subTest(text=text), \
+                 patch.object(self.worker._agent, "_mcp_servers_for_task", return_value=()), \
+                 patch.object(self.worker, "_run_agent_turn") as run_agent, \
+                 patch.object(self.worker, "_run_api_turn") as run_api:
+                self.worker._run_turn(text, [])
+            run_agent.assert_called_once_with(
+                text, [], ephemeral=False, office_plan=False,
+                office_context=False, office_generation=None,
+            )
+            run_api.assert_not_called()
 
     def test_api_backend_routes_officecli_tasks_to_mcp_agent_runtime(self):
         self.worker._backend = "api"
@@ -243,6 +269,33 @@ class CodexWorkerTests(unittest.TestCase):
             [("user", "hello"), ("assistant", "fast")],
         )
 
+    def test_api_stream_ignores_gateway_keepalive_text_delta(self):
+        class FakeResponse:
+            def __iter__(self):
+                return iter([
+                    b'data: {"type":"response.output_text.delta","item_id":"SSE-Keep-Alive","delta":"\\u200b","SSE-Keep-Alive":true}\n',
+                    b'data: {"type":"response.output_text.delta","delta":"fast"}\n',
+                    b'data: {"type":"response.completed","response":{"id":"resp_keepalive"}}\n',
+                ])
+
+            def close(self):
+                pass
+
+        self.worker._model = "test-model"
+        self.worker._api_base_url = "https://example.test/v1"
+        self.worker._model_provider = "responses"
+        self.worker._adapter = ModelAdapter("responses", self.worker._api_base_url)
+        with patch("worker.get_api_key", return_value="secret"), \
+             patch("worker.urllib.request.urlopen", return_value=FakeResponse()):
+            self.worker._run_api_turn("hello", [])
+        events = self.drain()
+        self.assertIn(("delta", "fast"), events)
+        self.assertNotIn(("delta", "\u200b"), events)
+        self.assertEqual(
+            [(item.role, item.text) for item in self.worker._api_context.messages],
+            [("user", "hello"), ("assistant", "fast")],
+        )
+
     def test_chat_completion_stream_becomes_delta_and_keeps_local_history(self):
         class FakeResponse:
             def __iter__(self):
@@ -284,4 +337,3 @@ class CodexWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,0 +1,9 @@
+name: deskorb-agent-release
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -r requirements.txt
+      - typing-extensions>=4.12

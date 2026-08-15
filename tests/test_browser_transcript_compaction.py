@@ -48,6 +48,26 @@ def test_browser_result_projection_removes_duplicate_snapshot_bodies():
     assert "content" not in projected["observations"][0]
 
 
+def test_browser_result_projection_preserves_find_text_targets():
+    runtime = _runtime_with_browser_checkpoint()
+    result = {
+        "ok": True,
+        "query": "Search",
+        "matched": True,
+        "matched_refs": [{
+            "ref": "search-box", "role": "textbox", "name": "Search",
+        }],
+        "matched_ref_count": 1,
+        "observation_id": "obs-2",
+    }
+
+    projected = json.loads(runtime._browser_tool_output_for_model(result))
+
+    assert projected["matched_refs"] == [{
+        "ref": "search-box", "role": "textbox", "name": "Search",
+    }]
+
+
 def test_browser_transcript_keeps_current_call_pair_but_drops_old_page_output():
     runtime = _runtime_with_browser_checkpoint()
     response = {

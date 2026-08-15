@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 
 import complex_browser_acceptance as base
 from browser_evidence import parse_github_star_count, parse_github_relative_date
+from browser_task_spec import BrowserTaskSpec
 
 
 EXTENDED_SCENARIOS: dict[str, dict[str, Any]] = {
@@ -102,7 +103,7 @@ EXTENDED_PROMPT_CONTRACTS: dict[str, str] = {
     "case-03-conditional-4399": """
 扩展验收约束：
 - 先观察搜索结果并判断是否存在官方网站；只打开当前快照中真实出现的可信链接。
-- 如果页面出现弹窗，只关闭弹窗；通过 find_text 定位造梦西游入口，提取 fields ["title", "url"] 并 verify 1 条证据。
+- 如果页面出现弹窗，只关闭弹窗；如果首页没有目标，使用当前快照中观察到的站内搜索框搜索原始任务里的目标词，再通过 find_text 定位名称包含目标词的真实入口，不能把插件、下载、查看详情或帮助链接当作目标；提取 fields ["title", "url"]，并用运行时从原始任务提取的 target_terms verify 1 条证据。
 - 找到游戏入口后立即停止，不要点击启动游戏、开始游戏、下载、登录或任何游戏内操作；不要用凭空猜测的 URL。
 """.strip(),
     "case-04-infinite-news": """
@@ -136,7 +137,6 @@ def prepare_catalog() -> None:
         raise RuntimeError(f"extended cases already installed: {sorted(duplicate)}")
     base.SCENARIOS.update(EXTENDED_SCENARIOS)
     base._PROMPT_CASE_CONTRACTS.update(EXTENDED_PROMPT_CONTRACTS)
-    base._PER_RECORD_REQUIRED_CASES.update(EXTENDED_SCENARIOS)
 
 
 def _records(run: dict[str, Any]) -> list[dict[str, Any]]:
@@ -184,6 +184,23 @@ def _custom_completion_failure(case_id: str, run: dict[str, Any]) -> str | None:
         }
         if not wikipedia_sources:
             return "wikipedia_final_page_evidence_missing"
+    elif case_id == "case-03-conditional-4399":
+        # A generic site/plugin/help link is not the requested entry. Require
+        # the evidence itself to contain the immutable target phrase derived
+        # from the original task; the model's prose and page source URL are
+        # not sufficient.
+        spec = BrowserTaskSpec.from_goal(str(scenario.get("prompt") or ""))
+        target_terms = tuple(str(item).casefold() for item in spec.target_terms if str(item).strip())
+        if not target_terms:
+            return "conditional_target_terms_missing"
+        game_entry = False
+        for fields in records:
+            searchable = " ".join(str(value).casefold() for value in fields.values())
+            if any(term in searchable for term in target_terms):
+                game_entry = True
+                break
+        if not game_entry:
+            return "conditional_game_entry_evidence_missing"
     return None
 
 

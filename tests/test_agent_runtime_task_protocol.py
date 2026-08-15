@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -88,6 +89,31 @@ class AgentRuntimeTaskProtocolTests(unittest.TestCase):
             self.assertEqual(progress[-1]["terminal"], "failed")
             self.assertEqual(progress[-1]["failure_kind"], "required_action_missing")
             self.assertEqual(journal.task(progress[-1]["task_id"])["status"], TASK_STATUS_FAILED)
+
+    def test_search_only_browser_task_accepts_verified_search_navigation_before_prose(self):
+        with tempfile.TemporaryDirectory() as directory:
+            events = Queue()
+            journal = InMemoryTaskJournal()
+            runtime = AgentRuntime(events, "fixture-model", "https://example.test/v1",
+                                   working_dir=Path(directory), task_journal=journal)
+            runtime._task_authorized_until = time.monotonic() + 30
+            runtime._request = Mock(side_effect=[
+                {"output": [{"type": "function_call", "call_id": "search",
+                             "name": "browser_action_batch", "arguments": "{\"actions\":[]}"}]},
+                {"output_text": "已显示搜索结果", "output": []},
+            ])
+            with patch("agent_runtime.get_api_key", return_value="fixture-key"), \
+                 patch.object(runtime, "_run_local_tool", return_value={
+                     "ok": True, "verified": True, "state_changed": True,
+                     "verification": {"passed": True, "kind": "browser_search_result"},
+                 }):
+                runtime.run_turn("在浏览器里搜索4399", [])
+
+            progress = [value for kind, value in list(events.queue)
+                        if kind == "task_progress" and isinstance(value, dict) and value.get("terminal")]
+            self.assertEqual(runtime._request.call_count, 2)
+            self.assertEqual(progress[-1]["terminal"], "completed")
+            self.assertTrue(progress[-1]["verified"])
 
     def test_empty_user_input_is_blocked_without_model_request(self):
         events = Queue()

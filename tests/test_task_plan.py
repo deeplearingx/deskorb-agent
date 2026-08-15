@@ -58,6 +58,16 @@ class TaskPlanTests(unittest.TestCase):
         self.assertTrue(plan.high_risk)
         self.assertIn("confirmation", plan.evidence_contract)
 
+    def test_installed_browser_launch_is_a_desktop_plan(self):
+        for goal in ("打开 Chrome", "启动 Edge", "打开 Firefox"):
+            with self.subTest(goal=goal):
+                self.assertEqual(TaskPlan.from_goal(goal).primary_phase, "desktop")
+
+    def test_common_desktop_action_words_are_desktop_plans(self):
+        for goal in ("点击桌面图标", "把当前窗口最大化", "用鼠标右键点击屏幕"):
+            with self.subTest(goal=goal):
+                self.assertEqual(TaskPlan.from_goal(goal).primary_phase, "desktop")
+
 
 if __name__ == "__main__":
     unittest.main()

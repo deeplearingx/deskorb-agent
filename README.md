@@ -25,6 +25,22 @@ environment such as `marketmind` for this project. The legacy `setup.cmd`
 portable-`.venv` flow remains available for compatibility, but it is not the
 default project runtime.
 
+### Environment setup scripts
+
+To prepare the full development and release environment in one step, run:
+
+```powershell
+.\setup-all.cmd -InstallPortableTools -InstallDotNet -BuildOfficeCli
+```
+
+Add `-InstallWhisperX` when meeting recording and local transcription are
+required. The script prepares the `deskorb-agent` Conda environment, the
+pinned Playwright MCP and Chromium browser, optional portable Node.js,
+PowerShell 7, MinGit and .NET 10 runtimes, and the self-contained OfficeCLI binary.
+Use `.\check-environment.cmd` to inspect the current state without changing
+the environment. Detailed options and reproducible version pinning are
+documented in [`packaging\README.md`](packaging/README.md).
+
 The overlay starts with `workspace-write` sandboxing. The status-bar
 **Read-only** toggle switches subsequent turns to a read-only sandbox. The
 adapter never uses `--dangerously-bypass-approvals-and-sandbox`.
@@ -55,9 +71,9 @@ Configuration overrides:
   window region; it defaults to the frameless-window setting.
 - `DESKORB_AGENT_RECENT_TURNS`: verbatim API recency window (defaults to `6`)
 - `DESKORB_AGENT_SUMMARY_TOKENS`: rolling-summary output cap (defaults to `1200`)
-- `DESKORB_AGENT_API_IMAGE_INPUT`: set to `1` only when the selected API model accepts
-  Responses API image input; defaults to `0` for text-only endpoints such as the tested
-  `glm-5.2` configuration
+- `DESKORB_AGENT_API_IMAGE_INPUT`: controls forwarding screenshots as Responses API
+  `input_image` blocks. It defaults to enabled; set it to `0` for text-only endpoints.
+  The currently verified `api.aijws.com`/`gpt-5.6-terra` gateway accepts this format.
 - `DESKORB_AGENT_OFFICE_MAX_NONEMPTY_CELLS`: Excel attachment cell cap (defaults to `10000`)
 - `DESKORB_AGENT_OFFICE_MAX_RENDERED_CHARS`: Office attachment character cap (defaults to `120000`)
 - `DESKORB_AGENT_OFFICECLI_AUTO_APPROVE`: retained for compatibility. In Full access,
@@ -192,9 +208,9 @@ Windows mouse/keyboard control; Codex mode is optional. When
 `DESKORB_AGENT_PROVIDER=deepseek` or `qwen` is set, the runtime uses that provider's
 Chat Completions endpoint while retaining the same internal tool transcript. If API mode receives an
 OfficeCLI task, DeskOrb automatically routes that task through the MCP-capable Agent
-Runtime. Automatic screenshots are omitted from API/Agent requests by default because
-the configured `glm-5.2` endpoint accepts text only; enable them only after verifying
-the selected model supports image input.
+Runtime. For the verified `api.aijws.com`/`gpt-5.6-terra` gateway, automatic screenshots
+are forwarded as Responses API `input_image` blocks. Set
+`DESKORB_AGENT_API_IMAGE_INPUT=0` when using a text-only endpoint.
 
 ### Local MCP: browser, PowerToys, and OfficeCLI
 

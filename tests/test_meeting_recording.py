@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -16,6 +17,16 @@ from meeting_recording import (
     WhisperXTranscriber,
     parse_whisperx_json,
 )
+
+
+class WhisperXPackageLayoutTests(unittest.TestCase):
+    def test_vads_package_exports_classes_used_by_asr(self):
+        vads_init = Path(__file__).resolve().parents[1] / "whisperX-main" / "whisperx" / "vads" / "__init__.py"
+        self.assertTrue(vads_init.is_file(), "WhisperX vads package must export its public classes")
+        source = vads_init.read_text(encoding="utf-8")
+        for name in ("Vad", "Silero", "Pyannote"):
+            self.assertIn(f"from .", source)
+            self.assertIn(name, source)
 
 
 class WhisperXCommandBuilderTests(unittest.TestCase):

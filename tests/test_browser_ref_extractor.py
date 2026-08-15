@@ -94,6 +94,30 @@ class BrowserRefSnapshotTests(unittest.TestCase):
         self.assertEqual(result["fields"]["source"], "fastapi.tiangolo.com")
         self.assertEqual(result["fields"]["url"], "https://fastapi.tiangolo.com/zh/")
 
+    def test_extracts_standard_playwright_product_card_snapshot(self):
+        content = [{"type": "text", "text": """### Page
+- Page URL: https://books.toscrape.com/
+### Snapshot
+```yaml
+- article [ref=e152]:
+  - link [ref=e154] [cursor=pointer]:
+    - /url: catalogue/tipping-the-velvet_999/index.html
+    - img "Tipping the Velvet" [ref=e155]
+  - heading [level=3] [ref=e162]:
+    - link "Tipping the Velvet" [ref=e163] [cursor=pointer]:
+      - /url: catalogue/tipping-the-velvet_999/index.html
+  - generic [ref=e164]:
+    - paragraph [ref=e165]: £53.74
+```"""}]
+
+        result = parse_ref_snapshot(content, "e152", ["title", "price"])
+
+        self.assertTrue(result["trusted_ref"])
+        self.assertEqual(result["fields"], {
+            "title": "Tipping the Velvet",
+            "price": "£53.74",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,7 @@ import json
 import re
 import secrets
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from typing import Any, Callable, Iterable, Protocol
 
 from browser_actions import STATE_CHANGING_ACTIONS, BrowserAction, validate_browser_action_batch
@@ -27,6 +27,7 @@ from browser_cache import (
 )
 from browser_evidence import (
     BrowserEvidenceLedger,
+    compatible_public_origin,
     decode_browser_content,
     extract_list_from_snapshot,
     is_safe_public_browser_url,
@@ -195,6 +196,7 @@ class BrowserExecutionSession:
         "browser_research_repository_navigation_blocked",
         "browser_research_record_required_before_issues", "browser_evidence_insufficient",
         "browser_navigation_requires_observed_link", "browser_navigation_origin_not_allowed",
+        "browser_site_search_required",
     })
     _SNAPSHOT_RECOVERY_ACTIONS = frozenset({
         "click_ref", "fill_ref", "select_ref", "press_key", "open_ref_new_tab",
@@ -209,6 +211,10 @@ class BrowserExecutionSession:
 
     _REOBSERVATION_FAILURES = frozenset({
         "browser_mcp_connection_failed", "tool_execution_timeout",
+    })
+    _EVIDENCE_STATE_CHANGE_ACTIONS = frozenset({
+        "navigate", "fill_ref", "click_ref", "select_ref", "press_key", "wait",
+        "scroll", "go_back", "switch_tab", "open_ref_new_tab", "close_tab",
     })
     _SEARCH_FALLBACK_HOSTS = frozenset({
         "google.com", "www.google.com", "bing.com", "www.bing.com", "cn.bing.com",
@@ -232,7 +238,9 @@ class BrowserExecutionSession:
                  required_evidence_before_issues: Iterable[str] | None = None,
                  strict_navigation_origins: bool | None = None,
                  search_discovery_required: bool = False,
+                 search_query: str = "",
                  repository_research_only: bool = False,
+                 required_entry_terms: Iterable[str] | None = None,
                  handoff_timeout_seconds: int = 120, clock=time.monotonic,
                  on_state_action: Callable[[str, str], None] | None = None,
                  locator_key: bytes | None = None):
@@ -259,7 +267,13 @@ class BrowserExecutionSession:
             if strict_navigation_origins is None else strict_navigation_origins
         )
         self.search_discovery_required = bool(search_discovery_required)
+        self.search_query = " ".join(str(search_query or "").casefold().split())[:120]
         self.repository_research_only = bool(repository_research_only)
+        self.required_entry_terms = tuple(dict.fromkeys(
+            str(term).strip().casefold()
+            for term in (required_entry_terms or ())
+            if str(term).strip()
+        ))[:8]
         self.handoff_timeout_seconds = max(1, int(handoff_timeout_seconds))
         self.clock = clock
         self.on_state_action = on_state_action
@@ -290,6 +304,7 @@ class BrowserExecutionSession:
         self._last_verify_observation_id = ""
         self._last_evidence_state_signature: str | None = None
         self._has_evidence_state_signature = False
+        self._evidence_state_change_required = False
         self._evidence_failure_count = 0
         self._trusted_extractor = TrustedBrowserRefExtractor()
         self._interaction_stage = "unknown"
@@ -316,6 +331,9 @@ class BrowserExecutionSession:
         self._authorized_high_risk: dict[str, Any] | None = None
         self._confirmation_count = 0
         self._login_flow_verified = False
+        self._entry_target_search_satisfied = not bool(self.required_entry_terms)
+        self._entry_target_refs: set[str] = set()
+        self._entry_site_search_required = False
 
     @property
     def observation_id(self) -> str:
@@ -373,6 +391,18 @@ class BrowserExecutionSession:
         ]
         if self._handoff_required or self._reobservation_required:
             return ["snapshot"]
+        if self._evidence_state_change_required:
+            return [
+                "navigate", "fill_ref", "click_ref", "select_ref",
+                "press_key", "wait", "scroll", "go_back", "switch_tab",
+                "open_ref_new_tab", "close_tab",
+            ]
+        if self.required_entry_terms and not self._entry_target_search_satisfied:
+            return [
+                "navigate", "snapshot", "fill_ref", "click_ref", "select_ref",
+                "press_key", "wait", "find_text", "scroll", "go_back",
+                "list_tabs", "switch_tab", "open_ref_new_tab", "close_tab",
+            ]
         if (self._research_relocation_required
                 and not self._is_github_repository_url(self._current_page_url)):
             return ["snapshot", "find_text", "list_tabs", "switch_tab", "open_ref_new_tab",
@@ -380,6 +410,13 @@ class BrowserExecutionSession:
         if self._interaction_stage == "evidence_ready":
             return ["verify"]
         if self._interaction_stage == "result_ready":
+            if self.required_entry_terms and not self._entry_target_search_satisfied:
+                return ["snapshot", "find_text", "list_tabs", "go_back", "navigate"]
+            if self.required_entry_terms:
+                return [
+                    "snapshot", "find_text", "list_tabs", "switch_tab",
+                    "click_ref", "open_ref_new_tab", "extract", "verify",
+                ]
             # A click may have opened a new target=_blank tab while the
             # current tab still exposes its old page.  Keep tab switching
             # available until evidence is verified; the action remains bound
@@ -405,6 +442,16 @@ class BrowserExecutionSession:
         ]
         if self._handoff_required or self._reobservation_required:
             return ["snapshot"]
+        if self._evidence_state_change_required:
+            return [
+                "navigate", "fill_ref", "click_ref", "select_ref",
+                "press_key", "wait", "scroll", "go_back", "switch_tab",
+                "open_ref_new_tab", "close_tab",
+            ]
+        if self.required_entry_terms and not self._entry_target_search_satisfied:
+            return [item for item in all_actions if item not in {"extract", "extract_list", "verify"}]
+        if self.required_entry_terms:
+            return [item for item in all_actions if item != "extract_list"]
         if (self._research_relocation_required
                 and not self._is_github_repository_url(self._current_page_url)):
             return ["snapshot", "find_text", "list_tabs", "switch_tab", "open_ref_new_tab",
@@ -477,6 +524,80 @@ class BrowserExecutionSession:
                 final = self._failure(
                     "browser_research_repository_page_required",
                     "Relocate to an observed GitHub /owner/repository page before collecting research evidence.",
+                    requires_reobservation=False,
+                )
+                self._action_steps += 1
+                self._action_log.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                })
+                observations.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                    "failure_kind": final.get("failure_kind"),
+                    "observation_id": self._observation_id,
+                })
+                break
+            if self.required_entry_terms and action.action == "extract_list":
+                final = self._failure(
+                    "browser_target_extract_requires_ref",
+                    "An entry task requires one singular extract on the target ref returned by find_text; "
+                    "broad list extraction is not permitted before the target is identified.",
+                    target_terms=list(self.required_entry_terms),
+                    required_action="extract",
+                    target_refs=sorted(self._entry_target_refs)[:16],
+                    requires_reobservation=False,
+                )
+                self._action_steps += 1
+                self._action_log.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                })
+                observations.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                    "failure_kind": final.get("failure_kind"),
+                    "observation_id": self._observation_id,
+                })
+                break
+            if (self.required_entry_terms
+                    and not self._entry_target_search_satisfied
+                    and action.action in {"extract", "verify"}):
+                final = self._failure(
+                    "browser_target_search_required",
+                    "Before extracting entry evidence, use find_text with one immutable target phrase "
+                    "from the user task. If it is absent, locate the observed site-search field, "
+                    "search the target, and observe the results before extracting.",
+                    target_terms=list(self.required_entry_terms),
+                    required_action="find_text",
+                    requires_reobservation=False,
+                )
+                self._action_steps += 1
+                self._action_log.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                })
+                observations.append({
+                    "action": action.action,
+                    "ok": False,
+                    "state_changed": False,
+                    "failure_kind": final.get("failure_kind"),
+                    "observation_id": self._observation_id,
+                })
+                break
+            if (self.required_entry_terms and action.action == "extract"
+                    and str(action.arguments.get("ref") or "") not in self._entry_target_refs):
+                final = self._failure(
+                    "browser_target_ref_required",
+                    "Extract only the current observed ref returned by find_text for the requested entry target.",
+                    target_terms=list(self.required_entry_terms),
+                    required_action="find_text",
+                    target_refs=sorted(self._entry_target_refs)[:16],
                     requires_reobservation=False,
                 )
                 self._action_steps += 1
@@ -588,6 +709,30 @@ class BrowserExecutionSession:
         result["tab_pair_progress"] = self.tab_pair_progress
         return result
 
+    def _observed_search_controls(self) -> list[dict[str, str]]:
+        """Expose only current-observation, non-credential search controls."""
+        controls: list[dict[str, str]] = []
+        for candidate in parse_snapshot_candidates(self._last_snapshot):
+            role = str(candidate.role or "").casefold()
+            name = str(candidate.name or "").strip()
+            text = " ".join((role, name, *candidate.parent_roles, *candidate.state_tokens)).casefold()
+            if any(marker in text for marker in (
+                    "password", "credential", "username", "email",
+                    "密码", "凭据", "用户名", "邮箱")):
+                continue
+            if role not in {"searchbox", "textbox", "combobox", "input"} and not any(
+                    marker in text for marker in ("search", "find", "query", "搜索", "查找", "检索")
+            ):
+                continue
+            controls.append({
+                "ref": str(candidate.ref or "")[:80],
+                "role": role[:40],
+                "name": name[:160],
+            })
+            if len(controls) >= 8:
+                break
+        return controls
+
     def _find_text(self, arguments: dict[str, Any]) -> dict[str, Any]:
         supplied = str(arguments.get("observation_id") or "")
         if not self._observation_id or supplied != self._observation_id:
@@ -597,6 +742,34 @@ class BrowserExecutionSession:
         if not query or len(query) > 160:
             return self._failure("invalid_browser_find_query",
                                  "Text search requires a bounded non-empty plain-text query.")
+        query_folded = query.casefold()
+        target_query = bool(
+            self.required_entry_terms
+            and any(term in query_folded for term in self.required_entry_terms)
+        )
+        # Once the current page has shown the target as ordinary text without
+        # an actionable link, repeating the same lookup cannot make progress.
+        # Force the model through an observed site-search control first.  The
+        # guard is task-generic: it carries the immutable target terms from the
+        # request, never a hard-coded game or website name.
+        if target_query and self._entry_site_search_required:
+            search_controls = self._observed_search_controls()
+            return self._failure(
+                "browser_site_search_required",
+                "The target phrase was already observed without an actionable link. "
+                "First locate an observed Search/搜索 textbox, fill the immutable target phrase, "
+                "submit it as a separate state action, and observe the results before searching "
+                "for the target again.",
+                query=query,
+                target_terms=list(self.required_entry_terms),
+                required_action=("fill_ref" if search_controls else "find_text"),
+                search_query_required=True,
+                search_refs=[str(item.get("ref") or "") for item in search_controls],
+                preferred_search_ref=(str(search_controls[0].get("ref") or "")
+                                      if search_controls else ""),
+                search_controls=search_controls[:8],
+                requires_reobservation=False,
+            )
         try:
             result = self.backend.call("find_text", {"query": query})
         except Exception as exc:
@@ -616,7 +789,6 @@ class BrowserExecutionSession:
                 # a structured match count.
                 rendered = json.dumps(result.get("content", ""), ensure_ascii=False)
                 matched = query.casefold() in rendered.casefold()
-            query_folded = query.casefold()
             matched_refs = []
             for candidate in parse_snapshot_candidates(self._last_snapshot):
                 candidate_text = " ".join((candidate.name, candidate.role, *candidate.parent_roles)).casefold()
@@ -639,6 +811,28 @@ class BrowserExecutionSession:
                     matched_refs.append(matched_ref)
                 if len(matched_refs) >= 16:
                     break
+            # Entry targets must prefer an observed actionable link over a
+            # search box or a container whose text merely contains the target.
+            # The preference is only for the immutable user target and never
+            # invents a URL; every href still comes from this snapshot.
+            if target_query:
+                actionable_target_refs = [
+                    item for item in matched_refs
+                    if item.get("href") and any(
+                        term in str(item.get("name") or "").casefold()
+                        for term in self.required_entry_terms
+                    )
+                ]
+                if actionable_target_refs:
+                    matched_refs = actionable_target_refs
+                else:
+                    matched_refs = []
+                matched_refs.sort(key=lambda item: (
+                    0 if item.get("href") else 1,
+                    0 if str(item.get("role") or "").casefold()
+                    in {"link", "button", "menuitem", "option"} else 1,
+                    str(item.get("ref") or ""),
+                ))
             # Login labels commonly occur on both a non-navigating button and
             # the actual observed authentication link.  Prefer the actionable
             # public link for this security-sensitive semantic query while
@@ -680,6 +874,104 @@ class BrowserExecutionSession:
                         "matched_refs": matched_refs,
                         "matched_ref_count": len(matched_refs),
                         "content_trust": "untrusted_page_data", "state_changed": False}
+            search_control_query = bool(
+                self.required_entry_terms
+                and not target_query
+                and any(marker in query_folded for marker in
+                        ("search", "find", "query", "搜索", "查找", "检索"))
+            )
+            if search_control_query:
+                search_controls = [
+                    item for item in matched_refs
+                    if str(item.get("role") or "").casefold()
+                    in {"searchbox", "textbox", "combobox", "input"}
+                ]
+                if search_controls:
+                    self._entry_site_search_required = False
+                    response["search_refs"] = [
+                        str(item.get("ref") or "") for item in search_controls[:8]
+                        if str(item.get("ref") or "").strip()
+                    ]
+                    response["preferred_search_ref"] = str(
+                        search_controls[0].get("ref") or ""
+                    )
+            target_query = bool(
+                self.required_entry_terms
+                and any(term in query_folded for term in self.required_entry_terms)
+            )
+            if target_query:
+                if response.get("matched") and matched_refs:
+                    self._entry_target_search_satisfied = True
+                    self._entry_target_refs = {
+                        str(item.get("ref")) for item in matched_refs
+                        if str(item.get("ref") or "").strip()
+                    }
+                    response["target_refs"] = sorted(self._entry_target_refs)[:16]
+                    response["preferred_target_ref"] = str(matched_refs[0].get("ref") or "")
+                    preferred_target = matched_refs[0]
+                    target_fields = {
+                        "title": str(preferred_target.get("name") or "").strip()[:400],
+                        "url": str(preferred_target.get("href") or "").strip()[:1000],
+                    }
+                    current_host = str(urlsplit(self._current_page_url).hostname or "").casefold().rstrip(".")
+                    # A search-engine result is only an observed lead. Its
+                    # displayed href may be a same-engine tracking wrapper,
+                    # so it must be opened before it can become final target
+                    # evidence, regardless of how the task was classified.
+                    search_result_page = current_host in self._SEARCH_FALLBACK_HOSTS
+                    if all(target_fields.values()) and not search_result_page:
+                        self._extractions.append({
+                            "kind": "target_ref",
+                            "fields": target_fields,
+                            "trusted_ref": True,
+                            "observation_id": self._observation_id,
+                        })
+                        self._evidence_ledger.add(
+                            kind="target_ref", tab_id=self._tab_id,
+                            observation_id=self._observation_id,
+                            source_url=self._current_page_url,
+                            fields=target_fields,
+                            supporting_text=query,
+                        )
+                        self._set_interaction_stage("evidence_ready")
+                elif response.get("matched"):
+                    self._entry_site_search_required = True
+                    search_controls = self._observed_search_controls()
+                    return self._failure(
+                        "browser_target_link_required",
+                        "The target phrase appears as page text but has no actionable observed ref. "
+                        "Use the observed site-search field or an observed result link before extracting.",
+                        query=query,
+                        target_terms=list(self.required_entry_terms),
+                        required_action=("fill_ref" if search_controls else "find_text"),
+                        search_refs=[str(item.get("ref") or "") for item in search_controls],
+                        preferred_search_ref=(str(search_controls[0].get("ref") or "")
+                                              if search_controls else ""),
+                        search_controls=search_controls[:8],
+                        requires_reobservation=False,
+                        content=self._bounded_snapshot_content(
+                            response.get("content"), self._MAX_MODEL_SNAPSHOT_CHARS,
+                        ),
+                    )
+                else:
+                    self._entry_site_search_required = True
+                    search_controls = self._observed_search_controls()
+                    return self._failure(
+                        "browser_target_text_not_found",
+                        "The requested entry target is not present in this page observation. "
+                        "Use an observed site-search field or an observed result link before extracting.",
+                        query=query,
+                        target_terms=list(self.required_entry_terms),
+                        required_action=("fill_ref" if search_controls else "find_text"),
+                        search_refs=[str(item.get("ref") or "") for item in search_controls],
+                        preferred_search_ref=(str(search_controls[0].get("ref") or "")
+                                              if search_controls else ""),
+                        search_controls=search_controls[:8],
+                        requires_reobservation=False,
+                        content=self._bounded_snapshot_content(
+                            response.get("content"), self._MAX_MODEL_SNAPSHOT_CHARS,
+                        ),
+                    )
             if "content" in response:
                 response["content"] = self._bounded_snapshot_content(
                     response.get("content"), self._MAX_MODEL_SNAPSHOT_CHARS,
@@ -705,6 +997,29 @@ class BrowserExecutionSession:
         # still bounded and does not widen navigation or permissions.
         snapshot_text = str(self._last_snapshot or "")
         matched = query.casefold() in snapshot_text.casefold()
+        target_query = bool(
+            self.required_entry_terms
+            and any(term in query.casefold() for term in self.required_entry_terms)
+        )
+        if target_query:
+            if matched:
+                self._entry_target_search_satisfied = True
+            else:
+                search_controls = self._observed_search_controls()
+                return self._failure(
+                    "browser_target_text_not_found",
+                    "The requested entry target is not present in this page observation. "
+                    "Use an observed site-search field or an observed result link before extracting.",
+                    query=query,
+                    target_terms=list(self.required_entry_terms),
+                    required_action=("fill_ref" if search_controls else "find_text"),
+                    search_refs=[str(item.get("ref") or "") for item in search_controls],
+                    preferred_search_ref=(str(search_controls[0].get("ref") or "")
+                                          if search_controls else ""),
+                    search_controls=search_controls[:8],
+                    requires_reobservation=False,
+                    content=[],
+                )
         return {
             "ok": True,
             "query": query,
@@ -932,8 +1247,13 @@ class BrowserExecutionSession:
         observed_url = page_url_from_content(content)
         if observed_url:
             observed_origin = origin_from_url(observed_url)
+            origin_allowed = bool(
+                observed_origin in self._allowed_origins
+                or any(compatible_public_origin(known, observed_origin)
+                       for known in self._allowed_origins)
+            )
             if (self.strict_navigation_origins and self._allowed_origins and observed_origin
-                    and observed_origin not in self._allowed_origins):
+                    and not origin_allowed):
                 self._reobservation_required = True
                 return self._failure(
                     "browser_navigation_origin_changed",
@@ -980,6 +1300,12 @@ class BrowserExecutionSession:
             return True
         if self._cache_verified:
             return action in {"snapshot", "list_tabs", "extract", "verify"}
+        if (self._evidence_state_change_required
+                and action in {"extract", "extract_list", "verify"}):
+            return False
+        if (self._evidence_state_change_required and not self._reobservation_required
+                and action in {"snapshot", "find_text", "list_tabs"}):
+            return False
         if self._interaction_stage == "ready_to_choose":
             # fill_ref is intentionally absent from next_allowed_actions, but
             # reaches its dedicated input-stage lock for clearer diagnostics.
@@ -1003,6 +1329,74 @@ class BrowserExecutionSession:
             return False
         parts = [part.casefold() for part in str(parsed.path or "").split("/") if part]
         return len(parts) >= 2 and parts[0] not in cls._GITHUB_NON_REPOSITORY_SEGMENTS
+
+    @staticmethod
+    def _normalized_search_text(value: Any) -> str:
+        return " ".join(str(value or "").casefold().split())
+
+    def _search_result_verification(self, action: str, before_url: str,
+                                    after_url: str) -> dict[str, Any] | None:
+        """Return bounded evidence when a requested public search is visible.
+
+        A search-only task should not require the model to perform a second
+        extract/verify round after the search result page is already reached.
+        The URL is trusted runtime state; page prose is deliberately not used
+        as the proof.  Complex tasks still have their own evidence gates in
+        ``AgentRuntime._browser_task_spec_verified``.
+        """
+        if not self.search_discovery_required or not self.search_query:
+            return None
+        parsed = urlsplit(str(after_url or ""))
+        host = str(parsed.hostname or "").casefold().rstrip(".")
+        if host not in self._SEARCH_FALLBACK_HOSTS:
+            return None
+        query_values = parse_qs(parsed.query, keep_blank_values=True)
+        observed_query = ""
+        for key in ("q", "wd", "query", "text", "keyword"):
+            values = query_values.get(key) or []
+            if values and str(values[0]).strip():
+                observed_query = str(values[0])
+                break
+        expected = self._normalized_search_text(self.search_query)
+        observed = self._normalized_search_text(observed_query)
+        if observed and observed != expected:
+            return None
+        # Some public search engines omit the query from their accessibility
+        # URL after submission. In that case only accept a state action that
+        # can actually submit a query, and require a search-results path.
+        search_path = str(parsed.path or "").casefold()
+        if not search_path.endswith(("/search", "/s")):
+            return None
+        if not observed and action not in {"press_key", "navigate", "go_back"}:
+            return None
+        if not observed and not before_url and action != "navigate":
+            return None
+        return {
+            "passed": True,
+            "kind": "browser_search_result",
+            "query": self.search_query[:120],
+            "origin": origin_from_url(after_url),
+        }
+
+    def _navigation_verification(self, action: str, before_url: str,
+                                 after_url: str) -> dict[str, Any] | None:
+        """Return navigation evidence for simple open/click tasks."""
+        if action not in {"navigate", "click_ref", "open_ref_new_tab", "switch_tab", "go_back"}:
+            return self._search_result_verification(action, before_url, after_url)
+        search_evidence = self._search_result_verification(action, before_url, after_url)
+        if search_evidence is not None:
+            return search_evidence
+        parsed = urlsplit(str(after_url or ""))
+        host = str(parsed.hostname or "").casefold().rstrip(".")
+        if not after_url or host in self._SEARCH_FALLBACK_HOSTS:
+            return None
+        if action not in {"navigate", "open_ref_new_tab", "switch_tab"} and str(before_url or "") == str(after_url or ""):
+            return None
+        return {
+            "passed": True,
+            "kind": "browser_navigation",
+            "origin": origin_from_url(after_url),
+        }
 
     def _repository_record_verified(self) -> bool:
         required = set(self.required_evidence_before_issues)
@@ -1028,6 +1422,12 @@ class BrowserExecutionSession:
     def _state_action(self, action: BrowserAction, initial_observation: str) -> dict[str, Any]:
         if self._handoff_required:
             return self._handoff_failure()
+        if self.required_entry_terms:
+            # A state change invalidates the previous target search result. A
+            # fresh observation must locate the target again before evidence
+            # extraction, which prevents cross-page false positives.
+            self._entry_target_search_satisfied = False
+            self._entry_target_refs.clear()
         navigation_key = ""
         navigation_attempt = 0
         if action.action == "navigate":
@@ -1318,6 +1718,7 @@ class BrowserExecutionSession:
         # stage lock and permit a repeated search.
         autocomplete_input = self._is_autocomplete_input(action)
         before = self._state_fingerprint
+        before_url = self._current_page_url
         self._remember_locator(action)
         self._emit_state_activity("begin", action.action)
         result: dict[str, Any] = {"ok": False, "failure_kind": "browser_backend_failure"}
@@ -1412,6 +1813,9 @@ class BrowserExecutionSession:
                 if self._has_options(after.get("content")):
                     self._set_interaction_stage("ready_to_choose")
                     break
+        navigation_verification = self._navigation_verification(
+            action.action, before_url, self._current_page_url,
+        )
         changed = bool(after.get("observation_id") and self._state_fingerprint != before)
         if changed:
             self._last_no_progress_signature = None
@@ -1419,6 +1823,9 @@ class BrowserExecutionSession:
             self._last_state_action_signature = signature
             self._repeated_state_action_count = 0
             self._reobservation_required = False
+            self._evidence_state_change_required = False
+            self._last_evidence_state_signature = None
+            self._has_evidence_state_signature = False
             self._snapshot_recovery_attempts.clear()
             self._tab_recovery_attempts.clear()
             self._extractions.clear()
@@ -1482,6 +1889,8 @@ class BrowserExecutionSession:
                     "tabs_invalidated": action.action in {"open_ref_new_tab", "close_tab"},
                     "interaction_stage": self._interaction_stage,
                     "login_flow_verified": self._login_flow_verified,
+                    **({"verified": True, "verification": navigation_verification}
+                       if navigation_verification is not None else {}),
                     **tab_refresh}
 
         self._no_progress_count += 1
@@ -1543,10 +1952,52 @@ class BrowserExecutionSession:
         elif action.action in {"click_ref", "open_ref_new_tab"}:
             variables = {"target_label": str(action.arguments.get("target_label") or "")}
         rebound = resolve_locator(descriptor, candidates, variables, key=self.locator_key)
+        if not rebound and action.action == "extract":
+            # Accessibility snapshots often put a useful ``article`` card
+            # inside a nameless product ``listitem``.  The model may choose
+            # the wrapper ref on the first observation, while a refresh can
+            # invalidate that ref.  Rebind once through the same stable
+            # listitem position and parent chain, then extract from its
+            # article child.  This does not guess a selector or page URL; it
+            # only follows a structure already present in both observations.
+            rebound = self._resolve_extraction_child_ref(descriptor, candidates)
         if not rebound:
             return action, False, "The old semantic ref could not be uniquely rebound from the latest observation."
         self._rebound_action_signatures.add(signature)
         return BrowserAction(action.action, {**action.arguments, "ref": rebound}), True, None
+
+    @staticmethod
+    def _resolve_extraction_child_ref(descriptor: LocatorDescriptor,
+                                      candidates: list[Any]) -> str | None:
+        if str(descriptor.role or "").casefold() != "listitem":
+            return None
+        parent_suffix = tuple(descriptor.parent_roles)
+        anchors = []
+        for index, candidate in enumerate(candidates):
+            candidate_parents = tuple(getattr(candidate, "parent_roles", ()))
+            parent_matches = (
+                not parent_suffix
+                or candidate_parents[-len(parent_suffix):] == parent_suffix
+            )
+            if (str(getattr(candidate, "role", "")).casefold() == "listitem"
+                    and getattr(candidate, "relative_position", None) == descriptor.relative_position
+                    and parent_matches):
+                anchors.append((index, candidate))
+        if len(anchors) != 1:
+            return None
+        anchor_index, anchor = anchors[0]
+        anchor_parents = tuple(getattr(anchor, "parent_roles", ()))
+        for candidate in candidates[anchor_index + 1:]:
+            parent_roles = tuple(getattr(candidate, "parent_roles", ()))
+            if str(getattr(candidate, "role", "")).casefold() == "listitem":
+                if parent_roles == anchor_parents:
+                    break
+                continue
+            if (str(getattr(candidate, "role", "")).casefold() == "article"
+                    and len(parent_roles) >= 1
+                    and parent_roles[:-1] == anchor_parents):
+                return str(getattr(candidate, "ref", "")) or None
+        return None
 
     @staticmethod
     def _has_options(content: Any) -> bool:
@@ -2038,11 +2489,46 @@ class BrowserExecutionSession:
 
     def _verify(self, arguments: dict[str, Any]) -> dict[str, Any]:
         latest = self._extractions[-1] if self._extractions else {}
+        fields = latest.get("fields") if isinstance(latest, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
         signature = self._evidence_signature("verify", {
             **arguments, "extraction_index": len(self._extractions),
         })
         if (self._last_verify_signature == signature
                 and self._last_verify_observation_id == self._observation_id):
+            # Models occasionally resend the final verification call while
+            # they are composing the answer.  Once the exact same evidence
+            # has already passed, this is an idempotent read, not a progress
+            # loop.  Preserve the verified contract instead of turning a
+            # successfully completed browser task into browser_evidence_loop.
+            if self._cache_verified:
+                return {
+                    "ok": True,
+                    "verified": True,
+                    "verification": {
+                        "passed": True,
+                        "kind": "cached_verification",
+                        "matched_fields": sum(
+                            bool(value)
+                            for value in fields.values()
+                        ) if isinstance(fields, dict) else 0,
+                        "required_fields": len(arguments.get("required_fields") or []),
+                        "matched_items": len(latest.get("items") or [])
+                        if isinstance(latest, dict) and isinstance(latest.get("items"), list)
+                        else 0,
+                        "minimum_results": self.minimum_results,
+                        "tab_count": self._last_tab_count,
+                        "evidence_count": len(self._evidence_ledger.records),
+                        "confirmation_count": self._confirmation_count,
+                        "tab_pair_progress": self.tab_pair_progress,
+                    },
+                    "postcondition_kind": "cached_verification",
+                    "postcondition_passed": True,
+                    "extraction": dict(latest) if isinstance(latest, dict) else {},
+                    "evidence_ledger": self._evidence_ledger.safe_dict(),
+                    "observation_id": self._observation_id,
+                    "state_changed": False,
+                }
             return {
                 "ok": False,
                 "failure_kind": "browser_evidence_loop",
@@ -2053,8 +2539,6 @@ class BrowserExecutionSession:
             }
         self._last_verify_signature = signature
         self._last_verify_observation_id = self._observation_id
-        fields = latest.get("fields") if isinstance(latest, dict) else {}
-        fields = fields if isinstance(fields, dict) else {}
         if (not latest or str(latest.get("observation_id") or "") != self._observation_id):
             if not latest and self.final_tab_mode != "any":
                 passed = self._final_tab_state_verified()
@@ -2231,12 +2715,35 @@ class BrowserExecutionSession:
         self._cache_verified = bool(passed)
         if passed:
             self._set_interaction_stage("verified")
-        return {"ok": True, "verified": bool(passed), "verification": verification,
+            return {"ok": True, "verified": True, "verification": verification,
+                    "postcondition_kind": verification_kind,
+                    "postcondition_passed": True,
+                    "extraction": dict(latest),
+                    "evidence_ledger": self._evidence_ledger.safe_dict(),
+                    "observation_id": self._observation_id, "state_changed": False}
+
+        # A failed verification is a recovery boundary, not a successful tool
+        # result.  Returning ``ok=True`` here leaves the model with a
+        # verify-only stage and allows it to vary the arguments while keeping
+        # the same stale extraction.  That was the source of long real-browser
+        # runs that appeared frozen.  Force one fresh observation and let the
+        # bounded evidence-failure budget hand off instead of permitting an
+        # unbounded verification loop.
+        self._evidence_state_change_required = True
+        failure = self._evidence_failure(
+            "browser_evidence_insufficient",
+            "The requested browser evidence did not satisfy verification; obtain a fresh observation and collect it again.",
+            verification=verification,
+            extraction=dict(latest),
+            evidence_ledger=self._evidence_ledger.safe_dict(),
+            observation_id=self._observation_id,
+            state_changed=False,
+        )
+        if failure.get("handoff_required"):
+            return failure
+        return {**failure, "verified": False,
                 "postcondition_kind": verification_kind,
-                "postcondition_passed": bool(passed),
-                "extraction": dict(latest),
-                "evidence_ledger": self._evidence_ledger.safe_dict(),
-                "observation_id": self._observation_id, "state_changed": False}
+                "postcondition_passed": False}
 
     def _evidence_failure(self, failure_kind: str, error: str, **extra: Any) -> dict[str, Any]:
         """Allow one fresh-observation relocation, then hand off the task."""
@@ -2280,6 +2787,7 @@ class BrowserExecutionSession:
         self._evidence_ledger.clear()
         self._action_log.clear()
         self._cache_verified = False
+        self._evidence_state_change_required = False
         self._trusted_extractor.invalidate()
         return {"ok": False, "failure_kind": self._handoff_reason,
                 "error": "Browser interaction made no progress; manual handoff is required.",
@@ -2323,6 +2831,7 @@ class BrowserExecutionSession:
         self._evidence_ledger.clear()
         self._action_log.clear()
         self._cache_verified = False
+        self._evidence_state_change_required = False
         self._trusted_extractor.invalidate()
 
     def _preserve_known_navigation_origins(self) -> None:
@@ -2929,8 +3438,17 @@ class BrowserExecutionSession:
         if candidate is not None:
             candidate_text = " ".join((candidate.role, candidate.name,
                                         *candidate.parent_roles, *candidate.state_tokens))
+        # The value typed into a normal search box is user data, not a
+        # description of the target control.  Including it here makes a
+        # harmless query such as "password" look like credential entry and
+        # triggers the permanent-deny path after confirmation.  Credential
+        # protection remains bound to the observed control name/role/ref and
+        # to explicit target metadata.
+        keys = ("ref", "element", "button", "label")
+        if action.action != "fill_ref":
+            keys = (*keys, "value")
         return " ".join((candidate_text, *(str(args.get(key) or "")
-                                           for key in ("ref", "value", "element", "button", "label")))).casefold()
+                                           for key in keys))).casefold()
 
     def _login_target_link_error(self, action: BrowserAction) -> tuple[str, str, str] | None:
         """Reject a decorative login button when a real observed link exists.

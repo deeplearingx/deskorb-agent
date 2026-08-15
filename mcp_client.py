@@ -194,6 +194,7 @@ class MCPServerSpec:
     allowed_roots: tuple[str, ...] = ()
     max_input_bytes: int = 256 * 1024
     max_output_bytes: int = 64 * 1024
+    isolated: bool = False
 
 
 def resolve_officecli_binary(explicit: str | Path | None = None) -> str | None:
@@ -222,7 +223,10 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                      enable_officecli: bool = True,
                      officecli_binary: str | Path | None = None,
                      playwright_output_dir: str | Path | None = None,
-                     playwright_registry_dir: str | Path | None = None) -> list[MCPServerSpec]:
+                     playwright_registry_dir: str | Path | None = None,
+                     enable_browser_use: bool = False,
+                     browser_use_server_name: str = "browser-use",
+                     browser_use_config_dir: str | Path | None = None) -> list[MCPServerSpec]:
     """Load trusted local servers from a standard ``mcpServers`` JSON file."""
     value = str(config_path or "").strip()
     if value:
@@ -239,6 +243,13 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
         result = [_parse_server(name, spec, path.parent) for name, spec in servers.items()]
         if playwright_output_dir:
             result = [_with_playwright_output_dir(spec, playwright_output_dir) for spec in result]
+        if enable_browser_use and not any(
+                spec is not None and spec.name == browser_use_server_name for spec in result):
+            browser_use = _default_browser_use_spec(
+                browser_use_server_name, browser_use_config_dir=browser_use_config_dir,
+            )
+            if browser_use is not None:
+                result.append(browser_use)
         return [spec for spec in result if spec is not None]
     root = Path(__file__).resolve().parent
     interpreter = Path(sys.executable)
@@ -278,6 +289,12 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                 "playwright", "npx",
                 args, registry_env, None, allow_safe_tools=True,
             ))
+    if enable_browser_use:
+        browser_use = _default_browser_use_spec(
+            browser_use_server_name, browser_use_config_dir=browser_use_config_dir,
+        )
+        if browser_use is not None:
+            result.append(browser_use)
     result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root),
                                 allow_safe_tools=True))
     if enable_officecli:
@@ -311,6 +328,56 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
     return result
 
 
+def _resolve_uvx_binary() -> str | None:
+    configured = str(os.environ.get("DESKORB_AGENT_BROWSER_USE_UVX", "")).strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if path.is_file():
+            return str(path.resolve())
+    # Conda/venv installs commonly place uvx beside the environment's
+    # interpreter without adding Scripts to the parent process PATH.
+    interpreter_dir = Path(sys.executable).resolve().parent
+    for candidate in (
+        interpreter_dir / "Scripts" / "uvx.exe",
+        interpreter_dir / "Scripts" / "uvx",
+        interpreter_dir / "uvx.exe",
+        interpreter_dir / "uvx",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    for command in ("uvx", "uvx.exe"):
+        found = shutil.which(command)
+        if found:
+            return str(Path(found).resolve())
+    return None
+
+
+def _default_browser_use_spec(name: str, *, browser_use_config_dir: str | Path | None = None) -> MCPServerSpec | None:
+    command = _resolve_uvx_binary()
+    if not command:
+        return None
+    env: dict[str, str] = {
+        "BROWSER_USE_HEADLESS": os.environ.get("DESKORB_AGENT_BROWSER_USE_HEADLESS", "false"),
+        "ANONYMIZED_TELEMETRY": "false",
+    }
+    proxy = configured_playwright_proxy()
+    if proxy:
+        env["BROWSER_USE_PROXY_URL"] = proxy
+    if browser_use_config_dir:
+        env["BROWSER_USE_CONFIG_DIR"] = str(Path(browser_use_config_dir).expanduser().resolve())
+    return MCPServerSpec(
+        name=str(name or "browser-use").strip() or "browser-use",
+        command=command,
+        args=("--from", "browser-use[cli]", "browser-use", "--mcp"),
+        env=env,
+        description="Browser Use direct browser-control MCP backend behind DeskOrb semantic policy.",
+        intent_keywords=("browser use", "browser-use", "browser_use"),
+        capability="browser_use",
+        allow_safe_tools=True,
+        isolated=True,
+    )
+
+
 def _with_playwright_output_dir(spec: MCPServerSpec | None,
                                 output_dir: str | Path) -> MCPServerSpec | None:
     """Add a private output directory to a configured Playwright server only."""
@@ -325,6 +392,7 @@ def _with_playwright_output_dir(spec: MCPServerSpec | None,
         capability=spec.capability, read_only_tools=spec.read_only_tools,
         action_tools=spec.action_tools, allowed_roots=spec.allowed_roots,
         max_input_bytes=spec.max_input_bytes, max_output_bytes=spec.max_output_bytes,
+        isolated=spec.isolated,
     )
 
 
@@ -404,6 +472,9 @@ def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
     # trusted-local behavior. Once any allowlist/classification is declared,
     # unknown tools fail closed on discovery.
     explicit_policy = bool(allowed_tools or read_only_tools or action_tools)
+    isolated = metadata.get("isolated", False)
+    if not isinstance(isolated, bool):
+        isolated = str(isolated).strip().lower() in {"1", "true", "yes", "on"}
     roots = tuple(str((base / item).resolve(strict=False) if not Path(item).is_absolute()
                       else Path(item).expanduser().resolve(strict=False))
                   for item in raw_roots if item.strip())
@@ -414,6 +485,7 @@ def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
         allow_safe_tools=not explicit_policy, capability=str(metadata.get("capability") or "").strip().lower(),
         read_only_tools=read_only_tools, action_tools=action_tools, allowed_roots=roots,
         max_input_bytes=max_input_bytes, max_output_bytes=max_output_bytes,
+        isolated=bool(isolated),
     )
 
 
@@ -749,9 +821,13 @@ class MCPToolBridge:
 
     def __init__(self, config_path: str | Path | None, *, enable_playwright: bool = True,
                  enable_officecli: bool = True, officecli_binary: str | Path | None = None,
-                 timeout_seconds: int = 30, officecli_timeout_seconds: int | None = None):
+                 timeout_seconds: int = 30, officecli_timeout_seconds: int | None = None,
+                 enable_browser_use: bool = False,
+                 browser_use_server_name: str = "browser-use",
+                 browser_use_config_dir: str | Path | None = None):
         self._owned_output_dirs: set[Path] = set()
         self._owned_registry_dirs: set[Path] = set()
+        self._owned_browser_use_config_dirs: set[Path] = set()
         output_dir = None
         registry_dir = None
         if enable_playwright:
@@ -771,18 +847,30 @@ class MCPToolBridge:
                 registry_dir = (Path(tempfile.gettempdir()).resolve()
                                 / f"deskorb-playwright-registry-{uuid.uuid4().hex}")
                 self._owned_registry_dirs.add(registry_dir)
+        effective_browser_use_config_dir = browser_use_config_dir
+        if enable_browser_use and not str(config_path or "").strip() and not effective_browser_use_config_dir:
+            effective_browser_use_config_dir = (
+                Path(tempfile.gettempdir()).resolve()
+                / f"deskorb-browser-use-config-{uuid.uuid4().hex}"
+            )
+            self._owned_browser_use_config_dirs.add(Path(effective_browser_use_config_dir))
         try:
             self.specs = load_mcp_servers(
                 config_path, enable_playwright=enable_playwright,
                 enable_officecli=enable_officecli, officecli_binary=officecli_binary,
                 playwright_output_dir=output_dir,
                 playwright_registry_dir=registry_dir,
+                enable_browser_use=enable_browser_use,
+                browser_use_server_name=browser_use_server_name,
+                browser_use_config_dir=effective_browser_use_config_dir,
             )
         except Exception:
             if output_dir is not None:
                 shutil.rmtree(output_dir, ignore_errors=True)
             if registry_dir is not None:
                 shutil.rmtree(registry_dir, ignore_errors=True)
+            for config_dir in self._owned_browser_use_config_dirs:
+                shutil.rmtree(config_dir, ignore_errors=True)
             raise
         # A user-supplied config may already provide its own output directory;
         # only directories created by this bridge are owned and cleaned here.
@@ -809,11 +897,12 @@ class MCPToolBridge:
         """Configured trusted server names, without starting any process."""
         return tuple(self.clients)
 
-    def is_browser_isolated(self) -> bool:
-        """Report whether the configured Playwright backend uses an isolated profile."""
+    def is_browser_isolated(self, server_name: str = "playwright") -> bool:
+        """Report whether a configured browser server attests an isolated profile."""
+        requested = str(server_name or "playwright").strip().lower()
         for spec in self.specs:
-            if spec.name == "playwright":
-                return "--isolated" in spec.args
+            if spec.name.lower() == requested:
+                return bool(spec.isolated or (spec.name == "playwright" and "--isolated" in spec.args))
         return False
 
     def schemas(self, server_names: Iterable[str] | None = None,
@@ -864,9 +953,9 @@ class MCPToolBridge:
             result.append(schema)
         return result
 
-    def browser_process_id(self) -> int | None:
-        """Return the local Playwright MCP root PID, without exposing process args."""
-        client = self.clients.get("playwright")
+    def browser_process_id(self, server_name: str = "playwright") -> int | None:
+        """Return a local browser MCP root PID, without exposing process args."""
+        client = self.clients.get(str(server_name or "playwright"))
         value = getattr(client, "process_id", None) if client is not None else None
         value = value() if callable(value) else value
         try:
@@ -874,15 +963,16 @@ class MCPToolBridge:
         except (TypeError, ValueError):
             return None
 
-    def browser_diagnostics(self) -> dict[str, Any]:
-        """Return bounded, privacy-safe diagnostics for the browser server."""
-        client = self.clients.get("playwright")
+    def browser_diagnostics(self, server_name: str = "playwright") -> dict[str, Any]:
+        """Return bounded, privacy-safe diagnostics for a browser server."""
+        name = str(server_name or "playwright")
+        client = self.clients.get(name)
         if client is None:
-            return {"server": "playwright", "phase": "not_configured", "running": False,
+            return {"server": name, "phase": "not_configured", "running": False,
                     "exit_code": None, "stderr": []}
         getter = getattr(client, "diagnostics", None)
         value = getter() if callable(getter) else {}
-        return value if isinstance(value, dict) else {"server": "playwright"}
+        return value if isinstance(value, dict) else {"server": name}
 
     def server_catalog(self) -> list[dict[str, Any]]:
         """Safe, process-free capability hints for intent routing.
@@ -1020,6 +1110,11 @@ class MCPToolBridge:
                     shutil.rmtree(registry_dir, ignore_errors=True)
             except OSError:
                 continue
+        for config_dir in self._owned_browser_use_config_dirs:
+            try:
+                shutil.rmtree(config_dir, ignore_errors=True)
+            except OSError:
+                continue
 
     def _selected_servers(self, server_names: Iterable[str] | None) -> set[str]:
         if server_names is None:
@@ -1039,8 +1134,7 @@ class MCPToolBridge:
         spec = next((candidate for candidate in self.specs if candidate.name == server), None)
         if spec is not None:
             return spec
-        if (server in {"playwright", "powertoys", "officecli"}
-                and server in self.clients
+        if (server in self.clients
                 and not isinstance(self.clients[server], StdioMCPClient)):
             return MCPServerSpec(name=server, command="", args=(), env={}, allow_safe_tools=True)
         return None

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from browser_cache import LocatorDescriptor, SnapshotCandidate
 from browser_runtime import BrowserExecutionSession, PlaywrightMCPBackend
 
 
@@ -24,6 +25,23 @@ class FakeBackend:
         self.calls.append((action, dict(arguments)))
         if action in {"snapshot", "extract"}:
             content = self.snapshots.pop(0) if self.snapshots else snapshot("search", "")
+            return {"ok": True, "content": content}
+        return {"ok": True, "content": [{"type": "text", "text": action + " accepted"}]}
+
+
+class EntryTargetBackend(FakeBackend):
+    def call(self, action, arguments):
+        self.calls.append((action, dict(arguments)))
+        if action == "find_text":
+            query = str(arguments.get("query") or "").casefold()
+            matched = "target" in query
+            return {"ok": True, "matched": matched,
+                    "content": [{"type": "text", "text": "target result" if matched else "no match"}]}
+        if action == "snapshot":
+            content = [{"type": "text", "text": """### Page
+- link [ref=target-link]: "Target entry"
+  - /url: https://example.com/target
+"""}]
             return {"ok": True, "content": content}
         return {"ok": True, "content": [{"type": "text", "text": action + " accepted"}]}
 
@@ -106,6 +124,25 @@ class FakeBridge:
 
 
 class BrowserExecutionSessionTests(unittest.TestCase):
+    def test_listitem_extraction_ref_rebinds_to_current_article_child(self):
+        descriptor = LocatorDescriptor(
+            role="listitem", parent_roles=("generic", "list"), relative_position=58,
+        )
+        candidates = [
+            SnapshotCandidate(
+                ref="wrapper-new", role="listitem",
+                parent_roles=("generic", "list"), relative_position=58,
+            ),
+            SnapshotCandidate(
+                ref="article-new", role="article",
+                parent_roles=("generic", "list", "listitem"), relative_position=5,
+            ),
+        ]
+        self.assertEqual(
+            BrowserExecutionSession._resolve_extraction_child_ref(descriptor, candidates),
+            "article-new",
+        )
+
     def test_session_exposes_stable_session_tab_and_next_action_contract(self):
         backend = FakeBackend([snapshot("search", "")])
         session = BrowserExecutionSession(backend)
@@ -130,6 +167,67 @@ class BrowserExecutionSessionTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertEqual([item[0] for item in backend.calls], ["snapshot", "snapshot", "list_tabs"])
+
+    def test_entry_task_requires_target_lookup_before_extraction(self):
+        backend = EntryTargetBackend([])
+        session = BrowserExecutionSession(backend, required_entry_terms=("Target",))
+        first = session.execute([{"action": "snapshot", "arguments": {}}])
+
+        blocked = session.execute([{"action": "extract", "arguments": {
+            "ref": "target-link", "fields": ["title", "url"],
+            "observation_id": first["observation_id"],
+        }}])
+
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["failure_kind"], "browser_target_search_required")
+        self.assertNotIn("extract", blocked["next_allowed_actions"])
+        self.assertIn("find_text", blocked["next_allowed_actions"])
+
+        found = session.execute([{"action": "find_text", "arguments": {
+            "observation_id": first["observation_id"], "query": "Target",
+        }}])
+        self.assertTrue(found["ok"], found)
+        self.assertTrue(found["matched"])
+        self.assertEqual(found["interaction_stage"], "evidence_ready")
+        self.assertEqual(found["next_allowed_actions"], ["verify"])
+        self.assertEqual(len(session.evidence_ledger.records), 1)
+
+        verified = session.execute([{"action": "verify", "arguments": {
+            "required_fields": ["title", "url"],
+        }}])
+        self.assertTrue(verified["postcondition_passed"], verified)
+
+        broad = session.execute([{"action": "extract_list", "arguments": {
+            "fields": ["title", "url"], "observation_id": first["observation_id"],
+        }}])
+        self.assertFalse(broad["ok"])
+        self.assertEqual(broad["failure_kind"], "browser_target_extract_requires_ref")
+
+        wrong_ref = session.execute([{"action": "extract", "arguments": {
+            "ref": "other-link", "fields": ["title", "url"],
+            "observation_id": first["observation_id"],
+        }}])
+        self.assertFalse(wrong_ref["ok"])
+        self.assertEqual(wrong_ref["failure_kind"], "browser_target_ref_required")
+
+    def test_missing_entry_target_exposes_observed_site_search_control(self):
+        page = [{"type": "text", "text": """### Page
+- Page URL: https://www.4399.com/
+### Snapshot
+- textbox [ref=site-search]: \"搜索\"
+"""}]
+        backend = FakeBackend([page])
+        session = BrowserExecutionSession(backend, required_entry_terms=("造梦西游",))
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        result = session.execute([{"action": "find_text", "arguments": {
+            "observation_id": observation_id, "query": "造梦西游",
+        }}])
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "browser_target_text_not_found")
+        self.assertEqual(result["required_action"], "fill_ref")
+        self.assertEqual(result["preferred_search_ref"], "site-search")
 
     def test_autocomplete_stage_removes_repeat_fill_from_next_actions(self):
         initial = [{"type": "text", "text": """### Snapshot
@@ -318,6 +416,25 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual([item[0] for item in backend.calls], ["navigate", "snapshot"])
 
+    def test_search_result_navigation_is_verified_for_a_search_only_task(self):
+        result_page = [{"type": "text", "text": """### Page
+- Page URL: https://www.google.com/search?q=4399
+### Snapshot
+- heading [ref=results]: \"Search results for 4399\"
+"""}]
+        backend = FakeBackend([result_page])
+        session = BrowserExecutionSession(
+            backend, search_discovery_required=True, search_query="4399",
+        )
+
+        result = session.execute([{"action": "navigate", "arguments": {
+            "url": "https://www.google.com/search?q=4399",
+        }}])
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["verified"], result)
+        self.assertEqual(result["verification"]["kind"], "browser_search_result")
+
     def test_state_action_is_followed_by_observation_and_reports_progress(self):
         backend = FakeBackend([
             snapshot("search", ""),
@@ -430,6 +547,20 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         }}])
         self.assertEqual(result["failure_kind"], "browser_high_risk_confirmation_required")
         self.assertEqual([item[0] for item in backend.calls], ["snapshot"])
+
+    def test_search_query_text_does_not_turn_a_search_box_into_credential_input(self):
+        backend = FakeBackend([snapshot("search", ""), snapshot("search", "password")])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+
+        result = session.execute([{"action": "fill_ref", "arguments": {
+            "ref": "search", "value": "password", "observation_id": observation_id,
+        }}])
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn(result.get("failure_kind"), {
+            "browser_high_risk_confirmation_required", "browser_forbidden_action",
+        })
 
     def test_old_observation_id_is_rejected_without_calling_backend(self):
         backend = FakeBackend([snapshot("search", ""), snapshot("search", "Python")])
@@ -634,6 +765,34 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         blocked = session.execute([{"action": "navigate", "arguments": {"url": "https://evil.test/steal"}}])
         self.assertFalse(blocked["ok"])
         self.assertEqual(blocked["failure_kind"], "browser_navigation_origin_not_allowed")
+
+    def test_public_language_subdomain_redirect_is_allowed_after_observed_navigation(self):
+        first_page = [{"type": "text", "text": """### Page
+- Page URL: https://www.wikipedia.org/
+### Snapshot
+```yaml
+- link [ref=article]: \"Artificial intelligence\"
+  - /url: https://en.wikipedia.org/wiki/Artificial_intelligence
+```"""}]
+        redirected_page = [{"type": "text", "text": """### Page
+- Page URL: https://en.wikipedia.org/wiki/Artificial_intelligence
+### Snapshot
+```yaml
+- heading [ref=heading]: \"Artificial intelligence\"
+```"""}]
+        backend = FakeBackend([first_page, redirected_page])
+        session = BrowserExecutionSession(
+            backend, strict_navigation_origins=True,
+            allowed_origins=("https://www.wikipedia.org",),
+        )
+
+        navigated = session.execute([{"action": "navigate", "arguments": {
+            "url": "https://www.wikipedia.org/",
+        }}])
+        self.assertTrue(navigated["ok"], navigated)
+        observed = session.execute([{"action": "snapshot", "arguments": {}}])
+        self.assertTrue(observed["ok"], observed)
+        self.assertEqual(observed["page_url"], "https://en.wikipedia.org/wiki/Artificial_intelligence")
 
     def test_search_research_rejects_unobserved_cross_origin_repository_navigation(self):
         page = [{"type": "text", "text": """### Page
@@ -1223,6 +1382,56 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertTrue(result["postcondition_passed"], result)
         self.assertEqual([item["action"] for item in result["observations"]], ["extract", "verify"])
 
+    def test_state_action_invalidates_previous_evidence_signature(self):
+        first_page = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- article [ref=card-1]:
+  - heading [ref=title-1]: \"First page\"
+```
+"""}]
+        middle_page = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- article [ref=card-1]:
+  - heading [ref=title-1]: \"First page after scroll\"
+```
+"""}]
+        second_page = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- article [ref=card-2]:
+  - heading [ref=title-2]: \"Second page\"
+```
+"""}]
+        backend = FakeBackend([first_page, first_page, middle_page, second_page, second_page])
+        session = BrowserExecutionSession(backend)
+
+        first_navigation = session.execute([{"action": "navigate", "arguments": {
+            "url": "http://127.0.0.1/first",
+        }}])
+        first_observation = first_navigation["observation_id"]
+        first_extract = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-1", "fields": ["title"],
+            "observation_id": first_observation,
+        }}])
+        self.assertTrue(first_extract["ok"])
+
+        scrolled = session.execute([{"action": "scroll", "arguments": {
+            "direction": "down", "observation_id": first_extract["observation_id"],
+        }}])
+        self.assertTrue(scrolled["ok"], scrolled)
+        navigated = session.execute([{"action": "navigate", "arguments": {
+            "url": "http://127.0.0.1/first",
+        }}])
+        self.assertTrue(navigated["ok"], navigated)
+        second_extract = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-2", "fields": ["title"],
+            "observation_id": navigated["observation_id"],
+        }}])
+        self.assertTrue(second_extract["ok"], second_extract)
+        self.assertEqual(second_extract["extraction"]["fields"]["title"], "Second page")
+
     def test_extract_observation_contains_provenance_for_reporters(self):
         content = [{"type": "text", "text": """### Page
 - Page URL: http://127.0.0.1/search
@@ -1336,7 +1545,7 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         self.assertFalse(result["verification"]["passed"])
         self.assertEqual(result["failure_kind"], "browser_stale_evidence")
 
-    def test_same_verification_is_not_repeated_on_one_extraction(self):
+    def test_same_passed_verification_is_idempotent_on_one_extraction(self):
         content = [{"type": "text", "text": """### Page
 ### Snapshot
 ```yaml
@@ -1355,8 +1564,79 @@ class BrowserExecutionSessionTests(unittest.TestCase):
         repeated = session.execute([{"action": "verify", "arguments": arguments}])
 
         self.assertTrue(first["verification"]["passed"])
-        self.assertFalse(repeated["ok"])
-        self.assertEqual(repeated["failure_kind"], "browser_evidence_loop")
+        self.assertTrue(repeated["ok"])
+        self.assertTrue(repeated["verified"])
+        self.assertEqual(repeated["verification"]["kind"], "cached_verification")
+
+    def test_failed_verification_forces_fresh_observation_instead_of_verify_loop(self):
+        content = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- article [ref=card-1]:
+  - heading [ref=title-1]: \"Python asyncio\"
+```
+"""}]
+        backend = FakeBackend([content, content])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+        extracted = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-1", "fields": ["title"], "observation_id": observation_id,
+        }}])
+        self.assertTrue(extracted["ok"])
+
+        first = session.execute([{"action": "verify", "arguments": {
+            "required_fields": ["title", "source"],
+        }}])
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["failure_kind"], "browser_evidence_insufficient")
+        self.assertTrue(first["requires_reobservation"])
+        self.assertEqual(first["next_allowed_actions"], ["snapshot"])
+
+        # A model may change verification arguments while staying on the same
+        # stale evidence.  That must not reopen an unbounded verify-only loop.
+        second = session.execute([{"action": "verify", "arguments": {
+            "required_fields": ["title", "source"], "contains": "asyncio",
+        }}])
+        self.assertFalse(second["ok"])
+        self.assertTrue(second.get("handoff_required"))
+        self.assertEqual(second["failure_kind"], "browser_no_progress")
+        self.assertEqual([item[0] for item in backend.calls], ["snapshot", "extract"])
+
+    def test_failed_verification_snapshot_requires_a_new_state_before_extract(self):
+        content = [{"type": "text", "text": """### Page
+### Snapshot
+```yaml
+- article [ref=card-1]:
+  - heading [ref=title-1]: \"Python asyncio\"
+```
+"""}]
+        backend = FakeBackend([content, content, content, content])
+        session = BrowserExecutionSession(backend)
+        observation_id = session.execute([{"action": "snapshot", "arguments": {}}])["observation_id"]
+        extracted = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-1", "fields": ["title"], "observation_id": observation_id,
+        }}])
+        self.assertTrue(extracted["ok"])
+        failed = session.execute([{"action": "verify", "arguments": {
+            "required_fields": ["title", "source"],
+        }}])
+        self.assertFalse(failed["ok"])
+
+        refreshed = session.execute([{"action": "snapshot", "arguments": {}}])
+        self.assertTrue(refreshed["ok"])
+        self.assertIn("click_ref", refreshed["next_allowed_actions"])
+        self.assertNotIn("snapshot", refreshed["next_allowed_actions"])
+        self.assertNotIn("find_text", refreshed["next_allowed_actions"])
+        self.assertNotIn("list_tabs", refreshed["next_allowed_actions"])
+        self.assertNotIn("extract", refreshed["next_allowed_actions"])
+        self.assertNotIn("verify", refreshed["next_allowed_actions"])
+
+        repeated_extract = session.execute([{"action": "extract", "arguments": {
+            "ref": "card-1", "fields": ["title"],
+            "observation_id": refreshed["observation_id"],
+        }}])
+        self.assertFalse(repeated_extract["ok"])
+        self.assertEqual(repeated_extract["failure_kind"], "browser_action_not_allowed_for_stage")
 
     def test_failed_extraction_allows_one_relocation_then_handoffs(self):
         incomplete = [{"type": "text", "text": """### Page

@@ -58,6 +58,16 @@ _BLOCKED_BROWSER_SUFFIXES = (
     ".localhost", ".local", ".internal", ".lan", ".home.arpa",
     ".test", ".invalid",
 )
+# This is intentionally a small, conservative list.  It is only used to
+# recognise a normal public-site redirect (for example
+# www.wikipedia.org -> en.wikipedia.org); it never authorises a model to
+# invent a new navigation target.  Keeping the common multi-label suffixes
+# here avoids treating evil.co.uk as part of example.co.uk.
+_COMMON_TWO_LABEL_SUFFIXES = frozenset({
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "com.hk", "com.sg", "co.jp",
+    "co.kr", "com.br", "com.mx", "co.nz", "co.za",
+})
 _CAPABILITY_FIELDS = frozenset({"mcp", "memory", "multi_agent", "tool_calling"})
 _CAPABILITY_NEGATIVE = (
     "not supported", "unsupported", "does not support", "without support",
@@ -290,6 +300,49 @@ def origin_from_url(value: Any) -> str:
         return ""
     parsed = urlsplit(url)
     return f"{parsed.scheme}://{parsed.netloc}".casefold()
+
+
+def public_site_key(value: Any) -> str:
+    """Return a bounded registrable-site key for a public HTTP(S) URL.
+
+    This helper is deliberately not a general URL allowlist.  It exists for
+    post-navigation redirect validation, where a site can legitimately move
+    between sibling language/CDN subdomains.  Callers must still validate the
+    original URL and must not use this result to admit private or non-HTTP
+    addresses.
+    """
+    url = safe_http_url(value)
+    if not url:
+        return ""
+    try:
+        host = str(urlsplit(url).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
+    if not host or host in _BLOCKED_BROWSER_HOSTS or host.endswith(_BLOCKED_BROWSER_SUFFIXES):
+        return ""
+    try:
+        if ipaddress.ip_address(host):
+            return host
+    except ValueError:
+        pass
+    labels = [item for item in host.split(".") if item]
+    if len(labels) < 2:
+        return host
+    suffix = ".".join(labels[-2:])
+    label_count = 3 if suffix in _COMMON_TWO_LABEL_SUFFIXES and len(labels) >= 3 else 2
+    return ".".join(labels[-label_count:])
+
+
+def compatible_public_origin(left: Any, right: Any) -> bool:
+    """Return whether two already-observed public origins share a site key.
+
+    This is a redirect compatibility check, not permission to navigate to an
+    arbitrary sibling host.  The semantic runtime still requires an observed
+    link or an explicit user target before the state action is sent.
+    """
+    left_key = public_site_key(left)
+    right_key = public_site_key(right)
+    return bool(left_key and right_key and left_key == right_key)
 
 
 def parse_tab_list(value: Any) -> list[dict[str, Any]]:
@@ -746,7 +799,8 @@ __all__ = [
     "BrowserEvidenceLedger", "EvidenceRecord", "extract_list_from_snapshot",
     "decode_browser_content",
     "origin_from_url", "page_url_from_content", "parse_tab_list", "safe_http_url",
-    "is_safe_public_browser_url", "normalize_capability_status",
+    "is_safe_public_browser_url", "public_site_key", "compatible_public_origin",
+    "normalize_capability_status",
     "normalize_evidence_fields", "parse_github_relative_date", "parse_github_star_count",
     "observed_link_url", "observed_link_urls", "subtree_lines",
 ]

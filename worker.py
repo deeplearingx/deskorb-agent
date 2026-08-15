@@ -29,7 +29,8 @@ from agent_runtime import AgentRuntime
 from conversation_context import ConversationContext
 from credential_store import get_api_key
 from debuglog import DEBUG_LOG, _UIQueueTap, dbg
-from model_adapter import ModelAdapter
+from model_adapter import ModelAdapter, is_stream_keepalive_event
+from task_plan import TaskPlan
 
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -597,18 +598,36 @@ class CodexWorker(threading.Thread):
         officecli_follow_up = (
             self._officecli_session_active and self._officecli_follow_up_requested(text)
         )
-        if not office_plan and (pending_agent_action or officecli_task or officecli_follow_up):
+        task_plan = TaskPlan.from_goal(text)
+        agent_capability_task = task_plan.primary_phase in {"browser", "desktop"}
+        if not office_plan and (
+                pending_agent_action or officecli_task or officecli_follow_up or agent_capability_task
+        ):
             continuation = officecli_follow_up and not officecli_task and not pending_agent_action
             routed_text = self._officecli_continuation_prompt(text) if continuation else text
             if officecli_task or officecli_follow_up:
                 self._officecli_session_active = True
+            if officecli_task or officecli_follow_up:
+                route_reason = "officecli"
+                route_message = "OfficeCLI 请求已切换到本地 MCP Agent Runtime。"
+            elif agent_capability_task:
+                route_reason = "browser_or_desktop"
+                route_message = "浏览器/桌面请求已切换到带工具的 Agent Runtime。"
+            else:
+                route_reason = "pending_confirmation"
+                route_message = "待确认操作已切换到 Agent Runtime 继续执行。"
             dbg("backend_route", {
                 "from": "api", "to": "agent",
-                "reason": "officecli_continuation" if continuation else "officecli",
+                "reason": "officecli_continuation" if continuation else route_reason,
             })
-            self.ui.put(("diagnostic", "OfficeCLI 请求已切换到本地 MCP Agent Runtime。"))
+            self.ui.put(("diagnostic", route_message))
+            # Office-aware requests already carry structured OfficeCLI context;
+            # keep the established privacy boundary and do not duplicate that
+            # content as a screen image.  Browser/visual Agent requests retain
+            # the image paths so the verified visual gateway can inspect them.
+            routed_image_paths = [] if officecli_task or officecli_follow_up else image_paths
             return self._run_agent_turn(
-                routed_text, image_paths, ephemeral=ephemeral, office_plan=office_plan,
+                routed_text, routed_image_paths, ephemeral=ephemeral, office_plan=office_plan,
                 office_context=office_context, office_generation=office_generation,
             )
         self._officecli_session_active = False
@@ -746,6 +765,8 @@ class CodexWorker(threading.Thread):
                     continue
                 event_type = str(event.get("type", ""))
                 if event_type == "response.output_text.delta":
+                    if is_stream_keepalive_event(event):
+                        continue
                     delta = event.get("delta")
                     if delta:
                         saw_delta = True
@@ -866,15 +887,19 @@ class CodexWorker(threading.Thread):
             "input": [{"role": "user", "content": [
                 {"type": "input_text", "text": summary_prompt},
             ]}],
-            "stream": False,
+            "stream": True,
             "max_output_tokens": API_CONTEXT_SUMMARY_TOKENS,
         }
-        response = self._open_api_response(payload, api_key, "application/json")
+        response = self._open_api_response(payload, api_key, "text/event-stream")
         with self._api_lock:
             self._api_response = response
         try:
-            raw = response.read(2 * 1024 * 1024).decode("utf-8", "replace")
-            result = self._adapter.normalize_response(json.loads(raw))
+            # Use the same bounded SSE parser as AgentRuntime.  Compaction is
+            # intentionally silent, so the parser assembles the summary but
+            # does not publish deltas to the user-facing queue.
+            result = self._agent._consume_model_stream(
+                response, emit_stream=False, check_cancelled=False,
+            )
             if isinstance(result, dict) and result.get("error"):
                 raise RuntimeError(self._api_error_detail(result))
             summary = self._extract_api_text(result)
@@ -1048,4 +1073,3 @@ class CodexWorker(threading.Thread):
         except Exception:
             try: proc.kill()
             except Exception: pass
-

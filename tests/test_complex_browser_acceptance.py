@@ -237,7 +237,50 @@ class BrowserTaskSpecTests(unittest.TestCase):
         )
         self.assertTrue(spec.search_discovery_required)
         self.assertTrue(BrowserTaskSpec.from_goal("打开搜索引擎搜索 LangGraph").search_discovery_required)
+        self.assertTrue(BrowserTaskSpec.from_goal("搜索人工智能新闻").search_discovery_required)
+        self.assertFalse(BrowserTaskSpec.from_goal("打开 Wikipedia，站内搜索 Artificial intelligence").search_discovery_required)
         self.assertFalse(BrowserTaskSpec.from_goal("打开 GitHub 首页").search_discovery_required)
+
+    def test_negative_sensitive_actions_do_not_create_confirmation_points(self):
+        forbidden = BrowserTaskSpec.from_goal(
+            "找到游戏入口后停止，不要点击启动游戏、下载、登录或任何游戏内操作"
+        )
+        self.assertEqual(forbidden.confirmation_points, ())
+        requested = BrowserTaskSpec.from_goal(
+            "找到官网并在点击登录之前先询问我是否继续"
+        )
+        self.assertEqual(requested.confirmation_points, ("high_risk_external_action",))
+
+    def test_entry_targets_are_derived_from_the_user_goal(self):
+        dream = BrowserTaskSpec.from_goal(
+            "搜索“4399 造梦西游”。进入网站后找到造梦西游相关入口"
+        )
+        kingdom = BrowserTaskSpec.from_goal(
+            "搜索“4399 洛克王国”。进入网站后找到洛克王国相关入口"
+        )
+        self.assertEqual(dream.search_query, "4399 造梦西游")
+        self.assertEqual(dream.target_terms, ("造梦西游",))
+        self.assertEqual(kingdom.target_terms, ("洛克王国",))
+        self.assertEqual(dream.target_kind, "entry")
+        self.assertEqual(dream.max_action_steps, 50)
+
+    def test_search_query_stops_before_follow_up_action_after_chinese_comma(self):
+        spec = BrowserTaskSpec.from_goal("搜索4399，打开它")
+
+        self.assertEqual(spec.search_query, "4399")
+        # 4399 is a site/search term rather than an entry phrase; it should
+        # not be promoted to a separate target constraint.
+        self.assertEqual(spec.target_terms, ())
+        self.assertTrue(spec.search_discovery_required)
+
+    def test_find_and_open_target_is_bound_to_the_original_task(self):
+        spec = BrowserTaskSpec.from_goal(
+            "在浏览器里，点4399，找到并打开造梦西游"
+        )
+
+        self.assertEqual(spec.target_kind, "entry")
+        self.assertEqual(spec.target_terms, ("造梦西游",))
+        self.assertEqual(spec.max_action_steps, 50)
 
 
 class ComplexAcceptanceReportTests(unittest.TestCase):
