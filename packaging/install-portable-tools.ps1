@@ -116,7 +116,11 @@ function Install-PortableArchive {
         [switch]$Force
     )
 
-    $markerPath = Join-Path $Destination $Marker
+    $markerPath = if ($MarkerIsInCmdDirectory) {
+        Join-Path $Destination (Join-Path "cmd" $Marker)
+    } else {
+        Join-Path $Destination $Marker
+    }
     if ((-not $Force) -and (Test-Path -LiteralPath $markerPath)) {
         Write-Host "$Label already exists: $markerPath"
         return
