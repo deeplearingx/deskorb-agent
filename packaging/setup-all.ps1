@@ -47,8 +47,8 @@ if ($InstallPortableTools) {
     } else {
         & $toolScript @portableArguments
     }
-    if ($LASTEXITCODE -ne 0) {
-        throw "Portable tool installation failed with exit code $LASTEXITCODE."
+    if (-not $?) {
+        throw "Portable tool installation failed."
     }
 }
 
