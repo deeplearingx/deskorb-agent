@@ -516,3 +516,16 @@ conda run --no-capture-output -n deskorb-agent python -s -m pytest `
 最新的真实公开站点语义探针在 Chromium 启动阶段被本机 `EPERM`（Playwright 浏览器目录无权限）阻断，状态为 `browser_mcp_start_failed`，未执行页面动作；这属于环境阻断，不计为产品业务失败，也不能替代 21 次真实验收。
 
 全量 pytest 的当前环境差异：简繁转换测试因本机转换资源未生效出现 2 个失败；排除该文件后测试在约 89% 进度进入既有长时间 probe，超过 300 秒未产生新的失败输出。该结果不替代上面的 focused 回归，也不把真实验收判为通过。
+
+## 2026-08-15 Hybrid Research Mode 快速落地切片
+
+复杂任务先区分“需要真实网页操作”与“只需要收集公开资料”两类路径：
+
+- [x] 研究模式使用 `research_github_repositories` 只读工具，通过 GitHub REST API 获取最多 5 个仓库的元数据、README 安装片段、能力证据和最多 5 个 Open Issue 标题。
+- [x] 研究模式由原始用户目标路由；没有浏览器/UI 语义时不启动 Chromium、不暴露 shell、桌面控制、MCP 或 Browser Action。
+- [x] 证据进入现有 `BrowserEvidenceLedger`，能力字段只允许 `yes/no/unknown`，缺少正向证据时保留 `unknown`；Token、Cookie、原始 README 和上游错误正文不进入模型结果。
+- [x] 提供 `tools/github_research.py` 本地 CLI，沿用 `DESKORB_AGENT_API_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`，已通过配置代理对公开 `langchain-ai/langgraph` 完成真实 API 只读冒烟。
+- [x] 保留真实 Browser Mode 验收边界：#9、#12、#13、#15、#16、#17 的网页、Tab、动态 DOM、确认和恢复要求不能由研究 API 冒充完成。
+- [x] 研究适配器、任务路由和只读分发加入回归测试；本切片完成后全量 pytest 为 `802 passed, 88 subtests passed`，编译检查和 `git diff --check` 通过。
+
+实现设计见 `docs/superpowers/specs/2026-08-15-hybrid-research-design.md`。后续再增加官方文档适配器、研究到浏览器的 hybrid 阶段切换，以及 #12/#13/#15/#17 的中粒度 checkpoint；不在第一切片引入第二套浏览器控制器。

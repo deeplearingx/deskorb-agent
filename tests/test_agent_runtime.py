@@ -46,6 +46,23 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["results"][0]["line"], 1)
 
+    def test_github_research_tool_dispatches_through_readonly_client(self):
+        expected = {"ok": True, "status": "success", "record_count": 1}
+        with patch.object(self.tools.research_client, "research_repositories", return_value=expected) as research:
+            result = self.tools.call("research_github_repositories", {
+                "repositories": ["langchain-ai/langgraph"],
+                "required_fields": ["title", "stars"],
+                "include_issues": False,
+                "issue_limit": 1,
+            })
+        self.assertEqual(result, expected)
+        research.assert_called_once_with(
+            ["langchain-ai/langgraph"],
+            required_fields=["title", "stars"],
+            include_issues=False,
+            issue_limit=1,
+        )
+
     def test_read_only_mode_clears_pending_approval(self):
         events = Queue()
         runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=self.root)
@@ -385,7 +402,7 @@ class ReadOnlyToolsTests(unittest.TestCase):
     def test_browser_task_spec_blocks_terminal_success_when_required_evidence_is_missing(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
         runtime._task_plan = TaskPlan.from_goal(
-            "研究至少 2 个 GitHub 项目，记录标题、链接和 Star 数"
+            "在浏览器中研究至少 2 个 GitHub 项目，记录标题、链接和 Star 数"
         )
         first = {"title": "one", "url": "https://github.com/example/one", "stars": "10"}
         second = {"title": "two", "url": "https://github.com/example/two", "stars": "20"}
@@ -427,6 +444,13 @@ class ReadOnlyToolsTests(unittest.TestCase):
         staged = {item["name"] for item in runtime._available_schemas("在网页搜索资料后保存到 report.txt")}
         self.assertIn("filesystem_write", staged)
         self.assertNotIn("desktop_click", staged)
+
+    def test_plain_framework_research_exposes_readonly_github_tool_only(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        names = {item["name"] for item in runtime._available_schemas(
+            "调研 LangGraph、CrewAI 和 PydanticAI，比较 Star、语言和更新时间"
+        )}
+        self.assertEqual(names, {"research_github_repositories"})
 
     def test_cross_domain_file_stage_requires_runtime_verified_browser_evidence(self):
         runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)

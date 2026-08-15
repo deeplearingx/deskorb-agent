@@ -19,6 +19,11 @@ _WEB_MARKERS = (
     "langgraph", "crewai", "pydanticai", "autogen", "fastapi",
 )
 _SEARCH_MARKERS = ("搜索", "search", "研究", "research", "查找", "look up")
+_RESEARCH_ONLY_MARKERS = ("调研", "研究", "比较", "对比", "收集", "评估", "research", "compare")
+_BROWSER_UI_MARKERS = (
+    "浏览器", "网页", "网站", "tab", "标签页", "滚动", "弹窗", "页面内",
+    "登录入口", "browser", "website", "web page",
+)
 _FILE_MARKERS = ("保存", "写入文件", "写到文件", "文件", "report.txt", "save", "write to", "file")
 _NOTEPAD_MARKERS = ("记事本", "notepad", "输入到桌面", "写入记事本")
 _RISK_MARKERS = (
@@ -44,10 +49,21 @@ class TaskPlan:
         lowered = str(goal or "").strip().lower()
         desktop = any(marker in lowered for marker in _DESKTOP_MARKERS)
         explicit_web = any(marker in lowered for marker in _WEB_MARKERS)
+        research_intent = any(marker in lowered for marker in _RESEARCH_ONLY_MARKERS)
+        explicit_browser_ui = any(marker in lowered for marker in _BROWSER_UI_MARKERS)
         # An explicit web target wins even when the later stage mentions
         # Notepad or a file.  Desktop-only searches (QQ/Explorer) remain
         # desktop plans because they have no explicit web marker.
-        browser = explicit_web or (not desktop and any(marker in lowered for marker in _SEARCH_MARKERS))
+        research = bool(
+            not desktop
+            and research_intent
+            and not explicit_browser_ui
+        )
+        browser = bool(
+            not research
+            and (explicit_browser_ui or explicit_web
+                 or (not desktop and any(marker in lowered for marker in _SEARCH_MARKERS)))
+        )
         follow_up = ""
         if browser and any(marker in lowered for marker in _NOTEPAD_MARKERS):
             follow_up = "desktop"
@@ -55,7 +71,11 @@ class TaskPlan:
             follow_up = "file"
 
         high_risk = any(marker in lowered for marker in _RISK_MARKERS)
-        if browser:
+        if research:
+            capabilities = ("research_github_repositories",)
+            evidence = ["research_evidence"]
+            phase = "research"
+        elif browser:
             capabilities = ("browser_action_batch",)
             evidence = ["browser_extract", "browser_verify"]
             if high_risk:
@@ -87,6 +107,8 @@ class TaskPlan:
 
     def capabilities_for_stage(self, browser_verified: bool) -> tuple[str, ...]:
         """Return the minimal stage capability set, never including page data."""
+        if self.primary_phase == "research":
+            return self.allowed_capabilities
         if self.primary_phase != "browser":
             return self.allowed_capabilities
         if not browser_verified:

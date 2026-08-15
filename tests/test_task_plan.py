@@ -29,6 +29,13 @@ class TaskPlanTests(unittest.TestCase):
         self.assertEqual(plan.primary_phase, "browser")
         self.assertEqual(plan.browser_task_spec.max_tabs, 6)
 
+    def test_plain_framework_research_routes_to_readonly_research(self):
+        plan = TaskPlan.from_goal("调研 LangGraph、CrewAI 和 PydanticAI，比较 Star、语言和更新时间")
+        self.assertFalse(plan.browser_required)
+        self.assertEqual(plan.primary_phase, "research")
+        self.assertEqual(plan.allowed_capabilities, ("research_github_repositories",))
+        self.assertIn("research_evidence", plan.evidence_contract)
+
     def test_web_result_to_notepad_is_a_desktop_follow_up(self):
         plan = TaskPlan.from_goal("网页搜索结果后写入记事本")
         self.assertEqual(plan.follow_up_kind, "desktop")
