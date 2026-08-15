@@ -417,6 +417,65 @@ def _parse_server(name: Any, value: Any, base: Path) -> MCPServerSpec | None:
     )
 
 
+def _bounded_mcp_content(value: Any, cap: int) -> tuple[Any, bool]:
+    """Bound MCP output without cutting a JSON envelope in the middle.
+
+    Playwright returns a list of text blocks.  The old bridge serialized that
+    list and sliced the serialized bytes, which could turn a valid snapshot
+    into an unterminated/invalid JSON string.  Keep the same structured shape
+    and truncate only the text field that caused the bound.
+    """
+    limit = max(256, int(cap))
+
+    def encoded(item: Any) -> str:
+        return json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    if len(encoded(value)) <= limit:
+        return value, False
+    if isinstance(value, list):
+        bounded: list[Any] = []
+        for item in value:
+            candidate = [*bounded, item]
+            if len(encoded(candidate)) <= limit:
+                bounded.append(item)
+                continue
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                text = str(item["text"])
+                low, high = 0, len(text)
+                best: dict[str, Any] | None = None
+                marker = "\n[mcp output truncated]"
+                while low <= high:
+                    middle = (low + high) // 2
+                    shortened = {**item, "text": text[:middle] + marker}
+                    if len(encoded([*bounded, shortened])) <= limit:
+                        best = shortened
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if best is not None:
+                    bounded.append(best)
+            break
+        return bounded, True
+    if isinstance(value, dict) and isinstance(value.get("text"), str):
+        text = str(value["text"])
+        marker = "\n[mcp output truncated]"
+        low, high = 0, len(text)
+        best: dict[str, Any] | None = None
+        while low <= high:
+            middle = (low + high) // 2
+            shortened = {**value, "text": text[:middle] + marker}
+            if len(encoded(shortened)) <= limit:
+                best = shortened
+                low = middle + 1
+            else:
+                high = middle - 1
+        return (best or {"text": marker}), True
+    if isinstance(value, str):
+        marker = "\n[mcp output truncated]"
+        return value[:max(0, limit - len(marker))] + marker, True
+    return encoded(value)[:max(0, limit - 32)] + "\n[mcp output truncated]", True
+
+
 class StdioMCPClient:
     """Serial JSON-RPC client for one local MCP stdio server."""
 
@@ -924,16 +983,17 @@ class MCPToolBridge:
                 message = self._officecli_error_message(exposed_name, arguments, message)
             return {"ok": False, "error": message}
         content = result.get("content", result)
-        rendered = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         cap = spec.max_output_bytes
+        bounded_content, truncated = _bounded_mcp_content(content, cap)
+        rendered = json.dumps(content, ensure_ascii=False, separators=(",", ":"), default=str)
         if server == "officecli" and result.get("isError"):
             return {"ok": False, "server": server, "tool": original,
-                    "content": content if len(rendered) <= cap else rendered[:cap],
-                    "truncated": len(rendered) > cap,
+                    "content": bounded_content,
+                    "truncated": truncated,
                     "error": self._officecli_error_message(exposed_name, arguments, rendered)}
         return {"ok": not bool(result.get("isError")), "server": server, "tool": original,
-                "content": content if len(rendered) <= cap else rendered[:cap],
-                "truncated": len(rendered) > cap}
+                "content": bounded_content,
+                "truncated": truncated}
 
     def close(self) -> None:
         for client in self.clients.values():

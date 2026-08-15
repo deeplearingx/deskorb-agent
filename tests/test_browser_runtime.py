@@ -923,6 +923,16 @@ class BrowserExecutionSessionTests(unittest.TestCase):
             "href": "https://example.com/docs",
         }])
 
+    def test_snapshot_decodes_json_encoded_playwright_text_content(self):
+        content = '[{"type":"text","text":"### Page\\n- Page URL: https://en.wikipedia.org/wiki/Artificial_intelligence\\n### Snapshot\\n- link \\\"Search\\\" [ref=e18] [cursor=pointer]:\\n  - /url: /wiki/Special:Search"}]'
+        backend = FakeBackend([content])
+        session = BrowserExecutionSession(backend)
+
+        result = session.execute([{"action": "snapshot", "arguments": {}}])
+
+        self.assertEqual(result["page_url"], "https://en.wikipedia.org/wiki/Artificial_intelligence")
+        self.assertEqual(result["candidates"][0]["ref"], "e18")
+
     def test_github_page_snapshot_can_aggregate_split_repository_evidence(self):
         page = [{"type": "text", "text": """### Page
 - Page URL: https://github.com/example/agent

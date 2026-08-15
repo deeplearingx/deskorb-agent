@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
+import json
 import re
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -83,7 +84,20 @@ _NON_RECORD_URL_PATHS = (
 
 def _content_text(value: Any) -> str:
     if isinstance(value, str):
-        return value[:256_000]
+        raw = value
+        text = raw[:256_000]
+        # Some Playwright MCP responses encode the TextContent list one extra
+        # time as JSON. Decode only structured list/object strings; ordinary
+        # page text remains untouched and untrusted.
+        stripped = text.lstrip()
+        if stripped.startswith(("[{", "{")):
+            try:
+                decoded = json.loads(raw, strict=False)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (list, dict)):
+                return _content_text(decoded)
+        return text
     if isinstance(value, dict):
         if isinstance(value.get("text"), str):
             return value["text"][:256_000]
@@ -95,6 +109,38 @@ def _content_text(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return "\n".join(_content_text(item) for item in value)
     return ""
+
+
+def decode_browser_content(value: Any) -> Any:
+    """Decode one JSON-encoded MCP content envelope without executing it."""
+    if not isinstance(value, str):
+        return value
+    text = value
+    if not text.lstrip().startswith(("[{", "{")):
+        return value
+    try:
+        decoded = json.loads(text, strict=False)
+    except (TypeError, ValueError):
+        # Older Playwright MCP builds cap a single accessibility text block
+        # by cutting the JSON envelope itself. Recover the bounded text prefix
+        # without treating it as executable JSON; this keeps the Page URL and
+        # the first observed refs available for semantic recovery.
+        marker = '"text":"'
+        start = text.find(marker)
+        if not text.lstrip().startswith("[{") or start < 0:
+            return value
+        body = text[start + len(marker):]
+        if body.endswith("'}]") or body.endswith('"}]'):
+            body = body[:-3]
+        for _ in range(8):
+            try:
+                recovered = json.loads('"' + body + '"', strict=False)
+                if isinstance(recovered, str):
+                    return [{"type": "text", "text": recovered}]
+            except (TypeError, ValueError):
+                body = body[:-1]
+        return value
+    return decoded if isinstance(decoded, (list, dict)) else value
 
 
 def _unquote(value: str) -> str:
@@ -698,6 +744,7 @@ class BrowserEvidenceLedger:
 
 __all__ = [
     "BrowserEvidenceLedger", "EvidenceRecord", "extract_list_from_snapshot",
+    "decode_browser_content",
     "origin_from_url", "page_url_from_content", "parse_tab_list", "safe_http_url",
     "is_safe_public_browser_url", "normalize_capability_status",
     "normalize_evidence_fields", "parse_github_relative_date", "parse_github_star_count",

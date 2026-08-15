@@ -123,7 +123,16 @@ def bounded_observation_id(value: Any) -> str:
 def _content_text(value: Any) -> str:
     """Flatten only MCP text content; never inspect arbitrary result keys."""
     if isinstance(value, str):
-        return value[:_SNAPSHOT_LIMIT]
+        raw = value
+        text = raw[:_SNAPSHOT_LIMIT]
+        if text.lstrip().startswith(("[{", "{")):
+            try:
+                decoded = json.loads(raw, strict=False)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (list, dict)):
+                return _content_text(decoded)
+        return text
     if isinstance(value, dict):
         if isinstance(value.get("text"), str):
             return value["text"][:_SNAPSHOT_LIMIT]

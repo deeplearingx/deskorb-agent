@@ -166,6 +166,13 @@ def parse_snapshot_candidates(snapshot: Any) -> list[SnapshotCandidate]:
     """Parse only role/ref/name metadata from an accessibility snapshot."""
     if isinstance(snapshot, dict):
         snapshot = snapshot.get("content", snapshot.get("text", ""))
+    if isinstance(snapshot, str) and snapshot.lstrip().startswith(("[{", "{")):
+        try:
+            decoded = json.loads(snapshot, strict=False)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, (list, dict)):
+            snapshot = decoded
     if isinstance(snapshot, (list, tuple)):
         snapshot = "\n".join(
             str(item.get("text", "")) if isinstance(item, dict) else str(item)

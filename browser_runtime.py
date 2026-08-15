@@ -27,6 +27,7 @@ from browser_cache import (
 )
 from browser_evidence import (
     BrowserEvidenceLedger,
+    decode_browser_content,
     extract_list_from_snapshot,
     is_safe_public_browser_url,
     normalize_evidence_fields,
@@ -199,8 +200,12 @@ class BrowserExecutionSession:
         "click_ref", "fill_ref", "select_ref", "press_key", "open_ref_new_tab",
         "extract", "extract_list", "navigate",
     })
-    _MAX_RECOVERY_SNAPSHOT_CHARS = 64_000
-    _MAX_MODEL_SNAPSHOT_CHARS = 64_000
+    # A page can contain a very large accessibility tree.  Keep the full
+    # snapshot internally for trusted extraction, but send a smaller bounded
+    # projection to the model.  AgentRuntime also removes duplicate snapshot
+    # copies from ``observations`` before the next provider request.
+    _MAX_RECOVERY_SNAPSHOT_CHARS = 32_000
+    _MAX_MODEL_SNAPSHOT_CHARS = 32_000
 
     _REOBSERVATION_FAILURES = frozenset({
         "browser_mcp_connection_failed", "tool_execution_timeout",
@@ -918,7 +923,7 @@ class BrowserExecutionSession:
             )
         if not result.get("ok"):
             return self._backend_failure(result)
-        content = result.get("content", result)
+        content = decode_browser_content(result.get("content", result))
         previous_stage = self._interaction_stage
         self._observation_counter += 1
         self._observation_id = f"obs-{self._observation_counter}"

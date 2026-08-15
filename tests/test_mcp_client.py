@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,11 @@ class FakeClient:
 
     def close(self):
         return None
+
+
+class LargeOutputClient(FakeClient):
+    def call_tool(self, name, arguments):
+        return {"content": [{"type": "text", "text": "### Snapshot\\n" + ("- link [ref=e1]: \\\"item\\\"\\n" * 2000)}]}
 
 
 class RecordingProcessClient(FakeClient):
@@ -86,6 +92,25 @@ class MCPClientTests(unittest.TestCase):
         rendered = json.dumps(result["content"], ensure_ascii=False)
         self.assertIn("button-7", rendered)
         self.assertNotIn("_deskorb_risk_level", rendered)
+
+    def test_bridge_bounds_structured_output_without_slicing_json(self):
+        bridge = MCPToolBridge(None, enable_playwright=True)
+        bridge.clients["playwright"] = LargeOutputClient()
+        bridge.schemas()
+        playwright = next(item for item in bridge.specs if item.name == "playwright")
+        bridge.specs = [replace(playwright, max_output_bytes=1024)] + [
+            item for item in bridge.specs if item.name != "playwright"
+        ]
+        snapshot = next(item for item in bridge.schemas()
+                        if item["name"].endswith("browser_snapshot"))
+
+        result = bridge.call(snapshot["name"], {})
+
+        self.assertTrue(result["truncated"])
+        self.assertIsInstance(result["content"], list)
+        self.assertLessEqual(len(json.dumps(result["content"], ensure_ascii=False,
+                                             separators=(",", ":"))), 1024)
+        self.assertIn("mcp output truncated", result["content"][0]["text"])
 
     def test_default_servers_include_local_powertoys_adapter(self):
         specs = load_mcp_servers(None, enable_playwright=True)

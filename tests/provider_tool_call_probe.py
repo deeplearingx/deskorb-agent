@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from config import API_BASE_URL, API_MODEL, API_PROXY_URL
 from responses_tool_protocol import continue_input, function_call_output, function_calls
 from third_party_probe import config
 
@@ -31,8 +32,12 @@ def _post(endpoint: str, api_key: str, payload: dict) -> dict:
             "User-Agent": "deskorb-agent-tool-probe/1",
         },
     )
+    proxy_handler = urllib.request.ProxyHandler(
+        {"http": API_PROXY_URL, "https": API_PROXY_URL} if API_PROXY_URL else None
+    )
+    opener = urllib.request.build_opener(proxy_handler)
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with opener.open(request, timeout=90) as response:
             return json.loads(response.read(2 * 1024 * 1024).decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         detail = exc.read(64 * 1024).decode("utf-8", "replace")
@@ -45,10 +50,13 @@ def _post(endpoint: str, api_key: str, payload: dict) -> dict:
 
 
 def main() -> int:
-    values = config(Path(__file__).resolve().parents[2] / ".env")
-    base = values.get("url", "").rstrip("/")
+    # The provider file belongs to this repository.  ``parents[2]`` points to
+    # D:\workspace on the Windows layout and silently hid the configured
+    # project credentials behind a misleading "missing env" result.
+    values = config(Path(__file__).resolve().parents[1] / ".env")
+    base = API_BASE_URL.rstrip("/")
     api_key = values.get("api-key", "")
-    model = values.get("codex_overlay_api_model") or values.get("model_name") or "gpt-5.6-terra"
+    model = API_MODEL
     if not base.startswith(("https://", "http://")) or not api_key or "://" in model:
         print(json.dumps({"ok": False, "error": "Need url, api-key, and a model ID in ../.env"}))
         return 2

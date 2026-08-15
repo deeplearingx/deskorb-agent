@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from config import (API_CONTEXT_RECENT_TURNS, API_CONTEXT_TOKEN_BUDGET, API_REQUEST_RETRIES, API_TIMEOUT,
+                    BROWSER_PROVIDER_CALL_TIMEOUT,
                     BROWSER_START_TIMEOUT_SECONDS, MCP_CONFIG_PATH, MCP_TIMEOUT_SECONDS, OFFICECLI_AUTO_APPROVE, OFFICECLI_BINARY,
                     OFFICECLI_ENABLED, OFFICECLI_MAX_TOOL_ROUNDS, OFFICECLI_TIMEOUT_SECONDS,
                     API_MAX_TOOL_ROUNDS,
@@ -404,6 +405,14 @@ class AgentRuntime:
     HUMAN_VERIFICATION_CONTINUE = "__deskorb_human_verification_complete__"
     HUMAN_VERIFICATION_CANCEL = "__deskorb_human_verification_cancel__"
     TIMEOUT_RECOVERY_SECONDS = 8
+    # Browser transcripts are intentionally stateless between tool rounds.
+    # Keeping the original request, a bounded runtime checkpoint, and the
+    # latest response/tool pair prevents page snapshots from accumulating
+    # quadratically in long real-site tasks.
+    BROWSER_TRANSCRIPT_MAX_CHARS = 96_000
+    BROWSER_TRANSCRIPT_REQUEST_TEXT_CHARS = 20_000
+    BROWSER_TRANSCRIPT_CHECKPOINT_CHARS = 10_000
+    BROWSER_MODEL_RESULT_CHARS = 56_000
     CAPTCHA_MARKERS = (
         "快速验证身份", "我是人类", "人机验证", "滑块验证", "安全验证", "验证码",
         "captcha", "verify you are human", "verify you're human", "security verification",
@@ -1608,6 +1617,7 @@ class AgentRuntime:
         if not ephemeral:
             self._ensure_task_state(original_text)
         incomplete_prose_recovery_attempted = 0
+        browser_timeout_recovery_attempted = False
         instructions = SYSTEM_APPEND + (
             "\nYou are the independent DeskOrb Agent Runtime. You may inspect the active window and files below the configured working directory. "
             "When Full access is enabled and the user explicitly asks for a local change, filesystem_write may be used and its result is verified by rereading the file. "
@@ -1673,11 +1683,41 @@ class AgentRuntime:
                 self._finish_task("failed", failure_kind="cancelled")
                 self.ui.put(("system", "stopped."))
                 return
-            response = self._request_with_deadline(
-                {"model": self.model, "instructions": instructions, "input": transcript,
-                 "tools": self._available_schemas(original_text), "parallel_tool_calls": False, "stream": False},
-                api_key, deadline,
-            )
+            try:
+                response = self._request_with_deadline(
+                    {"model": self.model, "instructions": instructions, "input": transcript,
+                     "tools": self._available_schemas(original_text), "parallel_tool_calls": False, "stream": False},
+                    api_key, deadline,
+                )
+            except RuntimeError as exc:
+                # A provider timeout after a browser action is ambiguous: the
+                # action may already have reached the page.  Re-observe once,
+                # then resume from the fresh state without replaying it.
+                timeout_kind = str(exc).split(" phase=", 1)[0]
+                browser_task = bool(
+                    not ephemeral and self._task_plan is not None
+                    and self._task_plan.browser_required
+                )
+                if (browser_task and timeout_kind == "provider_timeout_after_tools"
+                        and not browser_timeout_recovery_attempted):
+                    recovery = self.recover_after_timeout(timeout_kind)
+                    browser_timeout_recovery_attempted = True
+                    if recovery.get("resume_required"):
+                        resume_message = {
+                            "role": "user",
+                            "content": [{
+                                "type": "input_text",
+                                "text": str(recovery.get("resume_prompt") or (
+                                    "The previous browser action may already have taken effect. "
+                                    "Take a fresh browser snapshot and continue without replaying it."
+                                )),
+                            }],
+                        }
+                        transcript = self._compact_browser_transcript(
+                            transcript, original_text, extra_messages=[resume_message],
+                        )
+                        continue
+                raise
             calls = function_calls(response)
             if not calls:
                 answer = self._extract_text(response)
@@ -1708,7 +1748,6 @@ class AgentRuntime:
                         # the same tool set; do not publish the unverified prose
                         # as if it were the user's requested result.
                         incomplete_prose_recovery_attempted += 1
-                        transcript = continue_input(transcript, response, [])
                         evidence_progress_hint = ""
                         if spec is not None and spec.deep_research and spec.minimum_results:
                             ledger = getattr(self._browser_session, "evidence_ledger", None)
@@ -1727,15 +1766,26 @@ class AgentRuntime:
                             if spec is not None and spec.deep_research
                             else ""
                         )
-                        transcript.append({"role": "user", "content": [{
-                            "type": "input_text",
-                            "text": (
-                                "The requested action is not complete yet. The latest tool evidence "
-                                "does not satisfy the task contract. Continue with the missing semantic "
-                                "tool action and its independent verification now; do not answer in prose "
-                                "until the contract is satisfied. " + missing_contract + evidence_progress_hint
-                            ),
-                        }]})
+                        recovery_message = {
+                            "role": "user", "content": [{
+                                "type": "input_text",
+                                "text": (
+                                    "The requested action is not complete yet. The latest tool evidence "
+                                    "does not satisfy the task contract. Continue with the missing semantic "
+                                    "tool action and its independent verification now; do not answer in prose "
+                                    "until the contract is satisfied. " + missing_contract + evidence_progress_hint
+                                ),
+                            }],
+                        }
+                        continuation = continue_input(transcript, response, [])
+                        continuation.append(recovery_message)
+                        if self._is_browser_runtime_task():
+                            transcript = self._compact_browser_transcript(
+                                continuation, original_text, response=response,
+                                outputs=[], extra_messages=[recovery_message],
+                            )
+                        else:
+                            transcript = continuation
                         continue
                     self._task_authorized_until = 0.0
                     if self._task_plan is not None and self._task_plan.browser_required:
@@ -1789,7 +1839,9 @@ class AgentRuntime:
                             }
                             self._task_state.record_tool_result(call.name, result) if self._task_state else None
                             self._publish_tool_result(call.name, arguments, result)
-                            outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
+                            outputs.append(function_call_output(
+                                call.call_id, self._browser_tool_output_for_model(result),
+                            ))
                             continue
                         state_action_seen = bool(state_actions)
                     if self._officecli_auto_approval(call.name, arguments):
@@ -1824,7 +1876,12 @@ class AgentRuntime:
                                 )
                             if self._task_state is not None:
                                 self._task_state.record_confirmation()
-                            self._pending_execution = (call, continue_input(transcript, response, []), original_text)
+                            pending_transcript = continue_input(transcript, response, [])
+                            if self._is_browser_runtime_task():
+                                pending_transcript = self._compact_browser_transcript(
+                                    pending_transcript, original_text, response=response, outputs=[],
+                                )
+                            self._pending_execution = (call, pending_transcript, original_text)
                             return
                         else:
                             result = self._run_desktop_action(call.name, arguments)
@@ -1833,7 +1890,12 @@ class AgentRuntime:
                 if not ephemeral and self._task_state is not None:
                     self._task_state.record_tool_result(call.name, result)
                     self._publish_tool_result(call.name, arguments, result)
-                outputs.append(function_call_output(call.call_id, json.dumps(result, ensure_ascii=False)))
+                outputs.append(function_call_output(
+                    call.call_id,
+                    self._browser_tool_output_for_model(result)
+                    if call.name == "browser_action_batch"
+                    else json.dumps(result, ensure_ascii=False),
+                ))
                 if (call.name == "browser_action_batch"
                         and isinstance(result, dict)
                         and not result.get("ok")
@@ -1859,7 +1921,8 @@ class AgentRuntime:
                             "browser_research_repository_navigation_blocked",
                             "browser_navigation_origin_not_allowed",
                             "browser_research_record_required_before_issues",
-                            "browser_issue_list_requires_issues_page"}
+                            "browser_issue_list_requires_issues_page",
+                            "tool_execution_timeout", "browser_mcp_connection_failed"}
                         and self._browser_semantic_recovery_attempts < (
                             2 if self._task_plan is not None
                             and self._task_plan.browser_task_spec.deep_research else 1
@@ -1926,6 +1989,10 @@ class AgentRuntime:
                     if not ephemeral and self._task_state is not None:
                         self._task_state.waiting_for_human(browser_handoff)
                     continuation = continue_input(transcript, response, outputs)
+                    if self._is_browser_runtime_task():
+                        continuation = self._compact_browser_transcript(
+                            continuation, original_text, response=response, outputs=outputs,
+                        )
                     self._pause_for_human_handoff(
                         continuation, original_text, ephemeral, browser_handoff, arguments,
                     )
@@ -1935,6 +2002,10 @@ class AgentRuntime:
                     if not ephemeral and self._task_state is not None:
                         self._task_state.waiting_for_human(captcha_marker)
                     continuation = continue_input(transcript, response, outputs)
+                    if self._is_browser_runtime_task():
+                        continuation = self._compact_browser_transcript(
+                            continuation, original_text, response=response, outputs=outputs,
+                        )
                     self._pause_for_human_verification(continuation, original_text, ephemeral,
                                                        captcha_marker, arguments)
                     return
@@ -1942,10 +2013,16 @@ class AgentRuntime:
             if calls:
                 transcript = self._append_desktop_observation(transcript, calls[-1].name)
             if target_recovery_required:
-                transcript.append({"role": "user", "content": [{
+                recovery_message = {"role": "user", "content": [{
                     "type": "input_text",
                     "text": self._browser_login_recovery_prompt(None),
-                }]})
+                }]}
+                transcript.append(recovery_message)
+                if self._is_browser_runtime_task():
+                    transcript = self._compact_browser_transcript(
+                        transcript, original_text, response=response, outputs=outputs,
+                        extra_messages=[recovery_message],
+                    )
                 continue
             if semantic_recovery_required:
                 missing_fields = ", ".join(semantic_recovery_missing_fields)
@@ -1973,7 +2050,7 @@ class AgentRuntime:
                         " The last navigation did not land on a trusted result. Re-observe the current page "
                         "and relocate by an observed same-page link; do not repeat that navigation target."
                     )
-                transcript.append({"role": "user", "content": [{
+                recovery_message = {"role": "user", "content": [{
                     "type": "input_text",
                     "text": (
                         "Structured browser evidence was insufficient. This is a bounded recovery turn, "
@@ -1990,8 +2067,18 @@ class AgentRuntime:
                         + missing_hint
                         + " If the page is blocked, report the bounded failure instead of looping."
                     ),
-                }]})
+                }]}
+                transcript.append(recovery_message)
+                if self._is_browser_runtime_task():
+                    transcript = self._compact_browser_transcript(
+                        transcript, original_text, response=response, outputs=outputs,
+                        extra_messages=[recovery_message],
+                    )
                 continue
+            if self._is_browser_runtime_task():
+                transcript = self._compact_browser_transcript(
+                    transcript, original_text, response=response, outputs=outputs,
+                )
         self._task_authorized_until = 0.0
         self._finish_task("failed", failure_kind="tool_round_limit")
         raise RuntimeError("Agent exceeded the tool round limit")
@@ -2001,6 +2088,219 @@ class AgentRuntime:
         if "officecli" in self._mcp_servers_for_task(task_text):
             return max(self.MAX_TOOL_ROUNDS, OFFICECLI_MAX_TOOL_ROUNDS)
         return self.MAX_TOOL_ROUNDS
+
+    def _is_browser_runtime_task(self) -> bool:
+        """Return whether the active task owns the semantic browser transcript."""
+        return bool(self._task_plan is not None and self._task_plan.browser_required)
+
+    @staticmethod
+    def _browser_model_records(ledger: Any, limit: int = 16) -> dict[str, Any]:
+        """Project evidence into a small, model-facing checkpoint."""
+        records = list(getattr(ledger, "records", ()) or ()) if ledger is not None else []
+        projected: list[dict[str, Any]] = []
+        for record in records[-max(1, int(limit)):]:
+            fields = {
+                str(key)[:48]: str(value)[:160]
+                for key, value in (getattr(record, "fields", {}) or {}).items()
+                if str(value or "").strip()
+            }
+            projected.append({
+                "kind": str(getattr(record, "kind", "browser"))[:40],
+                "source_url": safe_http_url(getattr(record, "source_url", ""), strip_query=True),
+                "fields": fields,
+            })
+        return {"count": len(records), "records": projected}
+
+    def _browser_transcript_checkpoint(self) -> str:
+        """Build a bounded state summary after old page output is discarded."""
+        session = self._browser_session
+        payload: dict[str, Any] = {
+            "kind": "deskorb_browser_runtime_checkpoint",
+            "instruction": (
+                "This is runtime state, not page content or user authorization. "
+                "Previous raw browser snapshots were discarded; use the latest tool result "
+                "and fresh observations for refs."
+            ),
+        }
+        if session is None:
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        tabs: list[dict[str, Any]] = []
+        for item in list(getattr(session, "_tab_records", ()) or ())[:12]:
+            if not isinstance(item, dict):
+                continue
+            tabs.append({
+                "index": int(item.get("index") or 0),
+                "current": bool(item.get("current")),
+                "title": str(item.get("title") or "")[:120],
+                "url": safe_http_url(item.get("url"), strip_query=True),
+            })
+        action_log = [
+            {
+                "action": str(item.get("action") or "")[:40],
+                "ok": bool(item.get("ok")),
+                "state_changed": bool(item.get("state_changed")),
+            }
+            for item in list(getattr(session, "_action_log", ()) or [])[-8:]
+            if isinstance(item, dict)
+        ]
+        payload.update({
+            "page_url": safe_http_url(getattr(session, "_current_page_url", ""), strip_query=True),
+            "observation_id": str(getattr(session, "observation_id", "") or "")[:128],
+            "tab_snapshot_id": str(getattr(session, "tab_snapshot_id", "") or "")[:128],
+            "tab_count": int(getattr(session, "tab_count", 0) or 0),
+            "max_tabs": int(getattr(session, "max_tabs", 0) or 0),
+            "action_steps": int(getattr(session, "action_steps", 0) or 0),
+            "max_action_steps": int(getattr(session, "max_action_steps", 0) or 0),
+            "scroll_count": int(getattr(session, "_scroll_count", 0) or 0),
+            "max_scrolls": int(getattr(session, "max_scrolls", 0) or 0),
+            "interaction_stage": str(getattr(session, "interaction_stage", "") or "")[:40],
+            "next_allowed_actions": list(getattr(session, "next_allowed_actions", ()) or ())[:24],
+            "model_allowed_actions": list(getattr(session, "model_allowed_actions", ()) or ())[:24],
+            "cache_verified": bool(getattr(session, "cache_verified", False)),
+            "confirmation_count": int(getattr(session, "_confirmation_count", 0) or 0),
+            "tabs": tabs,
+            "recent_actions": action_log,
+            "evidence_ledger": self._browser_model_records(
+                getattr(session, "evidence_ledger", None), limit=16,
+            ),
+        })
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(encoded) <= self.BROWSER_TRANSCRIPT_CHECKPOINT_CHARS:
+            return encoded
+        # A long title/field must never defeat the checkpoint bound.
+        payload["tabs"] = tabs[:6]
+        payload["evidence_ledger"] = self._browser_model_records(
+            getattr(session, "evidence_ledger", None), limit=8,
+        )
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)[:self.BROWSER_TRANSCRIPT_CHECKPOINT_CHARS]
+
+    def _browser_tool_output_for_model(self, result: Any) -> str:
+        """Remove duplicate page bodies from one browser tool output.
+
+        The executor keeps full data internally for extraction and verification.
+        Only the model-facing function result is projected: the final content is
+        retained once, while per-action ``observations`` keep metadata but drop
+        their repeated content copies.
+        """
+        if not isinstance(result, dict):
+            return json.dumps(result, ensure_ascii=False, default=str)
+        keep = {
+            "ok", "failure_kind", "error", "message", "state_changed", "requires_reobservation",
+            "handoff_required", "handoff_timeout_seconds", "observation_id", "tab_snapshot_id",
+            "tab_id", "browser_session_id", "batch_action_steps", "action_steps", "interaction_stage",
+            "next_allowed_actions", "model_allowed_actions", "stage_transition_count", "confirmation_count",
+            "login_flow_verified", "tab_pair_progress", "tab_count", "tab_listing_refreshed",
+            "tab_listing_failure_kind", "postcondition_passed", "postcondition_kind", "recovery_count",
+            "cache_status", "verification", "extraction", "extraction_list", "tabs", "candidates",
+            "content", "content_trust", "page_url", "source_url", "evidence_ledger", "recovery",
+        }
+        projected: dict[str, Any] = {key: result[key] for key in keep if key in result}
+        if "content" in projected:
+            projected["content"] = BrowserExecutionSession._bounded_snapshot_content(
+                projected["content"], 32_000,
+            )
+        if isinstance(projected.get("candidates"), list):
+            projected["candidates"] = projected["candidates"][:32]
+        if isinstance(projected.get("tabs"), list):
+            projected["tabs"] = projected["tabs"][:12]
+        if isinstance(projected.get("extraction_list"), dict):
+            items = projected["extraction_list"].get("items")
+            if isinstance(items, list):
+                projected["extraction_list"] = {
+                    **projected["extraction_list"], "items": items[:20],
+                }
+        observations = result.get("observations")
+        if isinstance(observations, list):
+            compact_observations: list[dict[str, Any]] = []
+            for item in observations[:20]:
+                if not isinstance(item, dict):
+                    continue
+                observation = {
+                    key: item[key] for key in (
+                        "action", "ok", "state_changed", "failure_kind", "verification",
+                        "observation_id", "ref", "extraction", "extraction_list", "tabs",
+                    ) if key in item
+                }
+                compact_observations.append(observation)
+            projected["observations"] = compact_observations
+        ledger = projected.get("evidence_ledger")
+        if isinstance(ledger, dict) and isinstance(ledger.get("records"), list):
+            projected["evidence_ledger"] = {
+                **ledger, "records": ledger["records"][-16:],
+            }
+        recovery = projected.get("recovery")
+        if isinstance(recovery, dict):
+            projected["recovery"] = {
+                key: recovery[key] for key in (
+                    "mode", "status", "attempt", "observation_id", "tab_snapshot_id",
+                    "page_url", "candidates", "tabs", "tab_count", "content",
+                ) if key in recovery
+            }
+            if "content" in projected["recovery"]:
+                projected["recovery"]["content"] = BrowserExecutionSession._bounded_snapshot_content(
+                    projected["recovery"]["content"], 16_000,
+                )
+        encoded = json.dumps(projected, ensure_ascii=False, default=str, separators=(",", ":"))
+        if len(encoded) <= self.BROWSER_MODEL_RESULT_CHARS:
+            return encoded
+        if "content" in projected:
+            projected["content"] = BrowserExecutionSession._bounded_snapshot_content(
+                projected["content"], 16_000,
+            )
+        projected["observations"] = list(projected.get("observations") or [])[-8:]
+        projected["candidates"] = list(projected.get("candidates") or [])[:16]
+        projected["model_result_truncated"] = True
+        encoded = json.dumps(projected, ensure_ascii=False, default=str, separators=(",", ":"))
+        if len(encoded) <= self.BROWSER_MODEL_RESULT_CHARS:
+            return encoded
+        # Keep the structural outcome valid JSON even for an unusual adapter
+        # that returns oversized extraction metadata.  The full value remains
+        # available inside the session/evidence ledger.
+        for optional in ("content", "observations", "candidates", "tabs", "recovery", "evidence_ledger"):
+            projected.pop(optional, None)
+            encoded = json.dumps(projected, ensure_ascii=False, default=str, separators=(",", ":"))
+            if len(encoded) <= self.BROWSER_MODEL_RESULT_CHARS:
+                break
+        return encoded
+
+    def _compact_browser_transcript(self, transcript: list[dict[str, Any]], original_text: str,
+                                    *, response: dict[str, Any] | None = None,
+                                    outputs: list[dict[str, Any]] | None = None,
+                                    extra_messages: list[dict[str, Any]] | None = None
+                                    ) -> list[dict[str, Any]]:
+        """Keep only the current response/tool pair plus a safe state checkpoint."""
+        if not self._is_browser_runtime_task():
+            return transcript
+        user_text = str(original_text or "Desktop task")[:self.BROWSER_TRANSCRIPT_REQUEST_TEXT_CHARS]
+        initial = {"role": "user", "content": [{"type": "input_text", "text": user_text}]}
+        current: list[dict[str, Any]] = []
+        if isinstance(response, dict):
+            current.extend(item for item in response.get("output") or () if isinstance(item, dict))
+        current.extend(item for item in (outputs or ()) if isinstance(item, dict))
+        extras = [item for item in (extra_messages or ()) if isinstance(item, dict)]
+        compacted = [initial, {
+            "role": "user",
+            "content": [{"type": "input_text", "text": self._browser_transcript_checkpoint()}],
+        }, *current, *extras]
+        # This is a final guard for unusual provider reasoning items.  Browser
+        # tool outputs are separately projected above, so normal requests stay
+        # far below this limit.
+        try:
+            encoded = json.dumps(compacted, ensure_ascii=False, default=str, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return compacted
+        if len(encoded) <= self.BROWSER_TRANSCRIPT_MAX_CHARS:
+            return compacted
+        for item in compacted:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    part["text"] = part["text"][:16_000] + "\n[transcript text truncated]"
+        return compacted
 
     def _resolve_human_verification(self, text: str) -> tuple[str, dict[str, Any] | None]:
         pending = self._pending_human_verification
@@ -2785,7 +3085,8 @@ class AgentRuntime:
             headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json",
                      "Accept": "application/json", "User-Agent": "deskorb-agent/0.2"})
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": self.api_proxy_url, "https": self.api_proxy_url})) if self.api_proxy_url else None
-        base_timeout = min(API_TIMEOUT, self.REQUEST_TIMEOUT)
+        browser_timeout = BROWSER_PROVIDER_CALL_TIMEOUT if self._is_browser_runtime_task() else self.REQUEST_TIMEOUT
+        base_timeout = min(API_TIMEOUT, self.REQUEST_TIMEOUT, browser_timeout)
         transient_error: BaseException | None = None
         for attempt in range(API_REQUEST_RETRIES + 1):
             if deadline is not None:

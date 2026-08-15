@@ -63,6 +63,12 @@ API_BASE_URL = (os.environ.get("OPENAI_BASE_URL", "").strip() or _provider_api_b
 API_PROXY_URL = os.environ.get("DESKORB_AGENT_API_PROXY", os.environ.get("CODEX_OVERLAY_API_PROXY", "")).strip()
 API_MODEL = _provider_api_model("gpt-5.6-terra")
 API_TIMEOUT = _env_int("DESKORB_AGENT_API_TIMEOUT", 180, 15, 900)
+# Browser tasks are iterative: a single provider call must be bounded so one
+# oversized/slow page cannot consume the whole task deadline.  The task loop
+# performs a fresh, non-replaying observation once after a timeout.
+BROWSER_PROVIDER_CALL_TIMEOUT = _env_int(
+    "DESKORB_AGENT_BROWSER_PROVIDER_CALL_TIMEOUT", 60, 15, 180,
+)
 API_REQUEST_RETRIES = _env_int("DESKORB_AGENT_API_REQUEST_RETRIES", 2, 0, 4)
 API_MAX_TOOL_ROUNDS = _env_int("DESKORB_AGENT_MAX_TOOL_ROUNDS", 100, 20, 500)
 API_CONTEXT_TOKEN_BUDGET = _env_int("DESKORB_AGENT_CONTEXT_TOKENS", 24_000, 4_000, 200_000)

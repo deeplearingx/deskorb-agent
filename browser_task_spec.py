@@ -106,6 +106,12 @@ class BrowserTaskSpec:
         for name, origin in _NAMED_SITE_ORIGINS.items():
             if name in text:
                 explicit_origins.add(origin)
+        # "Wikipedia" is a named site, not a single host: the public portal
+        # commonly redirects to the language subdomain used for the requested
+        # article.  Both hosts are still explicit user-scope, while arbitrary
+        # Wikipedia subdomains remain blocked until observed in the page.
+        if "wikipedia" in text:
+            explicit_origins.add("https://en.wikipedia.org")
 
         explicit_tab = _TAB_LIMIT.search(text)
         max_tabs = 6
