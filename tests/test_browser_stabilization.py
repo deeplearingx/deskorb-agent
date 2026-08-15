@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from agent_runtime import AgentRuntime
 from browser_runtime import PlaywrightMCPBackend
-from mcp_client import MCPError, MCPServerSpec, StdioMCPClient
+from mcp_client import MCPError, MCPServerSpec, MCPToolBridge, StdioMCPClient
 from task_runtime import classify_failure
 
 
@@ -100,6 +100,7 @@ class BrowserStabilizationTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_kind"], "browser_mcp_start_failed")
+        self.assertEqual(runtime.mcp.close_calls, 1)
         self.assertEqual([item[1]["phase"] for item in _browser_statuses(events)], [
             "starting", "failed",
         ])
@@ -254,7 +255,29 @@ class BrowserStabilizationTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_kind"], "browser_initial_snapshot_timeout")
+        self.assertEqual(runtime.mcp.close_calls, 1)
         self.assertEqual(_browser_statuses(events)[-1][1]["phase"], "failed")
+
+    def test_browser_start_failure_cleans_owned_playwright_output_dir(self):
+        events = Queue()
+        runtime = AgentRuntime(events, "test", "https://example.test/v1", working_dir=Path.cwd())
+        bridge = MCPToolBridge(None, enable_playwright=True, enable_officecli=False)
+        spec = next(item for item in bridge.specs if item.name == "playwright")
+        output_index = spec.args.index("--output-dir")
+        output_dir = Path(spec.args[output_index + 1])
+        output_dir.mkdir()
+        runtime.mcp = bridge
+
+        try:
+            with patch.object(bridge, "schemas",
+                              side_effect=MCPError("MCP process exited before initialize")):
+                result = runtime.prepare_visible_browser()
+        finally:
+            bridge.close()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_kind"], "browser_mcp_start_failed")
+        self.assertFalse(output_dir.exists())
 
     def test_prepare_visible_browser_classifies_missing_window(self):
         events = Queue()
@@ -265,6 +288,7 @@ class BrowserStabilizationTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["failure_kind"], "browser_window_not_visible")
+        self.assertEqual(runtime.mcp.close_calls, 1)
         self.assertEqual([item[1]["phase"] for item in _browser_statuses(events)], [
             "starting", "failed",
         ])

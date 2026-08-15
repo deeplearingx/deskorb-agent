@@ -4,6 +4,23 @@ from browser_ref_extractor import parse_ref_snapshot
 
 
 class BrowserRefSnapshotTests(unittest.TestCase):
+    def test_extracts_installation_command_from_code_like_generic_node(self):
+        content = [{"type": "text", "text": """### Page
+- Page URL: https://github.com/example/project
+### Snapshot
+```yaml
+- generic [ref=readme-root]:
+  - heading [ref=install-heading]: "Installation"
+  - generic [ref=install-command]: pip install -U example-project
+  - button "Copy code to clipboard" [ref=copy-install]
+```"""}]
+
+        result = parse_ref_snapshot(content, "readme-root", ["installation_command", "text"])
+
+        self.assertTrue(result["trusted_ref"])
+        self.assertEqual(result["fields"]["installation_command"], "pip install -U example-project")
+        self.assertEqual(result["fields"]["text"], "pip install -U example-project")
+
     def test_extracts_target_subtree_fields_and_resolves_relative_url(self):
         content = [{"type": "text", "text": """### Page
 - Page URL: http://127.0.0.1:8123/mock_store.html

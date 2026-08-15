@@ -23,6 +23,12 @@ class TaskPlanTests(unittest.TestCase):
         self.assertIn("filesystem_write", plan.capabilities_for_stage(True))
         self.assertNotIn("filesystem_write", plan.capabilities_for_stage(False))
 
+    def test_public_github_tasks_route_to_semantic_browser_plan(self):
+        plan = TaskPlan.from_goal("打开 GitHub 首页，进入 Trending 并切换到 Python")
+        self.assertTrue(plan.browser_required)
+        self.assertEqual(plan.primary_phase, "browser")
+        self.assertEqual(plan.browser_task_spec.max_tabs, 6)
+
     def test_web_result_to_notepad_is_a_desktop_follow_up(self):
         plan = TaskPlan.from_goal("网页搜索结果后写入记事本")
         self.assertEqual(plan.follow_up_kind, "desktop")

@@ -7,13 +7,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from browser_task_spec import BrowserTaskSpec
+
 
 _DESKTOP_MARKERS = (
     "qq", "资源管理器", "文件管理器", "记事本", "计算器", "explorer", "notepad", "calculator",
 )
 _WEB_MARKERS = (
     "浏览器", "网页", "网站", "淘宝", "京东", "百度", "google", "browser", "website",
-    "web page", "http://", "https://",
+    "web page", "http://", "https://", "github", "gitlab", "trending", "openai",
+    "langgraph", "crewai", "pydanticai", "autogen", "fastapi",
 )
 _SEARCH_MARKERS = ("搜索", "search", "研究", "research", "查找", "look up")
 _FILE_MARKERS = ("保存", "写入文件", "写到文件", "文件", "report.txt", "save", "write to", "file")
@@ -34,6 +37,7 @@ class TaskPlan:
     allowed_capabilities: tuple[str, ...]
     evidence_contract: tuple[str, ...]
     high_risk: bool
+    browser_task_spec: BrowserTaskSpec
 
     @classmethod
     def from_goal(cls, goal: str) -> "TaskPlan":
@@ -77,6 +81,8 @@ class TaskPlan:
             allowed_capabilities=capabilities,
             evidence_contract=tuple(evidence),
             high_risk=high_risk,
+            browser_task_spec=(BrowserTaskSpec.from_goal(goal)
+                               if browser else BrowserTaskSpec(navigation_mode="none")),
         )
 
     def capabilities_for_stage(self, browser_verified: bool) -> tuple[str, ...]:
@@ -102,6 +108,7 @@ class TaskPlan:
             "allowed_capabilities": list(self.allowed_capabilities),
             "evidence_contract": list(self.evidence_contract),
             "high_risk": self.high_risk,
+            "browser_task_spec": self.browser_task_spec.safe_dict(),
         }
 
 

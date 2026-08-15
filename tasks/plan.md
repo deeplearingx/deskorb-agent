@@ -393,14 +393,16 @@ DesktopActivityLifecycle + 事件契约
 - [x] MCP 断连映射为 `browser_mcp_connection_failed`，工具超时保留为 `tool_execution_timeout`；两类失败都要求重新观察，并最多触发一次 transport reconnect。
 - [x] 第二次 transport/timeout 故障返回 `browser_mcp_recovery_exhausted` 并阻断，不自动重放点击、输入、导航或切 Tab；原有无进展二次阻断、单 state action 批次规则和 `extract → verify` 证据链保持不变。
 - [x] 新增 flattened switch-tab、MCP 断连、工具超时、一次性 reconnect/耗尽测试；Slice 2 focused 回归当前为 `160 passed, 37 subtests passed`（含 Slice 1 相关测试）。
+- [x] 动态状态动作测试覆盖 `select_ref → snapshot → wait → snapshot → press_key → snapshot`；每个 state action 都使用最新 observation，跨 Tab 后清空旧 Tab 的语义 locator/rebind 缓存，旧 ref 不得跨 Tab 自动 rebind。
+- [x] 启动失败清理覆盖 MCP 进程退出、初始 snapshot 超时和窗口不可见；Windows `StdioMCPClient.close()` 使用 `taskkill /PID /T /F` 清理 Node/Chromium 进程树，并由真实 `MCPToolBridge` 测试确认私有 Playwright 输出目录删除。
 
 **仍需完成：**
 
-- [ ] 用动态 DOM 夹具补齐 `select_ref`、`press_key`、`wait` 和跨 Tab 旧 ref 的重复运行验证，并把“旧 ref 必须重新观察”与现有一次语义 rebind 的边界写成明确验收断言。
-- [ ] 把 `browser_window_not_visible`、MCP 进程退出和初始 snapshot 超时纳入同一组恢复耗尽测试；确认失败后任务所属 Node/Chromium 和临时 profile 均清理。
-- [ ] 运行浏览器 runtime focused pytest 与完整 pytest，并在真实网站探针上复核首次可见、首次动作、动作序列和恢复次数指标。
+- [x] 用动态 DOM 快照夹具补齐 `select_ref`、`press_key`、`wait` 和跨 Tab 旧 ref 验证，并把“旧 ref 必须重新观察”与同一 Tab 一次语义 rebind 的边界写成明确断言。
+- [x] 把 `browser_window_not_visible`、MCP 进程退出和初始 snapshot 超时纳入启动失败清理门禁；确认失败后任务所属 MCP 进程树和临时 profile 均清理。
+- [~] 浏览器 runtime focused pytest 与完整 pytest 已通过；本地 3× 动态探针均在工具调用前因模型提供方 `provider_timeout_before_tools` 超时，未进入浏览器、无页面动作和副作用，待提供方恢复后重跑。
 
-**最近一次回归：** 完整 `pytest` 为 `711 passed, 77 subtests passed in 32.15s`。
+**最近一次回归：** focused `83 passed, 4 subtests passed`；完整 `pytest` 为 `715 passed, 77 subtests passed in 29.33s`。
 
 **验证入口：**
 
@@ -468,7 +470,7 @@ conda run --no-capture-output -n deskorb-agent python -s -m pytest `
 
 ### 检查点
 
-- **Checkpoint A（Slice 1–2）：** 所有浏览器协议/恢复 focused tests 通过，用户截图场景不再因可纠正格式错误立即失败。
+- **Checkpoint A（Slice 1–2）：** 所有浏览器协议/恢复 focused tests 通过，动态 DOM、跨 Tab 旧 ref、窗口不可见、MCP 进程退出和临时 profile 清理均有同一质量门禁；用户截图场景不再因可纠正格式错误立即失败。✅
 - **Checkpoint B（Slice 3–5）：** 本地多 Tab、动态 DOM、分支、表单确认和取消测试通过；全量 pytest 无回归。
 - **Checkpoint C（Slice 6）：** 真实网站首批脚本 3× 运行，质量门禁通过；网络/验证码异常以阻断证据交付，不用本地夹具冒充线上成功。
 
@@ -492,3 +494,25 @@ conda run --no-capture-output -n deskorb-agent python -s -m pytest `
 - [x] 真实 `books.toscrape.com` 语义探针通过：可见启动、`navigate → snapshot → click_ref → snapshot` 全部成功，4 个动作步骤，耗时约 11.7 秒；报告 `artifacts/public-books-browser-action.json`。
 - [ ] 真实 Bing/FastAPI 模型验收未通过：已执行 `navigate → snapshot → extract → snapshot` 后以 `provider_timeout_after_tools` 结束；这次不是浏览器启动或协议校验失败，需在 Slice 2/6 单独优化 provider 分阶段预算并重跑。
 - [x] 探针结束后未发现带 `playwright/mcp/deskorb` 参数的 Node/Chromium/Edge 孤儿进程。
+- [~] 2026-08-14 本地 `research-001` 动态探针 3× 均为 `provider_timeout_before_tools`（工具轮次 `0`、动作序列为空）；安全性通过且无本地页面副作用，阻塞原因是模型提供方未进入工具阶段。
+
+## 2026-08-14 真实 Browser Agent 验收增强（当前实现）
+
+本轮按真实门槛完成了生产语义浏览器链路的实现，不把本地 fixture 当作真实验收：
+
+- [x] 新增 `BrowserTaskSpec`：原始用户约束、Tab/滚动/动作/导航/MCP 恢复预算、证据字段、确认点和最终 Tab 条件。
+- [x] 新增 `find_text`、`list_tabs`、`open_ref_new_tab`、`switch_tab`、`close_tab`、`scroll`、`go_back`、`extract_list`；模型 schema 不再暴露数字 Tab 索引，旧索引仅保留兼容层。
+- [x] 完成观察期 `tab_ref`、状态动作单尾 batch、拓扑变化后的 Tab 重新列举、跨 Tab ref 隔离和 `press_key` MCP 参数适配。
+- [x] 新增最多 60 条脱敏 `BrowserEvidenceLedger`，列表去重、GitHub Star/相对日期规范化、能力状态 `yes/no/unknown`、来源优先级和扩展 `verify`。
+- [x] 完成公网 HTTP(S) 导航边界、搜索回退、同一 URL 最多一次重试、异常 origin fail-closed、滚动/动作硬预算。
+- [x] 任务原始约束提取用户明确 origin；生产 Playwright MCP 对未授权的首个跨域导航 fail-closed，最终 Tab 状态由 postflight `list_tabs` 重新核验。
+- [x] 完成高风险确认的 origin/role/name/唯一匹配/观察版本绑定；确认后重新观察并一次性授权，登录可在确认后执行，提交/购买/上传/删除/凭据输入仍永久禁止；拒绝分支不重放并尝试返回上一页。
+- [x] 新增独立 `tests/complex_browser_acceptance.py`，固定 #9/#12/#13/#15/#16 确认/#16 拒绝/#17 七个门，每门 3 次共 21 次；报告保存运行 ID、提示词哈希、版本、动作批次、Tab 时间线、确认/恢复事件、脱敏证据账本和资源指标。
+- [x] 新增协议、Tab 生命周期、确认重绑定、能力状态、Star/日期解析和 21 次门禁单元测试；复杂验收测试 `15 passed`，核心浏览器/AgentRuntime/MCP 回归 `219 passed`。
+- [ ] 在真实配置、真实模型、可见隔离 Chromium 和公开网站上执行完整 21 次有效运行；运行命令及业务/安全门槛见 `docs/e2e-agent-evaluation.md`。运行前不宣称真实发布门槛已通过。
+
+本轮真实预检：`tests/mcp_readiness_probe.py` 发现 11 个 Playwright 工具且无诊断；#9 单次 smoke 确实启动了真实 runner 入口，但模型服务在首个 Browser Action 前报错，报告已归类为 `invalid_environment/provider_error_before_tools`，没有产生页面动作，不能计入产品完成率。
+
+最新的真实公开站点语义探针在 Chromium 启动阶段被本机 `EPERM`（Playwright 浏览器目录无权限）阻断，状态为 `browser_mcp_start_failed`，未执行页面动作；这属于环境阻断，不计为产品业务失败，也不能替代 21 次真实验收。
+
+全量 pytest 的当前环境差异：简繁转换测试因本机转换资源未生效出现 2 个失败；排除该文件后测试在约 89% 进度进入既有长时间 probe，超过 300 秒未产生新的失败输出。该结果不替代上面的 focused 回归，也不把真实验收判为通过。

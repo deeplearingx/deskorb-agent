@@ -29,6 +29,7 @@ venv/
 *.log
 _*.log
 _*.py
+!tests/__init__.py
 _*.png
 app-server-schema/
 

@@ -13,10 +13,12 @@ from typing import Any
 
 ALLOWED_ACTIONS = frozenset({
     "navigate", "snapshot", "click_ref", "fill_ref", "select_ref", "wait",
-    "switch_tab", "press_key", "extract", "verify",
+    "switch_tab", "list_tabs", "open_ref_new_tab", "close_tab", "press_key",
+    "find_text", "scroll", "go_back", "extract", "extract_list", "verify",
 })
 STATE_CHANGING_ACTIONS = frozenset({
-    "navigate", "click_ref", "fill_ref", "select_ref", "wait", "switch_tab", "press_key",
+    "navigate", "click_ref", "fill_ref", "select_ref", "wait", "switch_tab",
+    "open_ref_new_tab", "close_tab", "press_key", "scroll", "go_back",
 })
 SAFE_PRESS_KEYS = frozenset({
     "Enter", "Escape", "Tab", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
@@ -40,13 +42,25 @@ _FLATTENED_ARGUMENT_KEYS: dict[str, frozenset[str]] = {
         "ref", "target", "refs", "observation_id", "values", "value", "options",
     }),
     "wait": frozenset({"observation_id", "seconds", "time", "ms", "duration_ms", "milliseconds"}),
-    "switch_tab": frozenset({"observation_id", "index"}),
+    "switch_tab": frozenset({"observation_id", "index", "tab_ref", "tab_snapshot_id"}),
+    "list_tabs": frozenset({"observation_id"}),
+    "open_ref_new_tab": frozenset({"ref", "target", "refs", "observation_id"}),
+    "close_tab": frozenset({"observation_id", "index", "tab_ref", "tab_snapshot_id"}),
     "press_key": frozenset({"ref", "target", "refs", "observation_id", "key"}),
+    "find_text": frozenset({"observation_id", "query", "text"}),
+    "scroll": frozenset({"observation_id", "direction"}),
+    "go_back": frozenset({"observation_id"}),
     "extract": frozenset({
         "ref", "target", "refs", "observation_id", "fields", "selectors", "field_names",
     }),
+    "extract_list": frozenset({
+        "observation_id", "scope_ref", "fields", "selectors", "field_names", "limit", "unique_by",
+    }),
     "verify": frozenset({
         "contains", "expected", "required_fields", "fields", "postcondition", "price_min", "price_max",
+        "min_items", "unique_by", "max_tabs", "final_tabs", "required_origins", "forbidden_actions",
+        "required_evidence", "source_priority",
+        "required_confirmations",
     }),
 }
 
@@ -73,6 +87,23 @@ def _semantic_field_alias(value: Any) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return ""
+    # Exact semantic names must win over substring heuristics.  Without this
+    # precedence, ``issue_title`` was incorrectly reduced to ``title``.
+    exact_aliases = {
+        "issue": "issue_title", "issue title": "issue_title", "issue_title": "issue_title",
+        "installation_command": "installation", "installation": "installation", "install": "installation",
+        "star": "stars", "stars": "stars", "stargazers": "stars", "星标": "stars",
+        "language": "language", "语言": "language", "主要语言": "language",
+        "updated": "updated_at", "updated_at": "updated_at", "更新时间": "updated_at",
+        "mcp": "mcp", "memory": "memory", "记忆": "memory",
+        "multi-agent": "multi_agent", "multi agent": "multi_agent", "multi_agent": "multi_agent",
+        "tool calling": "tool_calling", "tool-calling": "tool_calling", "tool_calling": "tool_calling",
+        "发布时间": "published_at", "rating": "rating", "评分": "rating",
+        "review_count": "review_count", "layout": "layout", "配列": "layout",
+        "connectivity": "connectivity", "连接方式": "connectivity",
+    }
+    if text in exact_aliases:
+        return exact_aliases[text]
     if any(marker in text for marker in ("title", "heading", "name", "标题", "名称", "h1", "h2")):
         return "title"
     if any(marker in text for marker in ("price", "价格", "售价")):
@@ -81,6 +112,20 @@ def _semantic_field_alias(value: Any) -> str:
         return "source"
     if any(marker in text for marker in ("url", "link", "链接")) or text in {"a", "anchor", "href"}:
         return "url"
+    aliases = {
+        "star": "stars", "stars": "stars", "stargazers": "stars", "星标": "stars",
+        "language": "language", "语言": "language", "主要语言": "language",
+        "updated": "updated_at", "updated_at": "updated_at", "更新时间": "updated_at",
+        "installation": "installation", "install": "installation", "安装": "installation",
+        "mcp": "mcp", "memory": "memory", "记忆": "memory",
+        "multi-agent": "multi_agent", "multi agent": "multi_agent", "multi_agent": "multi_agent",
+        "tool calling": "tool_calling", "tool-calling": "tool_calling", "tool_calling": "tool_calling",
+        "issue": "issue_title", "issue_title": "issue_title", "发布时间": "published_at",
+        "rating": "rating", "评分": "rating", "review_count": "review_count",
+        "layout": "layout", "配列": "layout", "connectivity": "connectivity", "连接方式": "connectivity",
+    }
+    if text in aliases:
+        return aliases[text]
     return text if _SEMANTIC_FIELD_NAME.fullmatch(text) else ""
 
 
@@ -94,7 +139,7 @@ def _normalize_field_names(values: Any) -> list[str]:
 def _normalize_arguments(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Normalize harmless model vocabulary aliases into the strict contract."""
     normalized = dict(arguments)
-    if action in {"click_ref", "fill_ref", "select_ref", "extract"}:
+    if action in {"click_ref", "fill_ref", "select_ref", "extract", "open_ref_new_tab"}:
         if "ref" not in normalized and isinstance(normalized.get("target"), str):
             normalized["ref"] = normalized["target"]
         if "ref" not in normalized and isinstance(normalized.get("refs"), list):
@@ -125,6 +170,23 @@ def _normalize_arguments(action: str, arguments: dict[str, Any]) -> dict[str, An
             normalized["fields"] = _normalize_field_names(raw_fields)
     if action == "extract" and isinstance(normalized.get("fields"), list):
         normalized["fields"] = _normalize_field_names(normalized["fields"])
+    if action == "extract_list" and "fields" not in normalized:
+        raw_fields = normalized.get("selectors")
+        if not isinstance(raw_fields, list):
+            raw_fields = normalized.get("field_names")
+        if isinstance(raw_fields, list):
+            normalized["fields"] = _normalize_field_names(raw_fields)
+    if action == "extract_list" and isinstance(normalized.get("fields"), list):
+        normalized["fields"] = _normalize_field_names(normalized["fields"])
+    if action == "find_text" and "query" not in normalized and isinstance(normalized.get("text"), str):
+        normalized["query"] = normalized["text"]
+    if action == "scroll":
+        direction = str(normalized.get("direction") or "down").strip().lower()
+        normalized["direction"] = "up" if direction in {"up", "pageup", "向上", "上"} else "down"
+    if action == "open_ref_new_tab" and "ref" not in normalized:
+        target = normalized.get("target")
+        if isinstance(target, str):
+            normalized["ref"] = target
     if action == "verify":
         if "contains" not in normalized and "expected" in normalized:
             expected = normalized["expected"]
@@ -173,18 +235,33 @@ def validate_browser_action_batch(value: Any) -> tuple[list[BrowserAction], str 
             url = str(arguments.get("url") or "")
             if not url.startswith(("http://", "https://")):
                 return [], "Navigate requires an http(s) URL."
-        if action == "switch_tab":
+        if action in {"switch_tab", "close_tab"}:
+            has_opaque_tab = bool(str(arguments.get("tab_ref") or "").strip()
+                                  and str(arguments.get("tab_snapshot_id") or "").strip())
             index = arguments.get("index")
-            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-                return [], "switch_tab requires a non-negative tab index."
-        if action in {"click_ref", "fill_ref", "select_ref", "press_key", "extract", "switch_tab"}:
+            if not has_opaque_tab and (isinstance(index, bool) or not isinstance(index, int) or index < 0):
+                return [], f"{action} requires a tab_ref/tab_snapshot_id pair or a non-negative legacy tab index."
+        if action in {"click_ref", "fill_ref", "select_ref", "press_key", "extract", "open_ref_new_tab"}:
             ref = str(arguments.get("ref") or "").strip()
-            if action in {"click_ref", "fill_ref", "select_ref", "press_key", "extract"} and not ref:
+            if action in {"click_ref", "fill_ref", "select_ref", "press_key", "extract", "open_ref_new_tab"} and not ref:
                 return [], f"{action} requires a structured page reference."
             if ref and (len(ref) > _MAX_REF_CHARS or any(character.isspace() for character in ref)):
                 return [], f"{action} requires a bounded structured page reference."
             if not str(arguments.get("observation_id") or "").strip():
                 return [], f"{action} requires the current observation_id."
+        if action in {"list_tabs", "find_text", "scroll", "go_back", "extract_list"}:
+            if not str(arguments.get("observation_id") or "").strip():
+                return [], f"{action} requires the current observation_id."
+        if action == "find_text":
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip() or len(query.strip()) > 160:
+                return [], "find_text requires a bounded non-empty plain-text query."
+            if any(token in query for token in ("(?", "\\d", "\\w", "|", "*", ".*")):
+                return [], "find_text accepts plain text only; regular expressions are not allowed."
+        if action == "scroll":
+            direction = str(arguments.get("direction") or "").strip().lower()
+            if direction not in {"up", "down"}:
+                return [], "scroll direction must be up or down."
         if action == "press_key":
             key = arguments.get("key")
             if not isinstance(key, str) or key not in SAFE_PRESS_KEYS:
@@ -220,6 +297,25 @@ def validate_browser_action_batch(value: Any) -> tuple[list[BrowserAction], str 
                                               or not _SEMANTIC_FIELD_NAME.fullmatch(field.strip())
                                               for field in fields)):
                 return [], "extract fields must be a list of at most 16 bounded semantic names."
+        if action == "extract_list":
+            fields = arguments.get("fields", [])
+            if (not isinstance(fields, list) or not fields or len(fields) > 16
+                    or any(not isinstance(field, str) or not field.strip()
+                           or len(field.strip()) > _MAX_FIELD_CHARS
+                           or not _SEMANTIC_FIELD_NAME.fullmatch(field.strip())
+                           for field in fields)):
+                return [], "extract_list fields must be a list of at most 16 bounded semantic names."
+            try:
+                limit = int(arguments.get("limit", 20))
+            except (TypeError, ValueError):
+                return [], "extract_list limit must be an integer."
+            if limit < 1 or limit > 20:
+                return [], "extract_list limit must be between 1 and 20."
+            unique_by = arguments.get("unique_by")
+            if unique_by is not None and (
+                    not isinstance(unique_by, list) or len(unique_by) > 8
+                    or any(not isinstance(item, str) or not item.strip() for item in unique_by)):
+                return [], "extract_list unique_by must be a bounded list of field names."
         if action == "verify":
             contains = arguments.get("contains")
             if contains is not None and not (isinstance(contains, str) or
@@ -236,6 +332,20 @@ def validate_browser_action_batch(value: Any) -> tuple[list[BrowserAction], str 
             if (not isinstance(required_fields, list) or len(required_fields) > 16
                                                 or any(not isinstance(field, str) or not field.strip() for field in required_fields)):
                 return [], "verify required_fields must be a list of at most 16 non-empty names."
+            for key, upper in (("min_items", 20), ("max_tabs", 12), ("required_confirmations", 8)):
+                if key in arguments:
+                    try:
+                        value_number = int(arguments[key])
+                    except (TypeError, ValueError):
+                        return [], f"verify {key} must be an integer."
+                    if value_number < 0 or value_number > upper:
+                        return [], f"verify {key} must be between 0 and {upper}."
+            for key in ("unique_by", "required_origins", "forbidden_actions", "required_evidence",
+                        "source_priority"):
+                value = arguments.get(key)
+                if value is not None and (not isinstance(value, list) or len(value) > 16
+                                          or any(not isinstance(item, str) or not item.strip() for item in value)):
+                    return [], f"verify {key} must be a bounded list of strings."
         if action in STATE_CHANGING_ACTIONS:
             state_change_indexes.append(len(validated))
         validated.append(BrowserAction(action, dict(arguments)))

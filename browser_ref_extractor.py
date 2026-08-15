@@ -39,7 +39,26 @@ _FIELD_ALIASES = {
     "price": frozenset({"price", "price_cny", "价格", "售价"}),
     "source": frozenset({"source", "来源"}),
     "url": frozenset({"url", "link", "链接", "详情链接", "/url"}),
+    "excerpt": frozenset({"excerpt", "summary", "摘要", "简介"}),
+    "stars": frozenset({"star", "stars", "stargazers", "star数", "star 数", "星标"}),
+    "language": frozenset({"language", "语言", "主要语言"}),
+    "updated_at": frozenset({"updated", "updated_at", "last_updated", "last updated", "最近更新时间", "更新时间", "最后更新"}),
+    "installation": frozenset({"installation", "install", "installation_command", "installation command", "安装", "安装命令"}),
+    "text": frozenset({"text", "content", "raw text"}),
+    "mcp": frozenset({"mcp"}),
+    "memory": frozenset({"memory", "记忆"}),
+    "multi_agent": frozenset({"multi-agent", "multi agent", "multi_agent", "多agent", "多 agent"}),
+    "tool_calling": frozenset({"tool calling", "tool-calling", "tool_calling", "工具调用"}),
+    "issue_title": frozenset({"issue", "issue title", "issue_title", "问题标题"}),
+    "published_at": frozenset({"published", "published_at", "发布时间", "日期"}),
+    "rating": frozenset({"rating", "评分"}),
+    "review_count": frozenset({"reviews", "review_count", "评价", "评价数"}),
+    "layout": frozenset({"layout", "配列", "键数"}),
+    "connectivity": frozenset({"connectivity", "connection", "连接方式", "无线"}),
 }
+_INSTALLATION_COMMAND = re.compile(
+    r"(?i)\b(?:pip|uv|poetry|conda|npm|pnpm|yarn|cargo|go)\s+(?:install|add|get)\b"
+)
 _TRUSTED_EXTRACTOR_TOOLS = frozenset({
     "browser_extract",
     "browser_extract_ref",
@@ -152,11 +171,14 @@ def _safe_http_url(value: str, *, base_url: str = "") -> str:
 
 
 def _canonical_field(label: str) -> str:
-    normalized = str(label or "").strip().casefold()
+    normalized = " ".join(str(label or "").strip().casefold().replace("_", " ").replace("-", " ").split())
     for canonical, aliases in _FIELD_ALIASES.items():
-        if normalized in {item.casefold() for item in aliases}:
+        if normalized == canonical.replace("_", " ") or normalized in {
+            " ".join(item.casefold().replace("_", " ").replace("-", " ").split())
+            for item in aliases
+        }:
             return canonical
-    return normalized
+    return normalized.replace(" ", "_")
 
 
 def parse_ref_snapshot(content: Any, ref: str, fields: list[str] | tuple[str, ...], *,
@@ -248,6 +270,12 @@ def parse_ref_snapshot(content: Any, ref: str, fields: list[str] | tuple[str, ..
             title_value = _unquote_scalar(value)
             if title_value and "title" not in values_by_canonical:
                 values_by_canonical["title"] = title_value
+        if (_canonical_field(label) not in _FIELD_ALIASES
+                and label.casefold() in {"generic", "code", "pre", "text"}
+                and _INSTALLATION_COMMAND.search(value)):
+            command = _unquote_scalar(value)
+            values_by_canonical.setdefault("installation", command)
+            values_by_canonical.setdefault("text", command)
 
     # Official Playwright snapshots commonly expose a result URL and a
     # visible heading/domain instead of explicit ``source:`` labels.  The URL

@@ -59,14 +59,31 @@
   - [x] 展平参数的 `switch_tab` 自动绑定当前 observation；state action 后强制新 snapshot。
   - [x] MCP 断连/工具超时有独立 failure kind；仅允许一次 reconnect，第二次返回 `browser_mcp_recovery_exhausted`。
   - [x] 新增恢复、重复动作防护和 flattened action 回归；focused `160 passed, 37 subtests passed`。
-  - [ ] 动态 DOM 的 `select/press/wait`、跨 Tab 旧 ref 和窗口/进程退出清理仍需本地夹具与真实探针复核。
+  - [x] 动态 DOM 的 `select/press/wait`、跨 Tab 旧 ref 和窗口/进程退出清理已有回归；focused `83 passed, 4 subtests passed`，完整 `715 passed, 77 subtests passed`。
+  - [~] 本地动态探针已运行 3×，均在浏览器工具调用前 `provider_timeout_before_tools`；无页面动作和副作用，待模型提供方恢复后重跑。
 - [ ] Slice 3：Tab 上限、切换/关闭、滚动、候选去重和来源证据。
 - [ ] Slice 4：条件分支、fallback、跨页面比较和结构化终态。
 - [ ] Slice 5：表单提交前确认、登录/提交/购买/验证码安全边界与 UI 状态协议。
 - [ ] Slice 6：真实网站 #9/#12/#13/#15/#16/#17 各运行 3 次并生成脱敏质量报告。
-- [~] Checkpoint A：协议/恢复 focused pytest 通过；还需把窗口不可见、MCP 进程退出和动态 DOM 夹具纳入同一质量门禁。
+- [x] Checkpoint A：协议/恢复 focused pytest 通过；窗口不可见、MCP 进程退出、动态 DOM 和临时 profile 清理已纳入同一质量门禁。
 - [ ] Checkpoint B：本地多 Tab/动态 DOM/分支/确认全量 pytest 通过。
 - [ ] Checkpoint C：真实网站 3× 验收指标达标或明确 blocked。
+
+## 复杂真实浏览器任务（2026-08-14 实施进度）
+
+- [x] Slice 3：Tab 上限、观察期 `tab_ref`、切换/新建/关闭、滚动/返回、列表抽取和去重。
+- [x] Slice 4：`BrowserTaskSpec`、受控导航、搜索回退、来源/能力证据、结构化 `verify` 和 bounded ledger。
+- [x] Slice 5：确认后重新观察、唯一目标绑定、登录一次性授权、拒绝返回、禁止提交/购买/上传/删除/凭据输入。
+- [x] Slice 6 runner：真实 #9/#12/#13/#15/#16/#17 独立 runner、7 个 gate 分支、21 次门禁聚合和脱敏报告。
+- [x] Checkpoint B：复杂协议/Tab/确认/证据 focused tests 通过。
+- [ ] Checkpoint C：使用真实模型、真实 Playwright MCP、可见隔离 Chromium 和公开网站完成 21 次有效运行；未执行前保持未发布状态。
+
+### 本轮验证
+
+- 复杂验收单元测试：`15 passed`。
+- 浏览器协议、BrowserRuntime、AgentRuntime、TaskPlan、MCP 回归：`219 passed`。
+- `complex_browser_acceptance.py --help` 入口检查通过。
+- 全量 pytest 首次收集已修复仓库外部 `tests` 包遮蔽；仍有既有简繁转换资源 2 个失败，排除后在既有长 probe 约 89% 处超过 300 秒，未产生新的失败输出。
 
 ### 真实网站本轮记录
 
@@ -77,5 +94,5 @@
 
 - 代码入口：`browser_runtime.py`、`agent_runtime.py`、`task_runtime.py`。
 - 失败分类：`browser_mcp_connection_failed`、`tool_execution_timeout`、`browser_mcp_recovery_exhausted`；恢复不会重放已发出的 state action。
-- 下一步顺序：动态 DOM/旧 ref 夹具 → MCP 进程退出/窗口不可见清理 → 全量 pytest → 真实网站 3× 探针。
-- 最近一次完整回归：`711 passed, 77 subtests passed in 32.15s`。
+- 下一步顺序：模型提供方恢复后重跑本地/公开只读 3× 探针 → 再进入 Slice 3 Tab 上限、关闭/滚动和候选证据。
+- 最近一次完整回归：`715 passed, 77 subtests passed in 29.33s`；本轮 focused `83 passed, 4 subtests passed`。

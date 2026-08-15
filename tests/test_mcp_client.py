@@ -1,10 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcp_client import MCPServerSpec, MCPToolBridge, StdioMCPClient, load_mcp_servers, resolve_officecli_binary
+from mcp_client import (MCPServerSpec, MCPToolBridge, StdioMCPClient,
+                        configured_playwright_proxy, load_mcp_servers,
+                        resolve_officecli_binary)
 
 
 class FakeClient:
@@ -126,6 +129,91 @@ class MCPClientTests(unittest.TestCase):
         bridge.close()
 
         self.assertFalse(output_dir.exists())
+
+    def test_playwright_registry_dir_is_private_and_cleaned_with_bridge(self):
+        bridge = MCPToolBridge(None, enable_playwright=True, enable_officecli=False)
+        spec = next(item for item in bridge.specs if item.name == "playwright")
+        registry_dir = Path(spec.env["PWTEST_SERVER_REGISTRY"])
+
+        self.assertFalse(registry_dir.exists())
+        self.assertNotEqual(registry_dir.parent.resolve(), Path(__file__).resolve().parents[1])
+        self.assertTrue(registry_dir.name.startswith("deskorb-playwright-registry-"))
+
+        registry_dir.mkdir()
+        bridge.close()
+
+        self.assertFalse(registry_dir.exists())
+
+    def test_load_default_playwright_accepts_a_private_registry_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry_dir = Path(directory) / "registry"
+            specs = load_mcp_servers(None, playwright_registry_dir=registry_dir)
+        spec = next(item for item in specs if item.name == "playwright")
+        self.assertEqual(Path(spec.env["PWTEST_SERVER_REGISTRY"]), registry_dir.resolve())
+
+    def test_browser_proxy_prefers_explicit_playwright_setting(self):
+        with patch.dict(os.environ, {
+            "PLAYWRIGHT_MCP_PROXY_SERVER": "http://127.0.0.1:12000",
+            "DESKORB_AGENT_BROWSER_PROXY": "http://127.0.0.1:12001",
+            "ALL_PROXY": "http://127.0.0.1:12002",
+        }, clear=False):
+            self.assertEqual(configured_playwright_proxy(), "http://127.0.0.1:12000")
+
+    def test_default_playwright_maps_all_proxy_to_mcp_proxy(self):
+        with patch.dict(os.environ, {
+            "PLAYWRIGHT_MCP_PROXY_SERVER": "",
+            "DESKORB_AGENT_BROWSER_PROXY": "",
+            "ALL_PROXY": "",
+            "all_proxy": "http://127.0.0.1:12000",
+        }, clear=False):
+            specs = load_mcp_servers(None)
+        spec = next(item for item in specs if item.name == "playwright")
+        self.assertEqual(spec.env.get("PLAYWRIGHT_MCP_PROXY_SERVER"), "http://127.0.0.1:12000")
+
+    def test_invalid_browser_proxy_is_ignored(self):
+        with patch.dict(os.environ, {
+            "PLAYWRIGHT_MCP_PROXY_SERVER": "file:///not-a-proxy",
+            "DESKORB_AGENT_BROWSER_PROXY": "not a url",
+            "ALL_PROXY": "",
+            "all_proxy": "",
+        }, clear=False):
+            self.assertEqual(configured_playwright_proxy(), "")
+
+    def test_stdio_close_terminates_the_owned_mcp_process_tree_on_windows(self):
+        class FakeProcess:
+            pid = 4321
+
+            def __init__(self):
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return None if not (self.terminated or self.killed) else 0
+
+            def wait(self, timeout=None):
+                if not (self.terminated or self.killed):
+                    raise TimeoutError("process still running")
+                return 0
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+        client = StdioMCPClient(MCPServerSpec("playwright", "node", (), {}))
+        process = FakeProcess()
+        client._process = process
+        with patch("mcp_client.os.name", "nt"), \
+                patch("mcp_client.subprocess.run") as run:
+            run.return_value.returncode = 0
+            client.close()
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [
+            "taskkill", "/PID", "4321", "/T", "/F",
+        ])
+        self.assertIsNone(client._process)
 
     def test_default_servers_include_officecli_when_binary_exists(self):
         with tempfile.TemporaryDirectory() as directory:

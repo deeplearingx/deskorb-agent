@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +29,16 @@ def is_python_healthy(
     path = Path(executable)
     if not path.is_file():
         return False
+    if os.name == "nt":
+        # Avoid handing arbitrary text files to the Windows image loader. A
+        # damaged or placeholder ``python.exe`` can otherwise block before
+        # subprocess.run gets a chance to enforce its timeout.
+        try:
+            with path.open("rb") as stream:
+                if stream.read(2) != b"MZ":
+                    return False
+        except OSError:
+            return False
     try:
         completed = runner(
             [str(path), "-I", "-c", PROBE_CODE],

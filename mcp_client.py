@@ -21,11 +21,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp_security import URLPolicyError, validate_local_path, validate_public_url
 
 
 PLAYWRIGHT_MCP_BROWSER = "chromium"
+PLAYWRIGHT_MCP_VERSION = "0.0.79"
 
 
 def default_playwright_paths() -> dict[str, Path]:
@@ -62,8 +64,84 @@ def local_playwright_diagnostics() -> list[str]:
     return diagnostics
 
 
+def configured_playwright_proxy() -> str:
+    """Return the explicitly configured browser proxy without exposing it.
+
+    Chromium does not consume the generic ``ALL_PROXY`` environment variable,
+    while Playwright MCP does accept ``PLAYWRIGHT_MCP_PROXY_SERVER``.  Prefer
+    the Playwright-specific setting, then DeskOrb's browser setting, and only
+    then the conventional all-proxy names.  Invalid values are ignored so a
+    malformed shell environment cannot make browser startup fail mysteriously.
+    """
+    preferred_names = (
+        "PLAYWRIGHT_MCP_PROXY_SERVER",
+        "DESKORB_AGENT_BROWSER_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+    )
+    values: dict[str, str] = {
+        str(name).casefold(): str(value).strip()
+        for name, value in os.environ.items()
+        if str(value).strip()
+    }
+    for name in preferred_names:
+        value = values.get(name.casefold(), "")
+        if not value or len(value) > 2048:
+            continue
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme.casefold() not in {"http", "https", "socks5", "socks5h"}:
+                continue
+            if not parsed.hostname:
+                continue
+            _ = parsed.port
+        except (TypeError, ValueError):
+            continue
+        return value
+    return ""
+
+
 class MCPError(RuntimeError):
     """A user-facing error from a local MCP process."""
+
+
+def _terminate_process_tree(process: Any) -> None:
+    """Best-effort termination for an owned MCP process and its descendants."""
+    if process is None:
+        return
+    if os.name == "nt":
+        try:
+            # Playwright MCP owns a Node process which may own Chromium child
+            # processes.  Terminating only the stdio parent can leave the
+            # browser and its profile alive after a task timeout or crash.
+            subprocess.run(
+                ["taskkill", "/PID", str(int(process.pid)), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+                creationflags=0x08000000,
+            )
+        except (AttributeError, OSError, subprocess.SubprocessError,
+                TypeError, ValueError):
+            pass
+    try:
+        process.wait(timeout=0.5)
+        return
+    except Exception:
+        pass
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=2)
+        except Exception:
+            pass
 
 
 def _safe_mcp_diagnostic(value: Any) -> str:
@@ -143,7 +221,8 @@ def resolve_officecli_binary(explicit: str | Path | None = None) -> str | None:
 def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool = True,
                      enable_officecli: bool = True,
                      officecli_binary: str | Path | None = None,
-                     playwright_output_dir: str | Path | None = None) -> list[MCPServerSpec]:
+                     playwright_output_dir: str | Path | None = None,
+                     playwright_registry_dir: str | Path | None = None) -> list[MCPServerSpec]:
     """Load trusted local servers from a standard ``mcpServers`` JSON file."""
     value = str(config_path or "").strip()
     if value:
@@ -170,6 +249,14 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
         console_python = interpreter
     result: list[MCPServerSpec] = []
     if enable_playwright:
+        registry_env = {}
+        if playwright_registry_dir:
+            registry_env["PWTEST_SERVER_REGISTRY"] = str(
+                Path(playwright_registry_dir).expanduser().resolve()
+            )
+        browser_proxy = configured_playwright_proxy()
+        if browser_proxy:
+            registry_env["PLAYWRIGHT_MCP_PROXY_SERVER"] = browser_proxy
         local = default_playwright_paths()
         if not local_playwright_diagnostics():
             args = (str(local["cli"]), "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated")
@@ -177,20 +264,19 @@ def load_mcp_servers(config_path: str | Path | None, *, enable_playwright: bool 
                 args += ("--output-dir", str(Path(playwright_output_dir).resolve()))
             result.append(MCPServerSpec(
                 "playwright", "node", args,
-                {"PLAYWRIGHT_BROWSERS_PATH": str(local["browsers"])}, str(root),
+                {**registry_env, "PLAYWRIGHT_BROWSERS_PATH": str(local["browsers"])}, str(root),
                 allow_safe_tools=True,
             ))
         else:
             # Keep the fallback aligned with the checked-in local release.
             # ``latest`` can silently change tool schemas and invalidate the
             # semantic adapter's ref/observation contract.
-            args = ("-y", "@playwright/mcp@0.0.79", "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated")
+            args = ("-y", f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}", "--browser", PLAYWRIGHT_MCP_BROWSER, "--isolated")
             if playwright_output_dir:
                 args += ("--output-dir", str(Path(playwright_output_dir).resolve()))
             result.append(MCPServerSpec(
                 "playwright", "npx",
-                args,
-                {}, None, allow_safe_tools=True,
+                args, registry_env, None, allow_safe_tools=True,
             ))
     result.append(MCPServerSpec("powertoys", str(console_python), (str(root / "powertoys_mcp.py"),), {}, str(root),
                                 allow_safe_tools=True))
@@ -508,14 +594,7 @@ class StdioMCPClient:
             process, self._process = self._process, None
             if not process:
                 return
-            try:
-                process.terminate()
-                process.wait(timeout=2)
-            except Exception:
-                try:
-                    process.kill()
-                except Exception:
-                    pass
+            _terminate_process_tree(process)
             try:
                 self._exit_code = process.poll()
             except Exception:
@@ -613,7 +692,9 @@ class MCPToolBridge:
                  enable_officecli: bool = True, officecli_binary: str | Path | None = None,
                  timeout_seconds: int = 30, officecli_timeout_seconds: int | None = None):
         self._owned_output_dirs: set[Path] = set()
+        self._owned_registry_dirs: set[Path] = set()
         output_dir = None
+        registry_dir = None
         if enable_playwright:
             # Reserve a unique, private path without creating it yet.  The
             # Playwright process creates the directory when it actually starts;
@@ -622,15 +703,27 @@ class MCPToolBridge:
             output_dir = (Path(tempfile.gettempdir()).resolve()
                           / f"deskorb-playwright-output-{uuid.uuid4().hex}")
             self._owned_output_dirs.add(output_dir)
+            # Playwright MCP 0.0.79 stores browser-server descriptors under
+            # LOCALAPPDATA\ms-playwright\b.  That global registry can be
+            # unreadable in managed Windows environments and is shared across
+            # unrelated tasks.  Give the default local server a private,
+            # per-bridge registry; the server creates it lazily on startup.
+            if not str(config_path or "").strip():
+                registry_dir = (Path(tempfile.gettempdir()).resolve()
+                                / f"deskorb-playwright-registry-{uuid.uuid4().hex}")
+                self._owned_registry_dirs.add(registry_dir)
         try:
             self.specs = load_mcp_servers(
                 config_path, enable_playwright=enable_playwright,
                 enable_officecli=enable_officecli, officecli_binary=officecli_binary,
                 playwright_output_dir=output_dir,
+                playwright_registry_dir=registry_dir,
             )
         except Exception:
             if output_dir is not None:
                 shutil.rmtree(output_dir, ignore_errors=True)
+            if registry_dir is not None:
+                shutil.rmtree(registry_dir, ignore_errors=True)
             raise
         # A user-supplied config may already provide its own output directory;
         # only directories created by this bridge are owned and cleaned here.
@@ -701,7 +794,7 @@ class MCPToolBridge:
         allowed = {
             "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
             "browser_fill_form", "browser_press_key", "browser_select_option",
-            "browser_wait_for", "browser_tabs",
+            "browser_wait_for", "browser_tabs", "browser_find", "browser_navigate_back",
         }
         result: list[dict[str, Any]] = []
         for schema in schemas:
@@ -858,6 +951,13 @@ class MCPToolBridge:
             try:
                 if output_dir.name.startswith("deskorb-playwright-output-") and output_dir.parent == Path(tempfile.gettempdir()).resolve():
                     shutil.rmtree(output_dir)
+            except OSError:
+                continue
+        for registry_dir in self._owned_registry_dirs:
+            try:
+                if (registry_dir.name.startswith("deskorb-playwright-registry-")
+                        and registry_dir.parent == Path(tempfile.gettempdir()).resolve()):
+                    shutil.rmtree(registry_dir, ignore_errors=True)
             except OSError:
                 continue
 

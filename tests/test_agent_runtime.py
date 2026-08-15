@@ -5,6 +5,7 @@ import json
 import urllib.error
 from pathlib import Path
 from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from agent_policy import Risk
@@ -235,6 +236,170 @@ class ReadOnlyToolsTests(unittest.TestCase):
         progress = [value for kind, value in events if kind == "task_progress"]
         self.assertEqual(progress[-1]["terminal"], "failed")
         self.assertEqual(progress[-1]["failure_kind"], "invalid_browser_action_batch")
+
+    def test_confirmed_browser_login_finishes_in_approval_resume_path(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        original_call = FunctionCall(
+            call_id="browser-login",
+            name="browser_action_batch",
+            arguments=json.dumps({"actions": [{
+                "action": "click_ref",
+                "arguments": {"ref": "observed-login", "observation_id": "obs-1"},
+            }]}),
+            item={"type": "function_call"},
+        )
+        runtime._pending_execution = (
+            original_call,
+            [{"role": "user", "content": "open OpenAI and click login after confirmation"}],
+            "打开 OpenAI，点击登录前先确认",
+        )
+        request = runtime.request_approval(
+            "browser_action_batch",
+            {"actions": [{"action": "click_ref", "arguments": {"ref": "observed-login"}}]},
+            Risk.EXTERNAL_OR_ELEVATED,
+            "Authorize high-risk browser login",
+        )
+        runtime.ui.get_nowait()  # discard the approval prompt
+        runtime.prepare_visible_browser = Mock(return_value={"ok": True})
+        runtime._run_desktop_action = Mock(return_value={
+            "ok": True, "state_changed": True, "login_flow_verified": True,
+            "confirmation_count": 1,
+        })
+
+        with patch("agent_runtime.get_api_key", return_value="test-key"):
+            runtime.run_turn(f"确认 {request.token}", [], deadline=ExecutionDeadline(10))
+
+        events = []
+        while not runtime.ui.empty():
+            events.append(runtime.ui.get_nowait())
+        progress = [value for kind, value in events if kind == "task_progress"]
+        self.assertEqual(progress[-1]["terminal"], "completed")
+        runtime._run_desktop_action.assert_called_once()
+
+    def test_cancelled_high_risk_browser_approval_uses_structural_descriptor(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._browser_session = SimpleNamespace(
+            observation_id="obs-1",
+            _current_page_url="https://platform.openai.com/login",
+            execute=Mock(return_value={"ok": True, "state_changed": True}),
+        )
+        runtime._pending_browser_approval_descriptor = {
+            "origin": "https://openai.com",
+            "observation_id": "obs-1",
+            "targets": [{"action": "click_ref", "ref": "login", "match_count": "1"}],
+            "action_hash": "hash",
+        }
+        request = runtime.request_approval(
+            "browser_action_batch",
+            {"actions": [{"action": "click_ref", "arguments": {"ref": "login"}}]},
+            Risk.EXTERNAL_OR_ELEVATED,
+            "MCP browser tool",
+        )
+        runtime.ui.get_nowait()  # discard the approval prompt
+
+        runtime.run_turn("取消", [])
+
+        events = []
+        while not runtime.ui.empty():
+            events.append(runtime.ui.get_nowait())
+        rejection = [value for kind, value in events if kind == "browser_confirmation_rejected"]
+        self.assertEqual(len(rejection), 1)
+        self.assertTrue(rejection[0]["ok"])
+        runtime._browser_session.execute.assert_called_once()
+
+    def test_decorative_login_target_gets_one_semantic_recovery_turn(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+
+        class FakeMcp:
+            available_servers = ("playwright",)
+
+            def schemas(self, _servers):
+                return []
+
+            def is_browser_isolated(self):
+                return True
+
+            def owns(self, _name):
+                return False
+
+        runtime.mcp = FakeMcp()
+        runtime._task_authorized_until = __import__("time").monotonic() + 30
+        first = {"output": [{
+            "type": "function_call", "call_id": "login-button", "name": "browser_action_batch",
+            "arguments": '{"actions":[{"action":"click_ref","arguments":{"ref":"button"}}]}',
+        }]}
+        second = {"output": [{
+            "type": "function_call", "call_id": "login-link", "name": "browser_action_batch",
+            "arguments": '{"actions":[{"action":"verify","arguments":{"required_fields":["title"]}}]}',
+        }]}
+        runtime._request = Mock(side_effect=[first, second])
+        runtime._available_schemas = Mock(return_value=[])
+        runtime._run_desktop_action = Mock(side_effect=[
+            {"ok": False, "failure_kind": "browser_login_target_requires_observed_link",
+             "error": "Use the observed public login link."},
+            {"ok": True, "postcondition_passed": True, "verified": True,
+             "verification": {"passed": True, "kind": "browser_structured_verification"},
+             "extraction": {"fields": {"title": "Verified result"}}},
+        ])
+
+        runtime._run_task_loop("test-key", [{"role": "user", "content": "search"}],
+                               "open browser and search a result", False)
+
+        self.assertEqual(runtime._request.call_count, 2)
+        events = []
+        while not runtime.ui.empty():
+            events.append(runtime.ui.get_nowait())
+        progress = [value for kind, value in events if kind == "task_progress"]
+        self.assertEqual(progress[-1]["terminal"], "completed")
+
+    def test_browser_evidence_failure_gets_one_bounded_relocation_turn(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._task_authorized_until = __import__("time").monotonic() + 30
+        first = {"output": [{
+            "type": "function_call", "call_id": "extract-1", "name": "browser_action_batch",
+            "arguments": '{"actions":[{"action":"extract","arguments":{"ref":"root"}}]}',
+        }]}
+        second = {"output": [{
+            "type": "function_call", "call_id": "verify-1", "name": "browser_action_batch",
+            "arguments": '{"actions":[{"action":"verify","arguments":{"required_fields":["title"]}}]}',
+        }]}
+        runtime._request = Mock(side_effect=[first, second])
+        runtime._available_schemas = Mock(return_value=[])
+        runtime._run_desktop_action = Mock(side_effect=[
+            {"ok": False, "failure_kind": "browser_evidence_insufficient",
+             "error": "The selected ref did not provide the requested fields."},
+            {"ok": True, "postcondition_passed": True, "verified": True,
+             "verification": {"passed": True, "kind": "browser_structured_verification"},
+             "extraction": {"fields": {"title": "Verified result"}}},
+        ])
+
+        runtime._run_task_loop("test-key", [{"role": "user", "content": "search"}],
+                               "open browser and search a result", False)
+
+        self.assertEqual(runtime._request.call_count, 2)
+        second_payload = runtime._request.call_args_list[1].args[0]
+        self.assertIn("Structured browser evidence was insufficient", str(second_payload["input"]))
+        self.assertIn("fresh snapshot", str(second_payload["input"]))
+        self.assertEqual(runtime._browser_semantic_recovery_attempts, 1)
+
+    def test_browser_task_spec_blocks_terminal_success_when_required_evidence_is_missing(self):
+        runtime = AgentRuntime(Queue(), "test", "https://example.test/v1", working_dir=self.root)
+        runtime._task_plan = TaskPlan.from_goal(
+            "研究至少 2 个 GitHub 项目，记录标题、链接和 Star 数"
+        )
+        first = {"title": "one", "url": "https://github.com/example/one", "stars": "10"}
+        second = {"title": "two", "url": "https://github.com/example/two", "stars": "20"}
+        runtime._browser_session = SimpleNamespace(
+            evidence_ledger=SimpleNamespace(records=(SimpleNamespace(fields=first),
+                                                     SimpleNamespace(fields=second))),
+            _confirmation_count=0,
+            _tab_records=[],
+            cache_verified=True,
+        )
+        self.assertTrue(runtime._browser_task_spec_verified())
+        first.pop("stars")
+        second.pop("stars")
+        self.assertFalse(runtime._browser_task_spec_verified())
 
     def test_configured_fla_ui_backend_owns_desktop_semantic_path(self):
         fake_backend = Mock()
