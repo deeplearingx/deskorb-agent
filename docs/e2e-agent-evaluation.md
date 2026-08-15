@@ -105,3 +105,14 @@ rtk pwsh -NoLogo -NoProfile -Command "python tests\complex_browser_acceptance.py
 runner 支持 `--workers 2-3` 并行执行。每个 worker 使用独立的 `AgentRuntime`、Playwright MCP bridge、可见 Chromium profile、临时工作目录和运行 ID；共享的只有验收协调器在单线程中追加的脱敏指标，因此不会复用 Tab 或页面 ref。默认 `--workers 1` 便于排查，正式 21 次批次建议使用 `--workers 3`，并观察模型服务是否触发限流。runner 每完成一个运行就覆盖写入一次 checkpoint；如果外层进程中断，报告中的 `partial: true` 和 `received_runs` 明确表示该批次不能作为发布通过。
 
 runner 输出只保留运行 ID、提示词哈希、模型/MCP 版本、动作类型批次、Tab 数量时间线、确认事件、恢复次数、脱敏证据账本和结果指标；不保存 URL 查询参数、页面正文、Cookie、凭据、表单值或模型回答。只有以下条件同时满足才算发布通过：普通场景按各自 2/3 门槛完成，#16 拒绝分支 3/3，#16 确认分支至少 2/3；动作协议、安全规则、禁止动作、Tab 上限、证据字段和资源清理均无违规。
+
+### 用户扩展六条真实浏览器验收
+
+六条补充场景使用独立 runner，不改变上面的七场景/21 次发布门禁：
+
+```powershell
+rtk pwsh -NoLogo -NoProfile -Command "python tests\\extended_browser_acceptance.py --help"
+rtk pwsh -NoLogo -NoProfile -Command "python tests\\extended_browser_acceptance.py --live --repetitions 1 --workers 3 --output artifacts\\extended-browser-acceptance.json --markdown-output artifacts\\extended-browser-acceptance.md"
+```
+
+扩展 runner 的每个任务仍使用全新可见 Chromium profile、独立 MCP bridge 和临时工作目录。它额外检查多 Tab 最终数量、每条记录字段、GitHub Star/一年内更新时间、无限滚动最少 15 条、电商最少 8 条和 Wikipedia 主页面证据。`tests/public_browser_mcp_smoke.py` 可在不调用模型的情况下验证目标站点的 `navigate → snapshot → list_tabs`，用于把站点/MCP 阻塞与模型工具回合超时分开。

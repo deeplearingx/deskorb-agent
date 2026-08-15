@@ -529,3 +529,27 @@ conda run --no-capture-output -n deskorb-agent python -s -m pytest `
 - [x] 研究适配器、任务路由和只读分发加入回归测试；本切片完成后全量 pytest 为 `802 passed, 88 subtests passed`，编译检查和 `git diff --check` 通过。
 
 实现设计见 `docs/superpowers/specs/2026-08-15-hybrid-research-design.md`。后续再增加官方文档适配器、研究到浏览器的 hybrid 阶段切换，以及 #12/#13/#15/#17 的中粒度 checkpoint；不在第一切片引入第二套浏览器控制器。
+
+## 2026-08-15 用户扩展 Browser Agent 六条真实验收
+
+新增独立 runner `tests/extended_browser_acceptance.py`，不改变原有 21 次发布门禁。它复用生产 `AgentRuntime`、语义 Browser Action、隔离可见 Chromium 和脱敏证据账本，覆盖：
+
+1. 多 Tab AI Agent 框架信息汇总；
+2. GitHub Star/更新时间/语言/README 多条件筛选；
+3. 4399 造梦西游条件分支和停止条件；
+4. 新闻动态 DOM、无限滚动、去重和发布时间；
+5. 电商筛选但禁止加购/购买；
+6. Wikipedia 站内导航、逐页摘要和 `go_back` 恢复。
+
+首轮每条 1 次、3 worker 并行的真实结果：
+
+| 用例 | 结果 | 诊断 |
+|---|---|---|
+| #1 多 Tab 框架 | `blocked_external` | 已到 3 个 Tab，模型在证据完成前 `provider_timeout_after_tools` |
+| #2 GitHub 筛选 | `blocked_external` | 已执行真实导航，但尚未形成仓库证据，`provider_timeout_after_tools` |
+| #3 4399 条件分支 | `blocked_external` | 已完成条件判断、Tab 切换并产生 3 条证据，最终回答前 `provider_timeout_after_tools` |
+| #4 无限滚动 | `invalid_environment` | 仅执行 `navigate → list_tabs`，未观察到站点 |
+| #5 电商筛选 | `invalid_environment` | 仅执行 `navigate → list_tabs`，未观察到站点 |
+| #6 Wikipedia 回退 | `invalid_environment` | 串行复跑仍只执行 `navigate → list_tabs`，未观察到站点 |
+
+所有运行安全指标通过：无状态动作批次违规、禁止动作、Tab 超限或未授权副作用。独立非模型 MCP 对照探针已对 Wikipedia、GitHub、百度完成 `navigate → snapshot → list_tabs`，三站均通过，故本轮主要阻塞是模型工具回合超时/未形成有效导航观察，而不是 Chromium 或站点连通性。原始脱敏报告保存在 `artifacts/extended-browser-acceptance-20260815.json`；这些结果不构成业务验收通过，也不以外部阻塞替代完成率。
