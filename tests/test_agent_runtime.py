@@ -1390,6 +1390,16 @@ class ReadOnlyToolsTests(unittest.TestCase):
         self.assertEqual(open_call.call_count, 2)
         sleep.assert_called_once()
 
+    def test_run_turn_looks_up_the_effective_provider_key(self):
+        runtime = AgentRuntime(
+            Queue(), "test", "https://api.aijws.com", working_dir=self.root,
+            model_provider="auto",
+        )
+        with patch("agent_runtime.get_api_key", return_value="secret") as get_key, \
+             patch.object(runtime, "_run_no_tools_ephemeral_turn", return_value=None):
+            runtime._run_turn("hello", [], allow_tools=False)
+        get_key.assert_called_once_with("responses")
+
     def test_request_caps_provider_timeout_to_remaining_execution_deadline(self):
         class Response:
             def read(self, _limit):

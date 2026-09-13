@@ -269,6 +269,23 @@ class CodexWorkerTests(unittest.TestCase):
             [("user", "hello"), ("assistant", "fast")],
         )
 
+    def test_auto_api_turn_looks_up_the_effective_provider_key(self):
+        class FakeResponse:
+            def __iter__(self):
+                return iter([b'data: {"type":"response.completed","response":{"id":"resp_1"}}\n'])
+
+            def close(self):
+                pass
+
+        self.worker._model = "test-model"
+        self.worker._model_provider = "auto"
+        self.worker._adapter = ModelAdapter("auto", "https://api.aijws.com")
+        self.worker._api_base_url = self.worker._adapter.profile.base_url
+        with patch("worker.get_api_key", return_value="secret") as get_key, \
+             patch("worker.urllib.request.urlopen", return_value=FakeResponse()):
+            self.worker._run_api_turn("hello", [])
+        get_key.assert_called_once_with("responses")
+
     def test_api_stream_ignores_gateway_keepalive_text_delta(self):
         class FakeResponse:
             def __iter__(self):

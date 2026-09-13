@@ -2,6 +2,7 @@
 setlocal
 cd /d "%~dp0"
 set "CONDA_NO_PLUGINS=true"
+set "CONDA_SOLVER=classic"
 set "PYTHONNOUSERSITE=1"
 
 where conda >nul 2>nul

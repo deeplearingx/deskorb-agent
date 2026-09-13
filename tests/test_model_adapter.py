@@ -1,10 +1,20 @@
 import unittest
 
-from model_adapter import ModelAdapter, provider_profile
+from model_adapter import ModelAdapter, effective_api_provider, provider_profile
 from responses_tool_protocol import function_call_output
 
 
 class ModelAdapterTests(unittest.TestCase):
+    def test_effective_provider_matches_the_protocol_used_for_key_lookup(self):
+        self.assertEqual(
+            effective_api_provider("auto", "https://api.aijws.com"),
+            "responses",
+        )
+        self.assertEqual(
+            effective_api_provider("openai-compatible", "https://api.aijws.com"),
+            "openai-compatible",
+        )
+
     def test_auto_detects_official_vendor_protocols(self):
         self.assertEqual(provider_profile("gpt", "https://api.openai.com/v1").name, "openai")
         self.assertEqual(provider_profile("auto", "https://api.deepseek.com").protocol, "chat_completions")

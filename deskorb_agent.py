@@ -38,6 +38,8 @@ from config import __version__
 from desktop_activity_indicator import DesktopActivityIndicator
 from credential_store import delete_api_key, has_api_key, set_api_key
 from debuglog import dbg, DEBUG_LOG
+from model_adapter import (PROVIDERS as API_PROVIDERS, effective_api_provider,
+                           normalize_provider)
 from win32utils import *
 from win32utils import _user32, _gdi32
 from worker import CodexWorker
@@ -132,6 +134,16 @@ def _state_text(state, key, default):
     return default if not value or value.lower() in ("none", "null") else value
 
 
+def _state_provider(state):
+    """Return the persisted/configured API provider, normalized to a known value."""
+    return normalize_provider(_state_text(state, "model_provider", MODEL_PROVIDER))
+
+
+def _connection_provider(provider, base_url):
+    """Resolve the provider used for both the API protocol and its credential."""
+    return effective_api_provider(provider, base_url)
+
+
 def _startup_permission_mode():
     """Decide this launch's permission state: (read_only, mode to LAUNCH the worker in).
     The remembered Read-only toggle — a deliberate user choice, like Window-only — wins
@@ -160,6 +172,7 @@ class Overlay:
         self._backend = _state_text(saved_state, "connection_backend", CONNECTION_BACKEND).lower()
         if self._backend not in ("auto", "codex", "api", "agent"):
             self._backend = CONNECTION_BACKEND
+        self._model_provider = _state_provider(saved_state)
         self._api_base_url = _state_text(saved_state, "api_base_url", API_BASE_URL)
         self._api_proxy_url = _state_text(saved_state, "api_proxy_url", API_PROXY_URL)
         startup_model = _state_text(saved_state, "model", API_MODEL)
@@ -172,7 +185,8 @@ class Overlay:
         self.worker = CodexWorker(self.ui_q, permission_mode=_launch_mode,
                                   backend=self._backend, model=startup_model,
                                   api_base_url=self._api_base_url,
-                                  api_proxy_url=self._api_proxy_url)
+                                  api_proxy_url=self._api_proxy_url,
+                                  model_provider=self._model_provider)
         self._meeting_result = None
         self._meeting_transcript = ""
         self._meeting_minutes_parts: list[str] = []
@@ -4218,14 +4232,15 @@ class Overlay:
         if self.busy:
             self.add_sys("⏳ Finish (or Stop) the current reply before switching connection.")
             return
-        if value == "api" and not has_api_key():
+        provider = _connection_provider(self._model_provider, self._api_base_url)
+        if value == "api" and not has_api_key(provider):
             self.add_sys("🔑 API Key 尚未配置；请在 Connection settings 中保存密钥。")
             self._open_connection_settings()
             return
         self._backend = value
         _save_state(connection_backend=value)
         self.worker.configure_connection(value, self._model, self._api_base_url,
-                                         self._api_proxy_url)
+                                         self._api_proxy_url, self._model_provider)
         self._set_status("switching connection…")
 
     def _open_connection_settings(self):
@@ -4240,16 +4255,19 @@ class Overlay:
         win.transient(self.root)
 
         backend_var = tk.StringVar(value=self._backend)
+        provider_var = tk.StringVar(value=self._model_provider)
         model_var = tk.StringVar(value=self._model or API_MODEL)
         base_var = tk.StringVar(value=self._api_base_url or API_BASE_URL)
         proxy_var = tk.StringVar(value=self._api_proxy_url)
         key_var = tk.StringVar()
-        status_var = tk.StringVar(value=("API Key: saved in Windows Credential Manager"
-                                         if has_api_key() else "API Key: not configured"))
+        initial_provider = _connection_provider(provider_var.get(), base_var.get())
+        status_var = tk.StringVar(value=(f"API Key: saved in Windows Credential Manager ({initial_provider})"
+                                         if has_api_key(initial_provider)
+                                         else f"API Key: not configured ({initial_provider})"))
 
         body = tk.Frame(win, bg=T["bg"], padx=18, pady=16)
         body.grid(row=0, column=0, sticky="nsew")
-        labels = ("Connection", "Model ID", "API base URL", "HTTP proxy (optional)", "API Key")
+        labels = ("Connection", "Provider", "Model ID", "API base URL", "HTTP proxy (optional)", "API Key")
         for row, label in enumerate(labels):
             tk.Label(body, text=label, bg=T["bg"], fg=T["muted"],
                      font=self.f_small, anchor="w").grid(row=row, column=0, sticky="w", pady=5)
@@ -4261,35 +4279,45 @@ class Overlay:
         backend_menu["menu"].configure(bg=T["field"], fg=T["text"])
         backend_menu.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=5)
 
+        provider_menu = tk.OptionMenu(body, provider_var, *API_PROVIDERS)
+        provider_menu.configure(bg=T["field"], fg=T["text"], activebackground=T["accent"],
+                                activeforeground=T["on_accent"], bd=0, highlightthickness=0,
+                                width=28)
+        provider_menu["menu"].configure(bg=T["field"], fg=T["text"])
+        provider_menu.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=5)
+
         entries = []
-        for row, variable, show in ((1, model_var, ""), (2, base_var, ""),
-                                    (3, proxy_var, ""), (4, key_var, "•")):
+        for row, variable, show in ((2, model_var, ""), (3, base_var, ""),
+                                    (4, proxy_var, ""), (5, key_var, "•")):
             entry = tk.Entry(body, textvariable=variable, show=show, bg=T["field"], fg=T["text"],
                              insertbackground=T["text"], relief="flat", width=38)
             entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=5, ipady=5)
             entries.append(entry)
 
         tk.Label(body, textvariable=status_var, bg=T["bg"], fg=T["faint"],
-                 font=self.f_small, anchor="w").grid(row=5, column=0, columnspan=2,
+                 font=self.f_small, anchor="w").grid(row=6, column=0, columnspan=2,
                                                       sticky="w", pady=(6, 10))
         error_var = tk.StringVar()
         tk.Label(body, textvariable=error_var, bg=T["bg"], fg=T["err"],
-                 font=self.f_small, anchor="w", wraplength=390).grid(row=6, column=0,
+                 font=self.f_small, anchor="w", wraplength=390).grid(row=7, column=0,
                                                                       columnspan=2, sticky="w")
 
         buttons = tk.Frame(body, bg=T["bg"])
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def clear_key():
             try:
-                delete_api_key()
+                provider = normalize_provider(provider_var.get())
+                effective_provider = _connection_provider(provider, base_var.get())
+                delete_api_key(effective_provider)
                 key_var.set("")
-                status_var.set("API Key: removed")
+                status_var.set(f"API Key: removed ({effective_provider})")
             except Exception as exc:
                 error_var.set(str(exc))
 
         def save():
             backend = backend_var.get().strip().lower()
+            provider = normalize_provider(provider_var.get())
             model = model_var.get().strip()
             base = base_var.get().strip().rstrip("/")
             proxy = proxy_var.get().strip().rstrip("/")
@@ -4307,19 +4335,23 @@ class Overlay:
                 error_var.set("Proxy must be an HTTP/HTTPS URL, for example http://127.0.0.1:7890.")
                 return
             try:
+                effective_provider = _connection_provider(provider, base)
                 if key_var.get().strip():
-                    set_api_key(key_var.get())
-                if backend in ("api", "agent") and not has_api_key():
+                    set_api_key(key_var.get(), effective_provider)
+                if backend in ("api", "agent") and not has_api_key(effective_provider):
                     error_var.set("API and Agent modes require an API Key.")
                     return
                 self._backend = backend
+                self._model_provider = provider
                 self._model = model
                 self._api_base_url = base
                 self._api_proxy_url = proxy
-                _save_state(connection_backend=backend, model=model, api_base_url=base,
-                            api_proxy_url=proxy)
-                self.worker.configure_connection(backend, model, base, proxy)
-                self.add_sys(f"🔌 Connection updated: {backend} · {model}")
+                _save_state(connection_backend=backend, model_provider=provider, model=model,
+                            api_base_url=base, api_proxy_url=proxy)
+                self.worker.configure_connection(backend, model, base, proxy, provider)
+                provider_label = (provider if provider == effective_provider
+                                  else f"{provider} → {effective_provider}")
+                self.add_sys(f"🔌 Connection updated: {backend} · {provider_label} · {model}")
                 win.destroy()
             except Exception as exc:
                 error_var.set(f"Could not save settings: {exc}")

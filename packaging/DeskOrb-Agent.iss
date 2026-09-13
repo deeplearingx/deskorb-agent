@@ -14,7 +14,9 @@ AppId={{9B7C4F55-8A3D-4B23-9B52-7D8B5CBF7A20}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-DefaultDirName={localappdata}\Programs\DeskOrb Agent
+; D: is the default, but the directory page lets the user choose another path.
+DefaultDirName=D:\DeskOrb Agent
+DisableDirPage=no
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -37,9 +39,8 @@ VersionInfoProductVersion=0.2.0
 Source: "{#ReleaseRoot}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{autoprograms}\DeskOrb Agent"; Filename: "{app}\Start DeskOrb Agent Portable.cmd"; WorkingDir: "{app}"
-Name: "{autodesktop}\DeskOrb Agent"; Filename: "{app}\Start DeskOrb Agent Portable.cmd"; WorkingDir: "{app}"
-Name: "{autoprograms}\DeskOrb Agent README"; Filename: "{app}\README.md"; WorkingDir: "{app}"
+; Keep the shortcut file alongside the application in the selected directory.
+Name: "{app}\DeskOrb Agent"; Filename: "{app}\Start DeskOrb Agent Portable.cmd"; WorkingDir: "{app}"
 
 [Run]
 Filename: "{app}\runtime\python\Scripts\conda-unpack.exe"; WorkingDir: "{app}\runtime\python"; StatusMsg: "Finalizing the bundled Python runtime..."; Flags: runhidden waituntilterminated

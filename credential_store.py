@@ -181,7 +181,7 @@ def delete_api_key(provider: str | None = None) -> None:
     target = _credential_target(provider)
     if not _advapi32.CredDeleteW(target, 1, 0):
         error = ctypes.get_last_error()
-    if error != 1168:            # ERROR_NOT_FOUND
+        if error != 1168:        # ERROR_NOT_FOUND
             raise ctypes.WinError(error)
     if target == TARGET and not _advapi32.CredDeleteW(LEGACY_TARGET, 1, 0):
         error = ctypes.get_last_error()

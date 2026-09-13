@@ -18,15 +18,19 @@
 .\packaging\build-installer.ps1
 ```
 
-输出文件：
+输出文件（构建缓存和产物都位于 D 盘项目目录）：
 
 ```text
 artifacts\installer\DeskOrb-Agent-0.2.0-Setup-x64.exe
 ```
 
-构建机需要预先安装 Inno Setup 6 和 `conda-pack`。安装器使用当前用户目录下的
-`%LOCALAPPDATA%\Programs\DeskOrb Agent`，不需要管理员权限；安装完成时会自动执行
-`conda-unpack` 修正 Python 环境路径，并创建开始菜单和桌面快捷方式。
+面向最终用户的安装步骤和注意事项见：[安装注意说明.md](安装注意说明.md)。安装包连接设置支持选择
+Provider，并会按 Provider 将 API Key 保存到 Windows Credential Manager。
+
+构建机需要预先安装 Inno Setup 6 和 `conda-pack`。安装器默认使用
+`D:\DeskOrb Agent` 作为安装目录，安装向导允许用户自定义安装目录和盘符；
+请选择当前用户有写入权限的目录，避免选择需要管理员权限的系统目录。安装完成时会自动执行
+`conda-unpack` 修正 Python 环境路径，并在安装目录内创建 `DeskOrb Agent.lnk` 快捷方式。
 
 ## 一键准备开发环境
 

@@ -86,6 +86,7 @@ if (Test-Path -LiteralPath $bundledDotNet) {
 }
 $env:PYTHONNOUSERSITE = "1"
 $env:CONDA_NO_PLUGINS = "true"
+$env:CONDA_SOLVER = "classic"
 
 Invoke-Checked `
     -FilePath $env:ComSpec `
@@ -106,10 +107,10 @@ if ($BuildOfficeCli) {
         -Label "OfficeCLI self-contained binary"
 }
 
-$checkArguments = @()
-if ($InstallWhisperX) { $checkArguments += "-RequireWhisperX" }
-if ($BuildOfficeCli) { $checkArguments += "-RequireOfficeCli" }
-if ($Strict) { $checkArguments += "-Strict" }
+$checkArguments = @{}
+if ($InstallWhisperX) { $checkArguments.RequireWhisperX = $true }
+if ($BuildOfficeCli) { $checkArguments.RequireOfficeCli = $true }
+if ($Strict) { $checkArguments.Strict = $true }
 & (Join-Path $PSScriptRoot "check-environment.ps1") @checkArguments
 if ($LASTEXITCODE -ne 0) {
     throw "Environment checks failed. See the report above."

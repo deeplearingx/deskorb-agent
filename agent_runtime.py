@@ -624,7 +624,7 @@ class AgentRuntime:
 
     def compact(self, force: bool = True) -> dict[str, int] | None:
         """Summarize older turns while retaining recent dialogue verbatim."""
-        api_key = get_api_key(self.model_provider)
+        api_key = get_api_key(self.adapter.provider)
         if not api_key:
             raise RuntimeError("API Key is not configured")
         return self._compact_context(api_key, force=force)
@@ -1348,7 +1348,7 @@ class AgentRuntime:
     def _run_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                   allow_tools: bool = True,
                   deadline: ExecutionDeadline | None = None):
-        api_key = get_api_key(self.model_provider)
+        api_key = get_api_key(self.adapter.provider)
         if not api_key:
             raise RuntimeError("API Key is not configured")
         self._cancelled.clear()
@@ -3736,7 +3736,10 @@ class AgentRuntime:
                         " Coding Plan requires a valid Ark Coding Plan API Key and a Coding Plan model ID; "
                         "check the api-key, url, and model_name entries in volcengine.env."
                     )
-                raise RuntimeError(f"API HTTP {exc.code}: {detail}") from exc
+                raise RuntimeError(
+                    f"API HTTP {exc.code}: {detail} "
+                    f"(provider={self.model_provider}, endpoint={self.adapter.endpoint})"
+                ) from exc
             except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
                 transient_error = exc
                 if deadline is not None and deadline.expired():

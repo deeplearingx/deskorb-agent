@@ -15,6 +15,9 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $root "artifacts\installer"
 }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
+if ([System.IO.Path]::GetPathRoot($OutputRoot) -ine "D:\") {
+    throw "Installer output must stay on D:. Resolved path: $OutputRoot"
+}
 $stage = Join-Path $OutputRoot "stage"
 $pythonArchive = Join-Path $OutputRoot "deskorb-agent-python.zip"
 $iss = Join-Path $PSScriptRoot "DeskOrb-Agent.iss"
@@ -60,7 +63,8 @@ function Resolve-InnoCompiler {
     foreach ($candidate in @(
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe",
-        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+        (Join-Path $root "artifacts\inno-setup\ISCC.exe")
     )) {
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
     }
@@ -113,13 +117,14 @@ if (-not $SkipPythonPack) {
     if ($LASTEXITCODE -ne 0) {
         throw "conda-pack failed with exit code $LASTEXITCODE."
     }
-    if (Test-Path -LiteralPath $pythonRoot) {
-        Remove-Item -LiteralPath $pythonRoot -Recurse -Force
-    }
-    New-Item -ItemType Directory -Force -Path $pythonRoot | Out-Null
-    Expand-Archive -LiteralPath $pythonArchive -DestinationPath $pythonRoot -Force
-    Remove-Item -LiteralPath $pythonArchive -Force
+} elseif (-not (Test-Path -LiteralPath $pythonArchive -PathType Leaf)) {
+    throw "-SkipPythonPack was requested, but the cached Python archive was not found: $pythonArchive"
 }
+if (Test-Path -LiteralPath $pythonRoot) {
+    Remove-Item -LiteralPath $pythonRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $pythonRoot | Out-Null
+Expand-Archive -LiteralPath $pythonArchive -DestinationPath $pythonRoot -Force
 Require-File (Join-Path $pythonRoot "python.exe") "Bundled Python runtime"
 Require-File (Join-Path $pythonRoot "Scripts\conda-unpack.exe") "conda-unpack runtime helper"
 
@@ -155,9 +160,6 @@ if (-not $SkipCompile) {
     Write-Host ("Installer created: {0} ({1} MB)" -f $installer, [math]::Round($installerInfo.Length / 1MB, 1))
 }
 
-if (Test-Path -LiteralPath $pythonArchive) {
-    Remove-Item -LiteralPath $pythonArchive -Force
-}
 if (-not $KeepStage -and (Test-Path -LiteralPath $stage)) {
     Remove-Item -LiteralPath $stage -Recurse -Force
 }

@@ -7,6 +7,10 @@ import provider_env
 
 
 class ProviderCredentialTests(unittest.TestCase):
+    def test_delete_existing_credential_does_not_read_unbound_error(self):
+        with patch.object(credential_store._advapi32, "CredDeleteW", return_value=1):
+            credential_store.delete_api_key("openai")
+
     def test_explicit_provider_targets_are_separate(self):
         self.assertEqual(credential_store._credential_target("deepseek"),
                          "DeskOrbAgent/DeepSeekAPIKey")

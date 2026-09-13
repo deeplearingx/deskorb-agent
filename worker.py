@@ -366,7 +366,7 @@ class CodexWorker(threading.Thread):
 
     def _resolved_backend(self) -> str:
         if self._backend == "auto":
-            return "agent" if get_api_key() else "codex"
+            return "agent" if get_api_key(self._adapter.provider) else "codex"
         return self._backend
 
     def _backend_status(self) -> str:
@@ -378,7 +378,7 @@ class CodexWorker(threading.Thread):
         active = self._resolved_backend()
         messages: list[str] = []
         if active in {"api", "agent"}:
-            if get_api_key():
+            if get_api_key(self._adapter.provider):
                 messages.append("✓ API key configured. Connection will be checked on the first message.")
             else:
                 messages.append("⚠ API key is not configured. Open Gear → Connection settings to add one.")
@@ -687,7 +687,7 @@ class CodexWorker(threading.Thread):
 
     def _run_api_turn(self, text: str, image_paths: list[str], ephemeral: bool = False,
                       office_plan: bool = False, office_generation: int | None = None):
-        api_key = get_api_key(self._model_provider)
+        api_key = get_api_key(self._adapter.provider)
         if not api_key:
             raise RuntimeError("API Key 未配置；点击底部状态栏打开 Connection settings")
         self.ui.put(("status", "API connecting…"))
@@ -982,7 +982,7 @@ class CodexWorker(threading.Thread):
             return
         if self._resolved_backend() == "api":
             try:
-                api_key = get_api_key(self._model_provider)
+                api_key = get_api_key(self._adapter.provider)
                 if not api_key:
                     raise RuntimeError("API Key is not configured")
                 meta = self._compact_api_context(api_key, force=True)

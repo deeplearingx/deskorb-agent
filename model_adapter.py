@@ -91,6 +91,11 @@ def provider_profile(provider: str | None, base_url: str | None) -> ProviderProf
     return ProviderProfile(requested, protocol, base or defaults[requested])
 
 
+def effective_api_provider(provider: str | None, base_url: str | None) -> str:
+    """Return the provider name whose protocol and credentials will be used."""
+    return provider_profile(provider, base_url).name
+
+
 class ModelAdapter:
     """Translate canonical requests and replies for one provider."""
 
